@@ -1,0 +1,20 @@
+[package]
+name = "bitbm25"
+version = "0.1.0"
+edition = "2021"
+description = "Exact BM25 over 64-row bitmap blocks keyed by row position"
+publish = false
+
+[lib]
+name = "bitbm25"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py312"], optional = true }
+
+[features]
+python = ["dep:pyo3"]
+
+[profile.release]
+lto = true
+codegen-units = 1
