@@ -1,20 +1,24 @@
 //! bitbm25: exact BM25 top-k and match counts over 64-row blocks keyed by row position.
 //!
 //! Each term's postings are grouped by block (row >> 6), in one of two forms:
-//!   - a *single*: the term occurs in just one row of the block. Stored as that row (u32) and its
-//!     term frequency (one byte), 5 bytes in all. Most (term, block) pairs in real text are singles.
+//!   - a *single*: the term occurs in just one row of the block. Stored as that row (u32), its term
+//!     frequency and its bound (one byte each), 6 bytes in all. Most (term, block) pairs in real
+//!     text are singles.
 //!   - a *multi*: two or more rows. Stored as the block id, a u64 mask of the rows (AND = `&`,
-//!     OR = `|`, count = popcount), where its term frequencies start, and the block's largest term
-//!     frequency and shortest row length (one byte each), plus one tf byte per row.
+//!     OR = `|`, count = popcount), where its term frequencies start and a one-byte bound, plus one
+//!     tf byte per row.
 //!
 //! Term frequencies of 255 or more go to a side table. Row lengths are kept exactly. Scores are
 //! computed at query time from term frequency, length and the current collection statistics (row
 //! count, document frequency, average length), so nothing stored goes stale when those change.
 //!
-//! A block's upper bound is the score of (largest tf, shortest length). BM25 rises with tf and
-//! falls with length whatever the statistics are, so the bound is always safe. Top-k visits blocks
-//! in descending order of their summed bound and stops once no remaining block can beat the
-//! current k-th score (block-max pruning). Results are exact.
+//! A bound is the block's largest tf_part = tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl)),
+//! rounded up to a 255th of k1 + 1, its ceiling for any tf, length or statistics. The query
+//! multiplies it by the term's idf. If avgdl grows after the bound was stored, every tf_part grows by
+//! at most avgdl_now / avgdl_then, so scaling bounds by max(1, that ratio) keeps them safe (only the
+//! build-time statistics exist so far, so the factor is 1). Top-k visits blocks in descending order
+//! of their summed bound and stops once no remaining block can beat the current k-th score
+//! (block-max pruning). Results are exact.
 //!
 //! All postings live in a few flat arrays shared by every term, and terms are a sorted lexicon, so
 //! a term costs about 40 bytes of overhead however rare it is (millions of terms occur once).
@@ -22,7 +26,6 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
-use std::sync::OnceLock;
 
 pub const K1: f64 = 1.2;
 pub const B: f64 = 0.75;
@@ -30,28 +33,15 @@ const SHIFT: u32 = 6; // 64 rows per block
 const TF_ESCAPE: u8 = u8::MAX; // stored tf meaning "255 or more, see Index::big_tf"
 const NONE: u32 = u32::MAX; // builder: term has no row yet
 
-/// 256 ascending row lengths. Code c means "length at least `dl_edges()[c]`": exact below 64, then
-/// steps of about 10% up to u32::MAX. Bounds use the edge, which never exceeds the true length.
-fn dl_edges() -> &'static [u32; 256] {
-    static EDGES: OnceLock<[u32; 256]> = OnceLock::new();
-    EDGES.get_or_init(|| {
-        let mut e = [0u32; 256];
-        let r = (u32::MAX as f64 / 64.0).powf(1.0 / 191.0);
-        for i in 1..256 {
-            let geometric = (64.0 * r.powi(i as i32 - 64)) as u32; // `as` saturates at u32::MAX
-            e[i] = if i < 64 { i as u32 } else { geometric.max(e[i - 1] + 1) };
-        }
-        e
-    })
-}
-
-fn dl_code(dl: u32) -> u8 {
-    (dl_edges().partition_point(|&e| e <= dl) - 1) as u8
-}
-
 /// The length-dependent part of BM25 for one term: tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl)).
 fn tf_part(tf: f64, dl: f64, avgdl: f64) -> f64 {
     tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avgdl))
+}
+
+/// tf_part of one row as a bound byte: units of (k1 + 1) / 255, rounded up.
+fn ub_byte(tf: u32, dl: u32, avgdl: f64) -> u8 {
+    let units = tf_part(tf as f64, dl as f64, avgdl) / ((K1 + 1.0) / 255.0);
+    (units.ceil() as u32).clamp(1, 255) as u8 // tf_part < k1 + 1, so at most 255
 }
 
 fn stored_tf(tf: usize) -> u8 {
@@ -64,23 +54,15 @@ struct Stats {
     n: f64,
     c0: f32, // k1 * (1 - b)
     c1: f32, // k1 * b / avgdl
-    // bound[dl code * 256 + stored tf]: tf_part at that tf and length edge, rounded up. TF_ESCAPE
-    // uses the limit as tf grows without bound, k1 + 1.
-    bound: Vec<f32>,
+    avgdl: f64,
+    unit: f32, // tf_part represented by one unit of a bound byte, nudged up for f32 rounding
 }
 
 impl Stats {
     fn new(n: usize, total_len: u64) -> Self {
         let avgdl = (total_len as f64 / n.max(1) as f64).max(f64::MIN_POSITIVE);
-        let mut bound = vec![0f32; 256 * 256];
-        for (c, &edge) in dl_edges().iter().enumerate() {
-            for tf in 1..256 {
-                let f = if tf == TF_ESCAPE as usize { K1 + 1.0 } else { tf_part(tf as f64, edge as f64, avgdl) };
-                // The margin covers f32 rounding here and in the query-time score.
-                bound[c * 256 + tf] = (f * (1.0 + 1e-6)) as f32;
-            }
-        }
-        Stats { n: n as f64, c0: (K1 * (1.0 - B)) as f32, c1: (K1 * B / avgdl) as f32, bound }
+        let unit = ((K1 + 1.0) / 255.0 * (1.0 + 1e-6)) as f32;
+        Stats { n: n as f64, c0: (K1 * (1.0 - B)) as f32, c1: (K1 * B / avgdl) as f32, avgdl, unit }
     }
 
     fn idf(&self, df: usize) -> f32 {
@@ -94,7 +76,7 @@ struct Term {
     id: u32,
     idf: f32,
     singles: Range<usize>, // into s_rows / s_tfs
-    multis: Range<usize>,  // into m_blocks / m_masks / m_tf_off / m_max_tf / m_min_dl
+    multis: Range<usize>,  // into m_blocks / m_masks / m_tf_off / m_ub
     tfs_start: usize,      // this term's first entry in m_tfs; m_tf_off is relative to it
 }
 
@@ -121,15 +103,14 @@ pub struct Index {
     mt_start: Vec<usize>,
     s_rows: Vec<u32>,
     s_tfs: Vec<u8>,
+    s_ub: Vec<u8>,
     m_blocks: Vec<u32>,
     m_masks: Vec<u64>,
     m_tf_off: Vec<u32>,
-    m_max_tf: Vec<u8>,
-    m_min_dl: Vec<u8>,
+    m_ub: Vec<u8>,
     m_tfs: Vec<u8>,
     big_tf: HashMap<(u32, u32), u32>, // (term id, row) -> tf, for the rare tf >= 255
     dl: Vec<u32>,                     // exact length of each row
-    dl_codes: Vec<u8>,                // dl_code of each row, for the bounds of singles
     stats: Stats,
 }
 
@@ -188,15 +169,8 @@ impl Index {
 
     fn mask_and_bound(&self, t: &Term, e: Entry) -> (u64, f32) {
         match e {
-            Entry::Single(k) => {
-                let row = self.s_rows[k];
-                let code = self.dl_codes[row as usize] as usize;
-                (1 << (row & 63), t.idf * self.stats.bound[code * 256 + self.s_tfs[k] as usize])
-            }
-            Entry::Multi(i) => {
-                let code = self.m_min_dl[i] as usize;
-                (self.m_masks[i], t.idf * self.stats.bound[code * 256 + self.m_max_tf[i] as usize])
-            }
+            Entry::Single(k) => (1 << (self.s_rows[k] & 63), t.idf * self.s_ub[k] as f32 * self.stats.unit),
+            Entry::Multi(i) => (self.m_masks[i], t.idf * self.m_ub[i] as f32 * self.stats.unit),
         }
     }
 
@@ -319,11 +293,15 @@ impl Index {
         if k == 0 {
             return vec![];
         }
-        let mut blocks = if and { self.and_blocks(&ts) } else { self.or_blocks(&ts) };
-        // ponytail: full sort; a partial ordering or bucketing by bound is cheaper at scale
-        blocks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        let blocks = if and { self.and_blocks(&ts) } else { self.or_blocks(&ts) };
+        // A max-heap on the bound: heapifying is O(n) and only the blocks actually visited are
+        // popped, where a full sort would order all of them. Bounds are non-negative, so their bit
+        // patterns sort like their values.
+        let mut blocks: BinaryHeap<(u32, u32, u64)> =
+            blocks.into_iter().map(|(b, ub, m)| (ub.to_bits(), u32::MAX - b, m)).collect();
         let mut top = TopK { k, heap: BinaryHeap::with_capacity(k + 1) };
-        for (b, ub, present) in blocks {
+        while let Some((ub, rb, present)) = blocks.pop() {
+            let (b, ub) = (u32::MAX - rb, f32::from_bits(ub));
             // Strict `<` keeps blocks that could hold a tie (a lower row wins it). The 1e-5 margin
             // covers f32 rounding when a row's term scores are summed.
             if top.heap.len() == k && ub * (1.0 + 1e-5) < top.threshold() {
@@ -367,16 +345,14 @@ impl Index {
             + bytes(&self.mt_start)
             + bytes(&self.s_rows)
             + bytes(&self.s_tfs)
+            + bytes(&self.s_ub)
             + bytes(&self.m_blocks)
             + bytes(&self.m_masks)
             + bytes(&self.m_tf_off)
-            + bytes(&self.m_max_tf)
-            + bytes(&self.m_min_dl)
+            + bytes(&self.m_ub)
             + bytes(&self.m_tfs)
             + self.big_tf.len() * 12
             + bytes(&self.dl)
-            + bytes(&self.dl_codes)
-            + bytes(&self.stats.bound)
     }
 }
 
@@ -473,7 +449,6 @@ impl Builder {
         let mut order: Vec<u32> = (0..n_terms as u32).collect();
         order.sort_unstable_by(|&a, &b| names[a as usize].cmp(&names[b as usize]));
 
-        let dl_codes: Vec<u8> = dl.iter().map(|&d| dl_code(d)).collect();
         let mut idx = Index {
             lex_bytes: Vec::with_capacity(names.iter().map(String::len).sum()),
             lex_off: Vec::with_capacity(n_terms + 1),
@@ -482,15 +457,14 @@ impl Builder {
             mt_start: Vec::with_capacity(n_terms + 1),
             s_rows: Vec::with_capacity(singles),
             s_tfs: Vec::with_capacity(singles),
+            s_ub: Vec::with_capacity(singles),
             m_blocks: Vec::with_capacity(multis),
             m_masks: Vec::with_capacity(multis),
             m_tf_off: Vec::with_capacity(multis),
-            m_max_tf: Vec::with_capacity(multis),
-            m_min_dl: Vec::with_capacity(multis),
+            m_ub: Vec::with_capacity(multis),
             m_tfs: Vec::with_capacity(multi_rows),
             big_tf: HashMap::new(),
             stats: Stats::new(dl.len(), total_len),
-            dl_codes,
             dl,
         };
         let mut rows: Vec<(u32, u32)> = Vec::new(); // one term's (row, tf), reused
@@ -513,24 +487,23 @@ impl Builder {
             }
             let tfs_start = idx.m_tfs.len();
             for group in rows.chunk_by(|a, b| a.0 >> SHIFT == b.0 >> SHIFT) {
+                let avgdl = idx.stats.avgdl;
                 if let [(row, tf)] = group {
                     idx.s_rows.push(*row);
                     idx.s_tfs.push(stored_tf(*tf as usize));
+                    idx.s_ub.push(ub_byte(*tf, idx.dl[*row as usize], avgdl));
                     continue;
                 }
-                let (mut mask, mut max_tf, mut min_dl) = (0u64, 0u8, u8::MAX);
+                let (mut mask, mut ub) = (0u64, 0u8);
                 idx.m_tf_off.push((idx.m_tfs.len() - tfs_start) as u32);
                 for &(row, tf) in group {
-                    let tf = stored_tf(tf as usize);
                     mask |= 1 << (row & 63);
-                    max_tf = max_tf.max(tf);
-                    min_dl = min_dl.min(idx.dl_codes[row as usize]);
-                    idx.m_tfs.push(tf);
+                    ub = ub.max(ub_byte(tf, idx.dl[row as usize], avgdl));
+                    idx.m_tfs.push(stored_tf(tf as usize));
                 }
                 idx.m_blocks.push(group[0].0 >> SHIFT);
                 idx.m_masks.push(mask);
-                idx.m_max_tf.push(max_tf);
-                idx.m_min_dl.push(min_dl);
+                idx.m_ub.push(ub);
             }
         }
         idx.lex_off.push(idx.lex_bytes.len());
@@ -759,16 +732,6 @@ mod tests {
             }
         }
         assert!(singles > 1000 && multis > 1000, "both entry kinds are exercised: {singles} {multis}");
-    }
-
-    #[test]
-    fn length_codes_round_down() {
-        let e = dl_edges();
-        assert!(e.windows(2).all(|w| w[0] < w[1]) && e[255] == u32::MAX);
-        for dl in (0..100_000).chain([u32::MAX - 1, u32::MAX]) {
-            let c = dl_code(dl) as usize;
-            assert!(e[c] <= dl && (c == 255 || dl < e[c + 1]), "dl {dl} code {c}");
-        }
     }
 
     #[test]
