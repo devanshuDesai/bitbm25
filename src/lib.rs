@@ -4,6 +4,7 @@
 //!   - a u64 mask of the rows that contain the term (AND = `&`, OR = `|`, count = popcount),
 //!   - the exact BM25 contribution of each of those rows, precomputed as f32,
 //!   - an 8-bit upper bound on those contributions, rounded up so pruning is safe.
+//!
 //! Top-k visits blocks in descending order of their summed upper bound and stops once no
 //! remaining block can beat the current k-th score (block-max pruning). Results are exact.
 
@@ -64,12 +65,12 @@ impl Index {
     }
 
     /// (block, summed upper bound, rows matching all terms) for every block where all terms co-occur.
-    fn and_blocks(ps: &[&Postings]) -> Vec<(u32, u16, u64)> {
+    fn and_blocks(ps: &[&Postings]) -> Vec<(u32, u32, u64)> {
         let rarest = (0..ps.len()).min_by_key(|&i| ps[i].blocks.len()).unwrap();
         let mut cursor = vec![0usize; ps.len()];
         let mut out = Vec::new();
         'blocks: for (i, &b) in ps[rarest].blocks.iter().enumerate() {
-            let (mut ub, mut mask) = (ps[rarest].ubs[i] as u16, ps[rarest].masks[i]);
+            let (mut ub, mut mask) = (ps[rarest].ubs[i] as u32, ps[rarest].masks[i]);
             for (t, p) in ps.iter().enumerate() {
                 if t == rarest {
                     continue;
@@ -82,7 +83,7 @@ impl Index {
                 if p.blocks[*c] != b {
                     continue 'blocks;
                 }
-                ub += p.ubs[*c] as u16;
+                ub += p.ubs[*c] as u32;
                 mask &= p.masks[*c];
                 if mask == 0 {
                     continue 'blocks;
@@ -94,14 +95,14 @@ impl Index {
     }
 
     /// (block, summed upper bound, rows matching any term) for every block touched by a term.
-    fn or_blocks(&self, ps: &[&Postings]) -> Vec<(u32, u16, u64)> {
+    fn or_blocks(&self, ps: &[&Postings]) -> Vec<(u32, u32, u64)> {
         // ponytail: dense per-query arrays sized to the whole collection; reuse a scratch buffer at scale
-        let mut ub = vec![0u16; self.n_blocks];
+        let mut ub = vec![0u32; self.n_blocks];
         let mut mask = vec![0u64; self.n_blocks];
         for p in ps {
             for i in 0..p.blocks.len() {
                 let b = p.blocks[i] as usize;
-                ub[b] += p.ubs[i] as u16;
+                ub[b] += p.ubs[i] as u32;
                 mask[b] |= p.masks[i];
             }
         }
@@ -115,11 +116,13 @@ impl Index {
             return vec![];
         }
         let mut blocks = if and { Self::and_blocks(&ps) } else { self.or_blocks(&ps) };
-        // ponytail: full sort; a bucket sort on the u16 bound or partial ordering is cheaper at scale
-        blocks.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        // ponytail: full sort; a bucket sort on the u32 bound or partial ordering is cheaper at scale
+        blocks.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
         let mut top = TopK { k, heap: BinaryHeap::with_capacity(k + 1) };
         for (b, ub, present) in blocks {
-            if top.heap.len() == k && (ub as f32) * self.scale < top.threshold() {
+            // Strict `<` keeps blocks that could hold a tie (a lower row wins it). The 1e-5 margin
+            // covers f32 rounding when a row's impacts are summed; bounds are already rounded up.
+            if top.heap.len() == k && (ub as f32) * self.scale * (1.0 + 1e-5) < top.threshold() {
                 break; // no remaining block can beat the current k-th score
             }
             let mut scores = [0f32; 64];
@@ -276,12 +279,14 @@ impl TopK {
     fn threshold(&self) -> f32 {
         self.heap.peek().map_or(f32::NEG_INFINITY, |h| h.0)
     }
+    /// Ties on score go to the lower row, so results don't depend on the order blocks are visited.
     fn push(&mut self, row: u32, score: f32) {
+        let hit = Hit(score, row);
         if self.heap.len() < self.k {
-            self.heap.push(Hit(score, row));
-        } else if score > self.threshold() {
+            self.heap.push(hit);
+        } else if self.heap.peek().is_some_and(|worst| hit < *worst) {
             self.heap.pop();
-            self.heap.push(Hit(score, row));
+            self.heap.push(hit);
         }
     }
     fn into_sorted(self) -> Vec<(u32, f32)> {
@@ -362,10 +367,18 @@ mod tests {
 
     /// Exhaustive reference: (row, score) for every matching row.
     fn brute(docs: &[String], q: &[&str], and: bool) -> Vec<(u32, f64)> {
+        let mut seen = HashSet::new();
+        let q: Vec<&str> = q.iter().copied().filter(|t| seen.insert(*t)).collect(); // duplicates count once
         let toks: Vec<Vec<&str>> = docs.iter().map(|d| d.split_whitespace().collect()).collect();
         let n = docs.len() as f64;
         let avgdl = toks.iter().map(|t| t.len() as f64).sum::<f64>() / n;
-        let df = |t: &str| toks.iter().filter(|d| d.contains(&t)).count() as f64;
+        let mut dfs: HashMap<&str, f64> = HashMap::new();
+        for d in &toks {
+            for t in d.iter().collect::<HashSet<_>>() {
+                *dfs.entry(*t).or_default() += 1.0;
+            }
+        }
+        let df = |t: &str| dfs.get(t).copied().unwrap_or(0.0);
         let mut out = Vec::new();
         for (row, d) in toks.iter().enumerate() {
             let hits = q.iter().filter(|t| d.contains(t)).count();
@@ -387,9 +400,18 @@ mod tests {
 
     #[test]
     fn matches_brute_force() {
-        let docs = corpus(3_000, 0x9E3779B97F4A7C15);
-        let idx = Index::build(&docs);
+        for (n, seed) in [(3_000, 0x9E3779B97F4A7C15), (1_000, 7)] {
+            check_corpus(&corpus(n, seed));
+        }
+    }
+
+    fn check_corpus(docs: &[String]) {
+        let idx = Index::build(docs);
+        // 300 terms: summed block bounds can exceed u16::MAX (255 * 258).
+        let every_term: Vec<String> = (0..300).map(|i| format!("t{i}")).collect();
+        let every_term: Vec<&str> = every_term.iter().map(String::as_str).collect();
         let queries: &[&[&str]] = &[
+            &every_term,
             &["t0"],
             &["t0", "t1"],
             &["t2", "t150", "t299"],
@@ -397,10 +419,11 @@ mod tests {
             &["t1", "t3"],
             &["t250", "t260"],
             &["t0", "missing"],
+            &["t1", "t1", "t3"],
         ];
         for q in queries {
             for and in [false, true] {
-                let want = brute(&docs, q, and);
+                let want = brute(docs, q, and);
                 assert_eq!(idx.count(q, and), want.len() as u64, "count {q:?} and={and}");
                 let got = idx.top_k(q, and, 10);
                 assert_eq!(got.len(), want.len().min(10), "len {q:?} and={and}");
@@ -413,6 +436,31 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn block_bounds_never_underestimate() {
+        let idx = Index::build(&corpus(3_000, 11));
+        for p in &idx.postings {
+            for bi in 0..p.blocks.len() {
+                let end = p.offsets.get(bi + 1).map_or(p.impacts.len(), |&o| o as usize);
+                for &imp in &p.impacts[p.offsets[bi] as usize..end] {
+                    assert!(imp <= p.ubs[bi] as f32 * idx.scale, "impact {imp} above bound {}", p.ubs[bi]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ties_go_to_the_lowest_rows() {
+        // 300 identical docs span 5 blocks with equal bounds; the top 10 must be rows 0..10 whatever
+        // order the blocks are visited in.
+        let docs = vec!["a b"; 300];
+        let idx = Index::build(&docs);
+        for and in [false, true] {
+            let rows: Vec<u32> = idx.top_k(&["a", "b"], and, 10).into_iter().map(|(r, _)| r).collect();
+            assert_eq!(rows, (0..10).collect::<Vec<_>>());
         }
     }
 }
