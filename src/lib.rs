@@ -1,27 +1,34 @@
 //! bitbm25: exact BM25 top-k and match counts over 64-row blocks keyed by row position.
 //!
-//! Each term's postings are grouped by block (row >> 6). Per block we keep:
-//!   - a u64 mask of the rows that contain the term (AND = `&`, OR = `|`, count = popcount),
-//!   - each of those rows' term frequency (one byte; larger values go to a side table),
-//!   - the block's largest term frequency and shortest row length, as one byte each.
+//! Each term's postings are grouped by block (row >> 6), in one of two forms:
+//!   - a *single*: the term occurs in just one row of the block. Stored as that row (u32) and its
+//!     term frequency (one byte), 5 bytes in all. Most (term, block) pairs in real text are singles.
+//!   - a *multi*: two or more rows. Stored as the block id, a u64 mask of the rows (AND = `&`,
+//!     OR = `|`, count = popcount), where its term frequencies start, and the block's largest term
+//!     frequency and shortest row length (one byte each), plus one tf byte per row.
 //!
-//! Row lengths are kept exactly, one u32 per row. Scores are computed at query time from term
-//! frequency, length and the current collection statistics (row count, document frequency,
-//! average length), so nothing stored goes stale when those statistics change.
+//! Term frequencies of 255 or more go to a side table. Row lengths are kept exactly. Scores are
+//! computed at query time from term frequency, length and the current collection statistics (row
+//! count, document frequency, average length), so nothing stored goes stale when those change.
 //!
 //! A block's upper bound is the score of (largest tf, shortest length). BM25 rises with tf and
 //! falls with length whatever the statistics are, so the bound is always safe. Top-k visits blocks
 //! in descending order of their summed bound and stops once no remaining block can beat the
 //! current k-th score (block-max pruning). Results are exact.
+//!
+//! All postings live in a few flat arrays shared by every term, and terms are a sorted lexicon, so
+//! a term costs about 40 bytes of overhead however rare it is (millions of terms occur once).
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::ops::Range;
 use std::sync::OnceLock;
 
 pub const K1: f64 = 1.2;
 pub const B: f64 = 0.75;
 const SHIFT: u32 = 6; // 64 rows per block
 const TF_ESCAPE: u8 = u8::MAX; // stored tf meaning "255 or more, see Index::big_tf"
+const NONE: u32 = u32::MAX; // builder: term has no row yet
 
 /// 256 ascending row lengths. Code c means "length at least `dl_edges()[c]`": exact below 64, then
 /// steps of about 10% up to u32::MAX. Bounds use the edge, which never exceeds the true length.
@@ -47,20 +54,8 @@ fn tf_part(tf: f64, dl: f64, avgdl: f64) -> f64 {
     tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avgdl))
 }
 
-#[derive(Default)]
-struct Postings {
-    blocks: Vec<u32>,  // sorted block ids
-    masks: Vec<u64>,   // rows in the block containing the term
-    offsets: Vec<u32>, // index of the block's first entry in `tfs`
-    max_tf: Vec<u8>,   // largest tf in the block (TF_ESCAPE: 255 or more)
-    min_dl: Vec<u8>,   // dl_code of the shortest row in the block that contains the term
-    tfs: Vec<u8>,      // tf per posting, in row order
-}
-
-impl Postings {
-    fn find(&self, block: u32) -> Option<usize> {
-        self.blocks.binary_search(&block).ok()
-    }
+fn stored_tf(tf: usize) -> u8 {
+    tf.min(TF_ESCAPE as usize) as u8
 }
 
 /// Collection statistics and the values derived from them. This is the only state that would be
@@ -69,20 +64,19 @@ struct Stats {
     n: f64,
     c0: f32, // k1 * (1 - b)
     c1: f32, // k1 * b / avgdl
-    // bound[dl code * 256 + max_tf]: tf_part at that tf and length edge, rounded up. TF_ESCAPE uses
-    // the limit as tf grows without bound, k1 + 1.
+    // bound[dl code * 256 + stored tf]: tf_part at that tf and length edge, rounded up. TF_ESCAPE
+    // uses the limit as tf grows without bound, k1 + 1.
     bound: Vec<f32>,
 }
 
 impl Stats {
     fn new(n: usize, total_len: u64) -> Self {
         let avgdl = (total_len as f64 / n.max(1) as f64).max(f64::MIN_POSITIVE);
-        let edges = dl_edges();
         let mut bound = vec![0f32; 256 * 256];
-        for (c, &edge) in edges.iter().enumerate() {
+        for (c, &edge) in dl_edges().iter().enumerate() {
             for tf in 1..256 {
                 let f = if tf == TF_ESCAPE as usize { K1 + 1.0 } else { tf_part(tf as f64, edge as f64, avgdl) };
-                // The margin covers f32 rounding here and in the query-time tf_part.
+                // The margin covers f32 rounding here and in the query-time score.
                 bound[c * 256 + tf] = (f * (1.0 + 1e-6)) as f32;
             }
         }
@@ -95,18 +89,47 @@ impl Stats {
     }
 }
 
-/// A resolved query term.
-struct Term<'a> {
+/// A term's slices of the shared arrays, resolved for one query.
+struct Term {
     id: u32,
-    p: &'a Postings,
     idf: f32,
+    singles: Range<usize>, // into s_rows / s_tfs
+    multis: Range<usize>,  // into m_blocks / m_masks / m_tf_off / m_max_tf / m_min_dl
+    tfs_start: usize,      // this term's first entry in m_tfs; m_tf_off is relative to it
+}
+
+impl Term {
+    fn df(&self, idx: &Index) -> usize {
+        self.singles.len() + idx.mt_start[self.id as usize + 1] - self.tfs_start
+    }
+}
+
+/// Where a term's postings for one block are.
+#[derive(Clone, Copy)]
+enum Entry {
+    Single(usize),
+    Multi(usize),
 }
 
 pub struct Index {
-    terms: HashMap<String, u32>,
-    postings: Vec<Postings>,
-    big_tf: HashMap<(u32, u32), u32>, // (term id, posting index) -> tf, for the rare tf >= 255
+    // Sorted lexicon: term id = rank; term i is lex_bytes[lex_off[i]..lex_off[i + 1]].
+    lex_bytes: Vec<u8>,
+    lex_off: Vec<usize>,
+    // Per term t, its singles are s_start[t]..s_start[t + 1], and likewise for multis and m_tfs.
+    s_start: Vec<usize>,
+    m_start: Vec<usize>,
+    mt_start: Vec<usize>,
+    s_rows: Vec<u32>,
+    s_tfs: Vec<u8>,
+    m_blocks: Vec<u32>,
+    m_masks: Vec<u64>,
+    m_tf_off: Vec<u32>,
+    m_max_tf: Vec<u8>,
+    m_min_dl: Vec<u8>,
+    m_tfs: Vec<u8>,
+    big_tf: HashMap<(u32, u32), u32>, // (term id, row) -> tf, for the rare tf >= 255
     dl: Vec<u32>,                     // exact length of each row
+    dl_codes: Vec<u8>,                // dl_code of each row, for the bounds of singles
     stats: Stats,
 }
 
@@ -120,19 +143,42 @@ impl Index {
         b.finish()
     }
 
+    fn lookup(&self, term: &str) -> Option<u32> {
+        let (mut lo, mut hi) = (0, self.lex_off.len() - 1);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.lex_bytes[self.lex_off[mid]..self.lex_off[mid + 1]].cmp(term.as_bytes()) {
+                Ordering::Less => lo = mid + 1,
+                Ordering::Greater => hi = mid,
+                Ordering::Equal => return Some(mid as u32),
+            }
+        }
+        None
+    }
+
+    fn term(&self, id: u32) -> Term {
+        let i = id as usize;
+        let mut t = Term {
+            id,
+            idf: 0.0,
+            singles: self.s_start[i]..self.s_start[i + 1],
+            multis: self.m_start[i]..self.m_start[i + 1],
+            tfs_start: self.mt_start[i],
+        };
+        t.idf = self.stats.idf(t.df(self));
+        t
+    }
+
     /// Distinct query terms (a repeated term counts once). None means an AND query can match nothing.
-    fn resolve(&self, terms: &[&str], and: bool) -> Option<Vec<Term<'_>>> {
+    fn resolve(&self, terms: &[&str], and: bool) -> Option<Vec<Term>> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for t in terms {
             if !seen.insert(*t) {
                 continue;
             }
-            match self.terms.get(*t) {
-                Some(&id) => {
-                    let p = &self.postings[id as usize];
-                    out.push(Term { id, p, idf: self.stats.idf(p.tfs.len()) });
-                }
+            match self.lookup(t) {
+                Some(id) => out.push(self.term(id)),
                 None if and => return None,
                 None => {}
             }
@@ -140,41 +186,101 @@ impl Index {
         (!out.is_empty()).then_some(out)
     }
 
-    fn block_bound(&self, t: &Term, i: usize) -> f32 {
-        t.idf * self.stats.bound[t.p.min_dl[i] as usize * 256 + t.p.max_tf[i] as usize]
+    fn mask_and_bound(&self, t: &Term, e: Entry) -> (u64, f32) {
+        match e {
+            Entry::Single(k) => {
+                let row = self.s_rows[k];
+                let code = self.dl_codes[row as usize] as usize;
+                (1 << (row & 63), t.idf * self.stats.bound[code * 256 + self.s_tfs[k] as usize])
+            }
+            Entry::Multi(i) => {
+                let code = self.m_min_dl[i] as usize;
+                (self.m_masks[i], t.idf * self.stats.bound[code * 256 + self.m_max_tf[i] as usize])
+            }
+        }
     }
 
-    /// Score contribution of posting `j` of term `t`, which is in row `row`.
-    fn score(&self, t: &Term, j: usize, row: usize) -> f32 {
-        let tf = match t.p.tfs[j] {
-            TF_ESCAPE => self.big_tf[&(t.id, j as u32)] as f32,
+    /// The term's entry for block `b`, searching from `cursor` (relative positions in its singles
+    /// and multis) and advancing it. Blocks must be asked for in ascending order per cursor.
+    fn seek(&self, t: &Term, cursor: &mut (usize, usize), b: u32) -> Option<Entry> {
+        let rows = &self.s_rows[t.singles.clone()];
+        cursor.0 += rows[cursor.0..].partition_point(|&r| r >> SHIFT < b);
+        if rows.get(cursor.0).is_some_and(|&r| r >> SHIFT == b) {
+            return Some(Entry::Single(t.singles.start + cursor.0));
+        }
+        let blocks = &self.m_blocks[t.multis.clone()];
+        cursor.1 += blocks[cursor.1..].partition_point(|&x| x < b);
+        blocks.get(cursor.1).is_some_and(|&x| x == b).then_some(Entry::Multi(t.multis.start + cursor.1))
+    }
+
+    /// Score of row `row`, whose stored term frequency for `t` is `stored`.
+    fn score(&self, t: &Term, stored: u8, row: u32) -> f32 {
+        let tf = match stored {
+            TF_ESCAPE => self.big_tf[&(t.id, row)] as f32,
             tf => tf as f32,
         };
         let s = &self.stats;
-        t.idf * tf * (K1 + 1.0) as f32 / (tf + s.c0 + s.c1 * self.dl[row] as f32)
+        t.idf * tf * (K1 + 1.0) as f32 / (tf + s.c0 + s.c1 * self.dl[row as usize] as f32)
+    }
+
+    /// Adds the scores of term `t` in block `b` to `scores`, for the rows in `present`.
+    fn score_block(&self, t: &Term, e: Entry, b: u32, present: u64, scores: &mut [f32; 64]) {
+        match e {
+            Entry::Single(k) => {
+                let row = self.s_rows[k];
+                if present >> (row & 63) & 1 == 1 {
+                    scores[(row & 63) as usize] += self.score(t, self.s_tfs[k], row);
+                }
+            }
+            Entry::Multi(i) => {
+                let (mask, start) = (self.m_masks[i], t.tfs_start + self.m_tf_off[i] as usize);
+                let mut bits = mask & present; // AND queries skip rows that don't match
+                while bits != 0 {
+                    let s = bits.trailing_zeros();
+                    let j = start + (mask & ((1u64 << s) - 1)).count_ones() as usize;
+                    scores[s as usize] += self.score(t, self.m_tfs[j], (b << SHIFT) | s);
+                    bits &= bits - 1;
+                }
+            }
+        }
     }
 
     /// (block, summed upper bound, rows matching all terms) for every block where all terms co-occur.
     fn and_blocks(&self, ts: &[Term]) -> Vec<(u32, f32, u64)> {
-        let rarest = (0..ts.len()).min_by_key(|&i| ts[i].p.blocks.len()).unwrap();
-        let mut cursor = vec![0usize; ts.len()];
+        let entries = |t: &Term| t.singles.len() + t.multis.len();
+        let rarest = (0..ts.len()).min_by_key(|&i| entries(&ts[i])).unwrap();
+        let mut cursors = vec![(0usize, 0usize); ts.len()];
         let mut out = Vec::new();
-        'blocks: for (i, &b) in ts[rarest].p.blocks.iter().enumerate() {
-            let (mut ub, mut mask) = (self.block_bound(&ts[rarest], i), ts[rarest].p.masks[i]);
+        let r = &ts[rarest];
+        // The rarest term's blocks in ascending order: merge its singles and multis.
+        let (mut si, mut mi) = (r.singles.start, r.multis.start);
+        'blocks: while si < r.singles.end || mi < r.multis.end {
+            let sb = self.s_rows.get(si).filter(|_| si < r.singles.end).map(|&row| row >> SHIFT);
+            let mb = self.m_blocks.get(mi).filter(|_| mi < r.multis.end).copied();
+            let (b, e) = match (sb, mb) {
+                (Some(s), Some(m)) if m < s => (m, Entry::Multi(mi)),
+                (Some(s), _) => (s, Entry::Single(si)),
+                (None, Some(m)) => (m, Entry::Multi(mi)),
+                (None, None) => unreachable!(),
+            };
+            match e {
+                Entry::Single(_) => si += 1,
+                Entry::Multi(_) => mi += 1,
+            }
+            let (mut mask, mut ub) = self.mask_and_bound(r, e);
             for (k, t) in ts.iter().enumerate() {
                 if k == rarest {
                     continue;
                 }
-                let c = &mut cursor[k];
-                *c += t.p.blocks[*c..].partition_point(|&x| x < b);
-                if *c == t.p.blocks.len() {
-                    break 'blocks;
-                }
-                if t.p.blocks[*c] != b {
+                let Some(e) = self.seek(t, &mut cursors[k], b) else {
+                    if cursors[k].0 == t.singles.len() && cursors[k].1 == t.multis.len() {
+                        break 'blocks; // this term has no blocks left
+                    }
                     continue 'blocks;
-                }
-                ub += self.block_bound(t, *c);
-                mask &= t.p.masks[*c];
+                };
+                let (m, bound) = self.mask_and_bound(t, e);
+                mask &= m;
+                ub += bound;
                 if mask == 0 {
                     continue 'blocks;
                 }
@@ -191,10 +297,17 @@ impl Index {
         let mut ub = vec![0f32; n_blocks];
         let mut mask = vec![0u64; n_blocks];
         for t in ts {
-            for i in 0..t.p.blocks.len() {
-                let b = t.p.blocks[i] as usize;
-                ub[b] += self.block_bound(t, i);
-                mask[b] |= t.p.masks[i];
+            for k in t.singles.clone() {
+                let (m, bound) = self.mask_and_bound(t, Entry::Single(k));
+                let b = (self.s_rows[k] >> SHIFT) as usize;
+                ub[b] += bound;
+                mask[b] |= m;
+            }
+            for i in t.multis.clone() {
+                let (m, bound) = self.mask_and_bound(t, Entry::Multi(i));
+                let b = self.m_blocks[i] as usize;
+                ub[b] += bound;
+                mask[b] |= m;
             }
         }
         (0..n_blocks).filter(|&b| mask[b] != 0).map(|b| (b as u32, ub[b], mask[b])).collect()
@@ -218,15 +331,8 @@ impl Index {
             }
             let mut scores = [0f32; 64];
             for t in &ts {
-                if let Some(i) = t.p.find(b) {
-                    let (mask, offset) = (t.p.masks[i], t.p.offsets[i] as usize);
-                    let mut bits = mask & present; // AND queries skip rows that don't match
-                    while bits != 0 {
-                        let s = bits.trailing_zeros();
-                        let j = offset + (mask & ((1u64 << s) - 1)).count_ones() as usize;
-                        scores[s as usize] += self.score(t, j, ((b << SHIFT) | s) as usize);
-                        bits &= bits - 1;
-                    }
+                if let Some(e) = self.seek(t, &mut (0, 0), b) {
+                    self.score_block(t, e, b, present, &mut scores);
                 }
             }
             let mut bits = present;
@@ -243,18 +349,64 @@ impl Index {
     pub fn count(&self, terms: &[&str], and: bool) -> u64 {
         let Some(ts) = self.resolve(terms, and) else { return 0 };
         if ts.len() == 1 {
-            return ts[0].p.tfs.len() as u64;
+            return ts[0].df(self) as u64;
         }
         let blocks = if and { self.and_blocks(&ts) } else { self.or_blocks(&ts) };
         blocks.iter().map(|&(_, _, m)| m.count_ones() as u64).sum()
     }
 
-    /// Approximate heap footprint of the index.
+    /// Heap footprint of the index, from the lengths of its arrays.
     pub fn size_bytes(&self) -> usize {
-        let terms: usize = self.terms.keys().map(|t| t.len() + 4 + 24).sum();
-        let per_term = self.postings.len() * std::mem::size_of::<Postings>();
-        let lists: usize = self.postings.iter().map(|p| p.blocks.len() * (4 + 8 + 4 + 1 + 1) + p.tfs.len()).sum();
-        terms + per_term + lists + self.dl.len() * 4 + self.big_tf.len() * 12 + self.stats.bound.len() * 4
+        fn bytes<T>(v: &[T]) -> usize {
+            std::mem::size_of_val(v)
+        }
+        bytes(&self.lex_bytes)
+            + bytes(&self.lex_off)
+            + bytes(&self.s_start)
+            + bytes(&self.m_start)
+            + bytes(&self.mt_start)
+            + bytes(&self.s_rows)
+            + bytes(&self.s_tfs)
+            + bytes(&self.m_blocks)
+            + bytes(&self.m_masks)
+            + bytes(&self.m_tf_off)
+            + bytes(&self.m_max_tf)
+            + bytes(&self.m_min_dl)
+            + bytes(&self.m_tfs)
+            + self.big_tf.len() * 12
+            + bytes(&self.dl)
+            + bytes(&self.dl_codes)
+            + bytes(&self.stats.bound)
+    }
+}
+
+/// Per-term state while building: (row delta, tf) pairs as LEB128 varints, which is far smaller than
+/// the final arrays' growth slack would be.
+#[derive(Default)]
+struct BuildTerm {
+    bytes: Vec<u8>,
+    last: u32,    // last row added, or NONE
+    in_block: u8, // rows added so far in the last row's block
+}
+
+fn put_varint(out: &mut Vec<u8>, mut v: u32) {
+    while v >= 0x80 {
+        out.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn get_varint(bytes: &[u8], pos: &mut usize) -> u32 {
+    let (mut v, mut shift) = (0u32, 0);
+    loop {
+        let b = bytes[*pos];
+        *pos += 1;
+        v |= ((b & 0x7f) as u32) << shift;
+        if b < 0x80 {
+            return v;
+        }
+        shift += 7;
     }
 }
 
@@ -264,66 +416,129 @@ impl Index {
 #[derive(Default)]
 pub struct Builder {
     terms: HashMap<String, u32>,
-    postings: Vec<Postings>,
-    big_tf: HashMap<(u32, u32), u32>,
+    postings: Vec<BuildTerm>,
     dl: Vec<u32>,
     total_len: u64,
+    // Running totals, so `finish` can size the final arrays exactly.
+    singles: usize,
+    multis: usize,
+    multi_rows: usize,
 }
 
 impl Builder {
     pub fn add(&mut self, doc: &str) {
-        let row = u32::try_from(self.dl.len()).expect("bitbm25 holds at most 2^32 rows");
+        assert!(self.dl.len() < NONE as usize, "bitbm25 holds at most 2^32 - 1 rows");
+        let row = self.dl.len() as u32;
         let mut toks: Vec<&str> = doc.split_ascii_whitespace().collect();
         let len = u32::try_from(toks.len()).expect("a row has at most 2^32 - 1 tokens");
         self.dl.push(len);
         self.total_len += len as u64;
-        let code = dl_code(len);
         toks.sort_unstable();
         for run in toks.chunk_by(|a, b| a == b) {
             let id = match self.terms.get(run[0]) {
                 Some(&id) => id,
                 None => {
-                    self.postings.push(Postings::default());
-                    let id = self.postings.len() as u32 - 1;
+                    let id = u32::try_from(self.postings.len()).expect("at most 2^32 terms");
+                    self.postings.push(BuildTerm { last: NONE, ..Default::default() });
                     self.terms.insert(run[0].to_string(), id);
                     id
                 }
             };
             let p = &mut self.postings[id as usize];
-            let block = row >> SHIFT;
-            if p.blocks.last() != Some(&block) {
-                p.blocks.push(block);
-                p.masks.push(0);
-                p.offsets.push(p.tfs.len() as u32);
-                p.max_tf.push(0);
-                p.min_dl.push(u8::MAX);
-            }
-            let tf = if run.len() >= TF_ESCAPE as usize {
-                self.big_tf.insert((id, p.tfs.len() as u32), run.len() as u32);
-                TF_ESCAPE
+            if p.last == NONE || p.last >> SHIFT != row >> SHIFT {
+                self.singles += 1;
+                p.in_block = 1;
             } else {
-                run.len() as u8
-            };
-            *p.masks.last_mut().unwrap() |= 1u64 << (row & 63);
-            p.tfs.push(tf);
-            let last = p.blocks.len() - 1;
-            p.max_tf[last] = p.max_tf[last].max(tf);
-            p.min_dl[last] = p.min_dl[last].min(code);
+                if p.in_block == 1 {
+                    self.singles -= 1;
+                    self.multis += 1;
+                    self.multi_rows += 1;
+                }
+                self.multi_rows += 1;
+                p.in_block += 1;
+            }
+            put_varint(&mut p.bytes, if p.last == NONE { row } else { row - p.last });
+            put_varint(&mut p.bytes, run.len() as u32);
+            p.last = row;
         }
     }
 
     pub fn finish(self) -> Index {
-        let Builder { terms, mut postings, big_tf, dl, total_len } = self;
-        for p in &mut postings {
-            p.blocks.shrink_to_fit();
-            p.masks.shrink_to_fit();
-            p.offsets.shrink_to_fit();
-            p.max_tf.shrink_to_fit();
-            p.min_dl.shrink_to_fit();
-            p.tfs.shrink_to_fit();
+        let Builder { terms, mut postings, dl, total_len, singles, multis, multi_rows } = self;
+        let n_terms = postings.len();
+        let mut names = vec![String::new(); n_terms];
+        for (name, id) in terms {
+            names[id as usize] = name;
         }
-        let stats = Stats::new(dl.len(), total_len);
-        Index { terms, postings, big_tf, dl, stats }
+        let mut order: Vec<u32> = (0..n_terms as u32).collect();
+        order.sort_unstable_by(|&a, &b| names[a as usize].cmp(&names[b as usize]));
+
+        let dl_codes: Vec<u8> = dl.iter().map(|&d| dl_code(d)).collect();
+        let mut idx = Index {
+            lex_bytes: Vec::with_capacity(names.iter().map(String::len).sum()),
+            lex_off: Vec::with_capacity(n_terms + 1),
+            s_start: Vec::with_capacity(n_terms + 1),
+            m_start: Vec::with_capacity(n_terms + 1),
+            mt_start: Vec::with_capacity(n_terms + 1),
+            s_rows: Vec::with_capacity(singles),
+            s_tfs: Vec::with_capacity(singles),
+            m_blocks: Vec::with_capacity(multis),
+            m_masks: Vec::with_capacity(multis),
+            m_tf_off: Vec::with_capacity(multis),
+            m_max_tf: Vec::with_capacity(multis),
+            m_min_dl: Vec::with_capacity(multis),
+            m_tfs: Vec::with_capacity(multi_rows),
+            big_tf: HashMap::new(),
+            stats: Stats::new(dl.len(), total_len),
+            dl_codes,
+            dl,
+        };
+        let mut rows: Vec<(u32, u32)> = Vec::new(); // one term's (row, tf), reused
+        for (new_id, &old) in order.iter().enumerate() {
+            idx.lex_off.push(idx.lex_bytes.len());
+            idx.lex_bytes.extend_from_slice(std::mem::take(&mut names[old as usize]).as_bytes());
+            idx.s_start.push(idx.s_rows.len());
+            idx.m_start.push(idx.m_blocks.len());
+            idx.mt_start.push(idx.m_tfs.len());
+
+            let bytes = std::mem::take(&mut postings[old as usize].bytes); // freed after this term
+            let (mut pos, mut row) = (0, 0u32);
+            rows.clear();
+            while pos < bytes.len() {
+                row += get_varint(&bytes, &mut pos);
+                rows.push((row, get_varint(&bytes, &mut pos)));
+            }
+            for &(row, tf) in rows.iter().filter(|r| r.1 >= TF_ESCAPE as u32) {
+                idx.big_tf.insert((new_id as u32, row), tf);
+            }
+            let tfs_start = idx.m_tfs.len();
+            for group in rows.chunk_by(|a, b| a.0 >> SHIFT == b.0 >> SHIFT) {
+                if let [(row, tf)] = group {
+                    idx.s_rows.push(*row);
+                    idx.s_tfs.push(stored_tf(*tf as usize));
+                    continue;
+                }
+                let (mut mask, mut max_tf, mut min_dl) = (0u64, 0u8, u8::MAX);
+                idx.m_tf_off.push((idx.m_tfs.len() - tfs_start) as u32);
+                for &(row, tf) in group {
+                    let tf = stored_tf(tf as usize);
+                    mask |= 1 << (row & 63);
+                    max_tf = max_tf.max(tf);
+                    min_dl = min_dl.min(idx.dl_codes[row as usize]);
+                    idx.m_tfs.push(tf);
+                }
+                idx.m_blocks.push(group[0].0 >> SHIFT);
+                idx.m_masks.push(mask);
+                idx.m_max_tf.push(max_tf);
+                idx.m_min_dl.push(min_dl);
+            }
+        }
+        idx.lex_off.push(idx.lex_bytes.len());
+        idx.s_start.push(idx.s_rows.len());
+        idx.m_start.push(idx.m_blocks.len());
+        idx.mt_start.push(idx.m_tfs.len());
+        debug_assert_eq!((idx.s_rows.len(), idx.m_blocks.len(), idx.m_tfs.len()), (singles, multis, multi_rows));
+        idx
     }
 }
 
@@ -522,22 +737,28 @@ mod tests {
 
     #[test]
     fn block_bounds_never_underestimate() {
+        let (mut singles, mut multis) = (0, 0);
         for docs in corpora() {
             let idx = Index::build(&docs);
-            for (id, p) in idx.postings.iter().enumerate() {
-                let t = Term { id: id as u32, p, idf: idx.stats.idf(p.tfs.len()) };
-                for i in 0..p.blocks.len() {
-                    let (mut bits, mut j) = (p.masks[i], p.offsets[i] as usize);
-                    while bits != 0 {
-                        let row = ((p.blocks[i] << SHIFT) | bits.trailing_zeros()) as usize;
-                        let (s, ub) = (idx.score(&t, j, row), idx.block_bound(&t, i));
-                        assert!(s <= ub, "term {id} row {row}: score {s} above bound {ub}");
-                        j += 1;
-                        bits &= bits - 1;
+            for id in 0..idx.lex_off.len() as u32 - 1 {
+                let t = idx.term(id);
+                singles += t.singles.len();
+                multis += t.multis.len();
+                for e in t.singles.clone().map(Entry::Single).chain(t.multis.clone().map(Entry::Multi)) {
+                    let (mask, ub) = idx.mask_and_bound(&t, e);
+                    let b = match e {
+                        Entry::Single(k) => idx.s_rows[k] >> SHIFT,
+                        Entry::Multi(i) => idx.m_blocks[i],
+                    };
+                    let mut scores = [0f32; 64];
+                    idx.score_block(&t, e, b, mask, &mut scores);
+                    for s in (0..64).filter(|s| mask >> s & 1 == 1) {
+                        assert!(scores[s] > 0.0 && scores[s] <= ub, "term {id} block {b}: {} above {ub}", scores[s]);
                     }
                 }
             }
         }
+        assert!(singles > 1000 && multis > 1000, "both entry kinds are exercised: {singles} {multis}");
     }
 
     #[test]
