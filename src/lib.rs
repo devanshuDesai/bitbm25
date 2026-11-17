@@ -39,71 +39,11 @@ pub struct Index {
 impl Index {
     /// Builds an in-memory index; row id = position in `docs`. Docs are pre-tokenized: whitespace-separated terms.
     pub fn build<S: AsRef<str>>(docs: &[S]) -> Self {
-        let n = docs.len();
-        let mut terms: HashMap<String, u32> = HashMap::new();
-        let mut raw: Vec<Vec<(u32, u32)>> = Vec::new(); // per term: (row, tf)
-        let mut dl = Vec::with_capacity(n);
-        let mut tf: HashMap<&str, u32> = HashMap::new();
-        for (row, doc) in docs.iter().enumerate() {
-            tf.clear();
-            let mut len = 0u32;
-            for tok in doc.as_ref().split_ascii_whitespace() {
-                *tf.entry(tok).or_default() += 1;
-                len += 1;
-            }
-            dl.push(len);
-            for (&t, &c) in &tf {
-                let id = *terms.entry(t.to_string()).or_insert_with(|| {
-                    raw.push(Vec::new());
-                    raw.len() as u32 - 1
-                });
-                raw[id as usize].push((row as u32, c));
-            }
+        let mut b = Builder::default();
+        for d in docs {
+            b.add(d.as_ref());
         }
-        // HashMap iteration order is arbitrary, so restore row order within each list.
-        for p in &mut raw {
-            p.sort_unstable_by_key(|&(row, _)| row);
-        }
-
-        let nf = n as f64;
-        let avgdl = dl.iter().map(|&x| x as f64).sum::<f64>() / nf.max(1.0);
-        let impact = |df: usize, tf: u32, dl: u32| -> f64 {
-            let idf = (1.0 + (nf - df as f64 + 0.5) / (df as f64 + 0.5)).ln();
-            let tf = tf as f64;
-            idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl as f64 / avgdl))
-        };
-        let max = raw
-            .iter()
-            .flat_map(|p| p.iter().map(|&(r, c)| impact(p.len(), c, dl[r as usize])))
-            .fold(0.0f64, f64::max);
-        let scale = ((max / 255.0) * (1.0 + 1e-6)).max(f64::MIN_POSITIVE) as f32;
-
-        let postings = raw
-            .iter()
-            .map(|p| {
-                let mut out = Postings::default();
-                for &(row, c) in p {
-                    let block = row >> SHIFT;
-                    if out.blocks.last() != Some(&block) {
-                        out.blocks.push(block);
-                        out.masks.push(0);
-                        out.ubs.push(0);
-                        out.offsets.push(out.impacts.len() as u32);
-                    }
-                    let imp = impact(p.len(), c, dl[row as usize]) as f32;
-                    *out.masks.last_mut().unwrap() |= 1u64 << (row & 63);
-                    out.impacts.push(imp);
-                    let mut ub = ((imp / scale).ceil() as u32).clamp(1, 255);
-                    if (ub as f32) * scale < imp && ub < 255 {
-                        ub += 1; // guard against f32 rounding making the bound unsafe
-                    }
-                    let last = out.ubs.last_mut().unwrap();
-                    *last = (*last).max(ub as u8);
-                }
-                out
-            })
-            .collect();
-        Index { terms, postings, n_blocks: n.div_ceil(64), scale }
+        b.finish()
     }
 
     /// Postings for distinct query terms. None means an AND query can match nothing.
@@ -225,6 +165,94 @@ impl Index {
     }
 }
 
+/// Streaming index construction: docs are added one at a time in row order and not retained, so a
+/// corpus never has to be in memory alongside its index. Rows only ever increase, so each term's
+/// postings are appended already sorted.
+#[derive(Default)]
+pub struct Builder {
+    terms: HashMap<String, u32>,
+    postings: Vec<Postings>, // `impacts` holds raw term frequencies until `finish`
+    dl: Vec<u32>,
+}
+
+impl Builder {
+    pub fn add(&mut self, doc: &str) {
+        let row = self.dl.len() as u32;
+        let mut toks: Vec<&str> = doc.split_ascii_whitespace().collect();
+        self.dl.push(toks.len() as u32);
+        toks.sort_unstable();
+        for run in toks.chunk_by(|a, b| a == b) {
+            let id = match self.terms.get(run[0]) {
+                Some(&id) => id,
+                None => {
+                    self.postings.push(Postings::default());
+                    let id = self.postings.len() as u32 - 1;
+                    self.terms.insert(run[0].to_string(), id);
+                    id
+                }
+            };
+            let p = &mut self.postings[id as usize];
+            let block = row >> SHIFT;
+            if p.blocks.last() != Some(&block) {
+                p.blocks.push(block);
+                p.masks.push(0);
+                p.ubs.push(0);
+                p.offsets.push(p.impacts.len() as u32);
+            }
+            *p.masks.last_mut().unwrap() |= 1u64 << (row & 63);
+            p.impacts.push(run.len() as f32);
+        }
+    }
+
+    pub fn finish(self) -> Index {
+        let Builder { terms, mut postings, dl } = self;
+        let n = dl.len();
+        let nf = n as f64;
+        let avgdl = dl.iter().map(|&x| x as f64).sum::<f64>() / nf.max(1.0);
+        let impact = |df: usize, tf: f32, dl: u32| -> f64 {
+            let idf = (1.0 + (nf - df as f64 + 0.5) / (df as f64 + 0.5)).ln();
+            let tf = tf as f64;
+            idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl as f64 / avgdl))
+        };
+        // Term frequencies -> exact impacts. Mask bits ascend in row order, matching `impacts`.
+        let mut max = 0.0f64;
+        for p in &mut postings {
+            let df = p.impacts.len();
+            let mut j = 0;
+            for (&block, &mask) in p.blocks.iter().zip(&p.masks) {
+                let mut m = mask;
+                while m != 0 {
+                    let row = (block << SHIFT) | m.trailing_zeros();
+                    let imp = impact(df, p.impacts[j], dl[row as usize]);
+                    max = max.max(imp);
+                    p.impacts[j] = imp as f32;
+                    j += 1;
+                    m &= m - 1;
+                }
+            }
+        }
+        let scale = ((max / 255.0) * (1.0 + 1e-6)).max(f64::MIN_POSITIVE) as f32;
+        for p in &mut postings {
+            for bi in 0..p.blocks.len() {
+                let end = p.offsets.get(bi + 1).map_or(p.impacts.len(), |&o| o as usize);
+                for &imp in &p.impacts[p.offsets[bi] as usize..end] {
+                    let mut ub = ((imp / scale).ceil() as u32).clamp(1, 255);
+                    if (ub as f32) * scale < imp && ub < 255 {
+                        ub += 1; // guard against f32 rounding making the bound unsafe
+                    }
+                    p.ubs[bi] = p.ubs[bi].max(ub as u8);
+                }
+            }
+            p.blocks.shrink_to_fit();
+            p.masks.shrink_to_fit();
+            p.ubs.shrink_to_fit();
+            p.offsets.shrink_to_fit();
+            p.impacts.shrink_to_fit();
+        }
+        Index { terms, postings, n_blocks: n.div_ceil(64), scale }
+    }
+}
+
 #[derive(PartialEq)]
 struct Hit(f32, u32);
 impl Eq for Hit {}
@@ -270,21 +298,28 @@ mod py {
 
     #[pymethods]
     impl PyIndex {
+        // Takes any iterable of str and indexes it in one streaming pass, so the caller can stream a
+        // corpus from disk; each string is borrowed only while it is being indexed.
         #[new]
-        fn new(docs: Vec<String>) -> Self {
-            PyIndex(super::Index::build(&docs))
+        fn new(docs: &Bound<'_, PyAny>) -> PyResult<Self> {
+            let mut b = super::Builder::default();
+            for d in docs.try_iter()? {
+                b.add(d?.cast::<pyo3::types::PyString>()?.to_str()?);
+            }
+            Ok(PyIndex(b.finish()))
         }
 
+        // Searches release the GIL so concurrent Python threads run in parallel.
         #[pyo3(signature = (terms, conjunctive = false, k = 10))]
-        fn top_k(&self, terms: Vec<String>, conjunctive: bool, k: usize) -> Vec<u32> {
+        fn top_k(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool, k: usize) -> Vec<u32> {
             let t: Vec<&str> = terms.iter().map(String::as_str).collect();
-            self.0.top_k(&t, conjunctive, k).into_iter().map(|(r, _)| r).collect()
+            py.detach(|| self.0.top_k(&t, conjunctive, k).into_iter().map(|(r, _)| r).collect())
         }
 
         #[pyo3(signature = (terms, conjunctive = false))]
-        fn count(&self, terms: Vec<String>, conjunctive: bool) -> u64 {
+        fn count(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool) -> u64 {
             let t: Vec<&str> = terms.iter().map(String::as_str).collect();
-            self.0.count(&t, conjunctive)
+            py.detach(|| self.0.count(&t, conjunctive))
         }
 
         fn size_bytes(&self) -> usize {
