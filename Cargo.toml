@@ -10,6 +10,8 @@ name = "bitbm25"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+crc32fast = "1.5.5"
+memmap2 = "0.9.12"
 pyo3 = { version = "0.30", features = ["extension-module", "abi3-py312"], optional = true }
 
 [features]
