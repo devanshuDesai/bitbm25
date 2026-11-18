@@ -36,6 +36,9 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
+mod collection;
+pub use collection::Collection;
+
 pub const K1: f64 = 1.2;
 pub const B: f64 = 0.75;
 const SHIFT: u32 = 6; // 64 rows per block
@@ -61,8 +64,9 @@ fn stored_tf(tf: usize) -> u8 {
     tf.min(TF_ESCAPE as usize) as u8
 }
 
-/// Collection statistics and the values derived from them. This is the only state that would be
-/// recomputed when rows are added; postings never are.
+/// Collection statistics and the values derived from them. Queries over several segments use
+/// statistics over all of them; postings never change.
+#[derive(Clone)]
 struct Stats {
     total_len: u64,
     n: f64,
@@ -82,6 +86,13 @@ impl Stats {
     fn idf(&self, df: usize) -> f32 {
         let df = df as f64;
         (1.0 + (self.n - df + 0.5) / (df + 0.5)).ln() as f32
+    }
+
+    /// These statistics for scoring a segment whose bounds were computed with `seg`'s: a larger
+    /// average length raises every tf_part by at most the ratio, so bounds are scaled by it.
+    fn for_segment(&self, seg: &Stats) -> Stats {
+        let scale = ((self.avgdl / seg.avgdl).max(1.0) * (1.0 + 1e-6)) as f32;
+        Stats { unit: self.unit * scale, ..self.clone() }
     }
 }
 
@@ -127,6 +138,21 @@ impl<T> Deref for Arr<T> {
     fn deref(&self) -> &[T] {
         // SAFETY: `ptr` is aligned and valid for `len` elements for as long as `_owner` lives.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// Replaces `path` with what `write` writes, atomically: it goes to `path.tmp`, is synced, then
+/// renamed, so a crash leaves the old file or the new one.
+fn replace_file(path: &Path, write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let mut w = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
+    write(&mut w)?;
+    w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => File::open(dir)?.sync_all(), // make the rename durable
+        _ => File::open(".")?.sync_all(),
     }
 }
 
@@ -193,14 +219,15 @@ pub struct Index {
     // The rare tf >= 255: big_keys is sorted (term id << 32 | row), big_tfs the matching tfs.
     big_keys: Arr<u64>,
     big_tfs: Arr<u32>,
-    dl: Arr<u32>, // exact length of each row
+    dl: Arr<u32>,  // exact length of each row
+    ids: Arr<u64>, // each row's id, ascending; ids outlive merges, row numbers don't
     stats: Stats,
     crcs: Option<[u32; SECTIONS]>, // of each section, when opened from a file
 }
 
 const MAGIC: &[u8; 8] = b"BITBM25\0";
-const VERSION: u32 = 1;
-const SECTIONS: usize = 16;
+const VERSION: u32 = 2;
+const SECTIONS: usize = 17;
 // Header: magic, version u32, section count u32, k1 f64, b f64, block shift u32, tf escape u32,
 // rows u64, total length u64, then per section (offset u64, bytes u64, crc32 u32, zero u32), then a
 // crc32 of all of that. Sections follow, each 8-byte aligned.
@@ -231,40 +258,59 @@ impl Index {
         None
     }
 
-    fn term(&self, id: u32) -> Term {
+    fn term(&self, id: u32, idf: f32) -> Term {
         let i = id as usize;
-        let mut t = Term {
+        Term {
             id,
-            idf: 0.0,
+            idf,
             singles: self.s_start[i]..self.s_start[i + 1],
             multis: self.m_start[i]..self.m_start[i + 1],
             tfs_start: self.mt_start[i],
-        };
-        t.idf = self.stats.idf(t.df(self));
-        t
-    }
-
-    /// Distinct query terms (a repeated term counts once). None means an AND query can match nothing.
-    fn resolve(&self, terms: &[&str], and: bool) -> Option<Vec<Term>> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for t in terms {
-            if !seen.insert(*t) {
-                continue;
-            }
-            match self.lookup(t) {
-                Some(id) => out.push(self.term(id)),
-                None if and => return None,
-                None => {}
-            }
         }
-        (!out.is_empty()).then_some(out)
     }
 
-    fn mask_and_bound(&self, t: &Term, e: Entry) -> (u64, f32) {
+    fn term_df(&self, id: u32) -> usize {
+        self.term(id, 0.0).df(self)
+    }
+
+    fn rows(&self) -> usize {
+        self.dl.len()
+    }
+
+    fn mask_and_bound(&self, st: &Stats, t: &Term, e: Entry) -> (u64, f32) {
         match e {
-            Entry::Single(k) => (1 << (self.s_rows[k] & 63), t.idf * self.s_ub[k] as f32 * self.stats.unit),
-            Entry::Multi(i) => (self.m_masks[i], t.idf * self.m_ub[i] as f32 * self.stats.unit),
+            Entry::Single(k) => (1 << (self.s_rows[k] & 63), t.idf * self.s_ub[k] as f32 * st.unit),
+            Entry::Multi(i) => (self.m_masks[i], t.idf * self.m_ub[i] as f32 * st.unit),
+        }
+    }
+
+    fn big_tf(&self, term: u32, row: u32) -> u32 {
+        let key = (term as u64) << 32 | row as u64;
+        self.big_tfs[self.big_keys.binary_search(&key).expect("escaped tf has an entry")]
+    }
+
+    /// Calls `f(row, tf)` for each row containing term `id`, in row order.
+    fn for_each_posting(&self, id: u32, mut f: impl FnMut(u32, u32)) {
+        let t = self.term(id, 0.0);
+        let tf = |stored: u8, row: u32| if stored == TF_ESCAPE { self.big_tf(id, row) } else { stored as u32 };
+        let (mut si, mut mi) = (t.singles.start, t.multis.start);
+        while si < t.singles.end || mi < t.multis.end {
+            // A term's singles and multis never share a block.
+            if mi == t.multis.end || (si < t.singles.end && self.s_rows[si] >> SHIFT < self.m_blocks[mi]) {
+                let row = self.s_rows[si];
+                f(row, tf(self.s_tfs[si], row));
+                si += 1;
+            } else {
+                let (b, mut bits) = (self.m_blocks[mi], self.m_masks[mi]);
+                let mut j = t.tfs_start + self.m_tf_off[mi] as usize;
+                while bits != 0 {
+                    let row = b << SHIFT | bits.trailing_zeros();
+                    f(row, tf(self.m_tfs[j], row));
+                    j += 1;
+                    bits &= bits - 1;
+                }
+                mi += 1;
+            }
         }
     }
 
@@ -282,25 +328,22 @@ impl Index {
     }
 
     /// Score of row `row`, whose stored term frequency for `t` is `stored`.
-    fn score(&self, t: &Term, stored: u8, row: u32) -> f32 {
+    fn score(&self, st: &Stats, t: &Term, stored: u8, row: u32) -> f32 {
         let tf = match stored {
-            TF_ESCAPE => {
-                let key = (t.id as u64) << 32 | row as u64;
-                self.big_tfs[self.big_keys.binary_search(&key).expect("escaped tf has an entry")] as f32
-            }
+            TF_ESCAPE => self.big_tf(t.id, row) as f32,
             tf => tf as f32,
         };
-        let s = &self.stats;
+        let s = st;
         t.idf * tf * (K1 + 1.0) as f32 / (tf + s.c0 + s.c1 * self.dl[row as usize] as f32)
     }
 
     /// Adds the scores of term `t` in block `b` to `scores`, for the rows in `present`.
-    fn score_block(&self, t: &Term, e: Entry, b: u32, present: u64, scores: &mut [f32; 64]) {
+    fn score_block(&self, st: &Stats, t: &Term, e: Entry, b: u32, present: u64, scores: &mut [f32; 64]) {
         match e {
             Entry::Single(k) => {
                 let row = self.s_rows[k];
                 if present >> (row & 63) & 1 == 1 {
-                    scores[(row & 63) as usize] += self.score(t, self.s_tfs[k], row);
+                    scores[(row & 63) as usize] += self.score(st, t, self.s_tfs[k], row);
                 }
             }
             Entry::Multi(i) => {
@@ -309,7 +352,7 @@ impl Index {
                 while bits != 0 {
                     let s = bits.trailing_zeros();
                     let j = start + (mask & ((1u64 << s) - 1)).count_ones() as usize;
-                    scores[s as usize] += self.score(t, self.m_tfs[j], (b << SHIFT) | s);
+                    scores[s as usize] += self.score(st, t, self.m_tfs[j], (b << SHIFT) | s);
                     bits &= bits - 1;
                 }
             }
@@ -317,7 +360,7 @@ impl Index {
     }
 
     /// (block, summed upper bound, rows matching all terms) for every block where all terms co-occur.
-    fn and_blocks(&self, ts: &[Term]) -> Vec<(u32, f32, u64)> {
+    fn and_blocks(&self, st: &Stats, ts: &[Term]) -> Vec<(u32, f32, u64)> {
         let entries = |t: &Term| t.singles.len() + t.multis.len();
         let rarest = (0..ts.len()).min_by_key(|&i| entries(&ts[i])).unwrap();
         let mut cursors = vec![(0usize, 0usize); ts.len()];
@@ -338,7 +381,7 @@ impl Index {
                 Entry::Single(_) => si += 1,
                 Entry::Multi(_) => mi += 1,
             }
-            let (mut mask, mut ub) = self.mask_and_bound(r, e);
+            let (mut mask, mut ub) = self.mask_and_bound(st, r, e);
             for (k, t) in ts.iter().enumerate() {
                 if k == rarest {
                     continue;
@@ -349,7 +392,7 @@ impl Index {
                     }
                     continue 'blocks;
                 };
-                let (m, bound) = self.mask_and_bound(t, e);
+                let (m, bound) = self.mask_and_bound(st, t, e);
                 mask &= m;
                 ub += bound;
                 if mask == 0 {
@@ -362,20 +405,20 @@ impl Index {
     }
 
     /// (block, summed upper bound, rows matching any term) for every block touched by a term.
-    fn or_blocks(&self, ts: &[Term]) -> Vec<(u32, f32, u64)> {
+    fn or_blocks(&self, st: &Stats, ts: &[Term]) -> Vec<(u32, f32, u64)> {
         // ponytail: dense per-query arrays sized to the whole collection; reuse a scratch buffer at scale
         let n_blocks = self.dl.len().div_ceil(64);
         let mut ub = vec![0f32; n_blocks];
         let mut mask = vec![0u64; n_blocks];
         for t in ts {
             for k in t.singles.clone() {
-                let (m, bound) = self.mask_and_bound(t, Entry::Single(k));
+                let (m, bound) = self.mask_and_bound(st, t, Entry::Single(k));
                 let b = (self.s_rows[k] >> SHIFT) as usize;
                 ub[b] += bound;
                 mask[b] |= m;
             }
             for i in t.multis.clone() {
-                let (m, bound) = self.mask_and_bound(t, Entry::Multi(i));
+                let (m, bound) = self.mask_and_bound(st, t, Entry::Multi(i));
                 let b = self.m_blocks[i] as usize;
                 ub[b] += bound;
                 mask[b] |= m;
@@ -384,60 +427,62 @@ impl Index {
         (0..n_blocks).filter(|&b| mask[b] != 0).map(|b| (b as u32, ub[b], mask[b])).collect()
     }
 
-    /// Exact BM25 top-k as (row, score), best first. Ties on score go to the lower row.
-    pub fn top_k(&self, terms: &[&str], and: bool, k: usize) -> Vec<(u32, f32)> {
-        self.search(terms, and, k, true)
-    }
-
-    /// `top_k` scoring every matching row instead of stopping early: the same answer, slowly. For
-    /// checking that pruning never changes results.
-    pub fn top_k_exhaustive(&self, terms: &[&str], and: bool, k: usize) -> Vec<(u32, f32)> {
-        self.search(terms, and, k, false)
-    }
-
-    fn search(&self, terms: &[&str], and: bool, k: usize, prune: bool) -> Vec<(u32, f32)> {
-        let Some(ts) = self.resolve(terms, and) else { return vec![] };
-        if k == 0 {
-            return vec![];
+    /// Blocks where the terms match (all of them if `and`), less rows deleted in `del`.
+    fn blocks(&self, st: &Stats, ts: &[Term], and: bool, del: &[u64]) -> Vec<(u32, f32, u64)> {
+        let mut blocks = if and { self.and_blocks(st, ts) } else { self.or_blocks(st, ts) };
+        if !del.is_empty() {
+            blocks.retain_mut(|(b, _, m)| {
+                *m &= !del[*b as usize];
+                *m != 0
+            });
         }
-        let blocks = if and { self.and_blocks(&ts) } else { self.or_blocks(&ts) };
+        blocks
+    }
+
+    /// Scores this segment's matches into `top`, which may already hold other segments' hits.
+    #[allow(clippy::too_many_arguments)]
+    fn search_into(&self, st: &Stats, ts: &[Term], and: bool, del: &[u64], prune: bool, top: &mut TopK) {
         // A max-heap on the bound: heapifying is O(n) and only the blocks actually visited are
         // popped, where a full sort would order all of them. Bounds are non-negative, so their bit
         // patterns sort like their values.
         let mut blocks: BinaryHeap<(u32, u32, u64)> =
-            blocks.into_iter().map(|(b, ub, m)| (ub.to_bits(), u32::MAX - b, m)).collect();
-        let mut top = TopK { k, heap: BinaryHeap::with_capacity(k + 1) };
+            self.blocks(st, ts, and, del).into_iter().map(|(b, ub, m)| (ub.to_bits(), u32::MAX - b, m)).collect();
         while let Some((ub, rb, present)) = blocks.pop() {
             let (b, ub) = (u32::MAX - rb, f32::from_bits(ub));
-            // Strict `<` keeps blocks that could hold a tie (a lower row wins it). The 1e-5 margin
+            // Strict `<` keeps blocks that could hold a tie (a lower id wins it). The 1e-5 margin
             // covers f32 rounding when a row's term scores are summed.
-            if prune && top.heap.len() == k && ub * (1.0 + 1e-5) < top.threshold() {
+            if prune && top.heap.len() == top.k && ub * (1.0 + 1e-5) < top.threshold() {
                 break; // no remaining block can beat the current k-th score
             }
             let mut scores = [0f32; 64];
-            for t in &ts {
+            for t in ts {
                 if let Some(e) = self.seek(t, &mut (0, 0), b) {
-                    self.score_block(t, e, b, present, &mut scores);
+                    self.score_block(st, t, e, b, present, &mut scores);
                 }
             }
             let mut bits = present;
             while bits != 0 {
                 let s = bits.trailing_zeros();
-                top.push((b << SHIFT) | s, scores[s as usize]);
+                top.push(self.ids[((b << SHIFT) | s) as usize], scores[s as usize]);
                 bits &= bits - 1;
             }
         }
-        top.into_sorted()
+    }
+
+    /// Exact BM25 top-k as (row id, score), best first. Ties on score go to the lower id.
+    pub fn top_k(&self, terms: &[&str], and: bool, k: usize) -> Vec<(u64, f32)> {
+        search(&[(self, &[])], terms, and, k, true)
+    }
+
+    /// `top_k` scoring every matching row instead of stopping early: the same answer, slowly. For
+    /// checking that pruning never changes results.
+    pub fn top_k_exhaustive(&self, terms: &[&str], and: bool, k: usize) -> Vec<(u64, f32)> {
+        search(&[(self, &[])], terms, and, k, false)
     }
 
     /// Exact number of matching rows.
     pub fn count(&self, terms: &[&str], and: bool) -> u64 {
-        let Some(ts) = self.resolve(terms, and) else { return 0 };
-        if ts.len() == 1 {
-            return ts[0].df(self) as u64;
-        }
-        let blocks = if and { self.and_blocks(&ts) } else { self.or_blocks(&ts) };
-        blocks.iter().map(|&(_, _, m)| m.count_ones() as u64).sum()
+        count(&[(self, &[])], terms, and)
     }
 
     /// Size of the index's arrays, which is also its file size less a few hundred bytes of header.
@@ -464,6 +509,7 @@ impl Index {
             as_bytes(&self.big_keys),
             as_bytes(&self.big_tfs),
             as_bytes(&self.dl),
+            as_bytes(&self.ids),
         ]
     }
 
@@ -493,20 +539,14 @@ impl Index {
         h.extend_from_slice(&crc32fast::hash(&h).to_le_bytes());
         h.resize(DATA_AT, 0);
 
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let mut w = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
-        w.write_all(&h)?;
-        for s in secs {
-            w.write_all(s)?;
-            w.write_all(&[0; 8][..s.len().next_multiple_of(8) - s.len()])?;
-        }
-        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        match path.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => File::open(dir)?.sync_all(), // make the rename durable
-            _ => File::open(".")?.sync_all(),
-        }
+        replace_file(path, |w| {
+            w.write_all(&h)?;
+            for s in secs {
+                w.write_all(s)?;
+                w.write_all(&[0; 8][..s.len().next_multiple_of(8) - s.len()])?;
+            }
+            Ok(())
+        })
     }
 
     /// Opens a saved index by mapping it: nothing is read until queries touch it, so this is
@@ -562,6 +602,7 @@ impl Index {
             big_keys: arr!(13),
             big_tfs: arr!(14),
             dl: arr!(15),
+            ids: arr!(16),
             stats: Stats::new(rows as usize, total_len),
             crcs: Some(crcs),
         };
@@ -585,6 +626,7 @@ impl Index {
             && [self.s_tfs.len(), self.s_ub.len()] == [self.s_rows.len(); 2]
             && [self.m_masks.len(), self.m_tf_off.len(), self.m_ub.len()] == [self.m_blocks.len(); 3]
             && self.big_tfs.len() == self.big_keys.len()
+            && self.ids.len() == self.dl.len()
     }
 
     /// Reads every byte of an opened index and checks it against the checksums written by `save`.
@@ -598,6 +640,91 @@ impl Index {
         }
         Ok(())
     }
+}
+
+/// A segment as a query sees it: its index, and its deleted rows as one bit per row (empty if none).
+type SegView<'a> = (&'a Index, &'a [u64]);
+
+/// The distinct query terms (a repeated term counts once) found in each segment, with idf from
+/// statistics over all segments, and those statistics adjusted for each segment. A segment's list is
+/// empty when it can't match. None when no segment can.
+fn resolve(segs: &[SegView], terms: &[&str], and: bool) -> Option<Vec<(Stats, Vec<Term>)>> {
+    let mut seen = HashSet::new();
+    let terms: Vec<&str> = terms.iter().copied().filter(|t| seen.insert(*t)).collect();
+    let ids: Vec<Vec<Option<u32>>> = segs.iter().map(|(s, _)| terms.iter().map(|t| s.lookup(t)).collect()).collect();
+    let df: Vec<usize> = (0..terms.len())
+        .map(|j| segs.iter().zip(&ids).map(|((s, _), ids)| ids[j].map_or(0, |id| s.term_df(id))).sum())
+        .collect();
+    if df.iter().all(|&d| d == 0) || (and && df.contains(&0)) {
+        return None;
+    }
+    // ponytail: deleted rows count toward n, df and avgdl until a merge drops them, as in Lucene;
+    // exact live statistics would need each deleted row's terms.
+    let rows = segs.iter().map(|(s, _)| s.rows()).sum();
+    let all = Stats::new(rows, segs.iter().map(|(s, _)| s.stats.total_len).sum());
+    let plans = segs.iter().zip(&ids).map(|((s, _), ids)| {
+        let ts = if and && ids.contains(&None) {
+            vec![]
+        } else {
+            ids.iter().zip(&df).filter_map(|(id, &df)| id.map(|id| s.term(id, all.idf(df)))).collect()
+        };
+        (all.for_segment(&s.stats), ts)
+    });
+    Some(plans.collect())
+}
+
+fn search(segs: &[SegView], terms: &[&str], and: bool, k: usize, prune: bool) -> Vec<(u64, f32)> {
+    let Some(plans) = resolve(segs, terms, and) else { return vec![] };
+    if k == 0 {
+        return vec![];
+    }
+    let mut top = TopK { k, heap: BinaryHeap::with_capacity(k + 1) };
+    for ((idx, del), (st, ts)) in segs.iter().zip(&plans) {
+        if !ts.is_empty() {
+            idx.search_into(st, ts, and, del, prune, &mut top); // the k-th score carries over, so later segments prune more
+        }
+    }
+    top.into_sorted()
+}
+
+fn count(segs: &[SegView], terms: &[&str], and: bool) -> u64 {
+    let Some(plans) = resolve(segs, terms, and) else { return 0 };
+    let per_segment = segs.iter().zip(&plans).map(|((idx, del), (st, ts))| match ts.as_slice() {
+        [] => 0,
+        [t] if del.is_empty() => t.df(idx) as u64,
+        _ => idx.blocks(st, ts, and, del).iter().map(|&(_, _, m)| m.count_ones() as u64).sum(),
+    });
+    per_segment.sum()
+}
+
+fn is_deleted(del: &[u64], row: usize) -> bool {
+    del.get(row >> SHIFT).is_some_and(|w| w >> (row & 63) & 1 == 1)
+}
+
+/// The live rows of `segs`, which must be in id order, as one new segment.
+fn merge(segs: &[SegView]) -> Index {
+    let mut b = Builder::default();
+    for &(idx, del) in segs {
+        let mut remap = vec![NONE; idx.rows()]; // old row -> new row, NONE if deleted
+        for (r, new) in remap.iter_mut().enumerate().filter(|(r, _)| !is_deleted(del, *r)) {
+            *new = b.dl.len() as u32;
+            b.dl.push(idx.dl[r]);
+            b.total_len += idx.dl[r] as u64;
+            b.ids.push(idx.ids[r]);
+        }
+        for t in 0..idx.lex_off.len() - 1 {
+            let name = &idx.lex_bytes[idx.lex_off[t]..idx.lex_off[t + 1]];
+            let mut id = None; // a term with no live rows is left out
+            idx.for_each_posting(t as u32, |row, tf| {
+                let r = remap[row as usize];
+                if r != NONE {
+                    let id = *id.get_or_insert_with(|| b.term_id(name));
+                    b.push(id, r, tf);
+                }
+            });
+        }
+    }
+    b.finish()
 }
 
 /// Per-term state while building: (row delta, tf) pairs as LEB128 varints, which is far smaller than
@@ -635,9 +762,10 @@ fn get_varint(bytes: &[u8], pos: &mut usize) -> u32 {
 /// postings are appended already sorted.
 #[derive(Default)]
 pub struct Builder {
-    terms: HashMap<String, u32>,
+    terms: HashMap<Vec<u8>, u32>,
     postings: Vec<BuildTerm>,
     dl: Vec<u32>,
+    ids: Vec<u64>,
     total_len: u64,
     // Running totals, so `finish` can size the final arrays exactly.
     singles: usize,
@@ -646,54 +774,69 @@ pub struct Builder {
 }
 
 impl Builder {
+    /// Adds a row whose id is its position.
     pub fn add(&mut self, doc: &str) {
-        assert!(self.dl.len() < NONE as usize, "bitbm25 holds at most 2^32 - 1 rows");
+        self.add_with_id(self.dl.len() as u64, doc);
+    }
+
+    /// Adds a row; ids must increase.
+    pub fn add_with_id(&mut self, id: u64, doc: &str) {
+        assert!(self.dl.len() < NONE as usize, "a segment holds at most 2^32 - 1 rows");
+        assert!(self.ids.last().is_none_or(|&last| last < id), "row ids must increase");
         let row = self.dl.len() as u32;
         let mut toks: Vec<&str> = doc.split_ascii_whitespace().collect();
         let len = u32::try_from(toks.len()).expect("a row has at most 2^32 - 1 tokens");
         self.dl.push(len);
+        self.ids.push(id);
         self.total_len += len as u64;
         toks.sort_unstable();
         for run in toks.chunk_by(|a, b| a == b) {
-            let id = match self.terms.get(run[0]) {
-                Some(&id) => id,
-                None => {
-                    let id = u32::try_from(self.postings.len()).expect("at most 2^32 terms");
-                    self.postings.push(BuildTerm { last: NONE, ..Default::default() });
-                    self.terms.insert(run[0].to_string(), id);
-                    id
-                }
-            };
-            let p = &mut self.postings[id as usize];
-            if p.last == NONE || p.last >> SHIFT != row >> SHIFT {
-                self.singles += 1;
-                p.in_block = 1;
-            } else {
-                if p.in_block == 1 {
-                    self.singles -= 1;
-                    self.multis += 1;
-                    self.multi_rows += 1;
-                }
-                self.multi_rows += 1;
-                p.in_block += 1;
-            }
-            put_varint(&mut p.bytes, if p.last == NONE { row } else { row - p.last });
-            put_varint(&mut p.bytes, run.len() as u32);
-            p.last = row;
+            let term = self.term_id(run[0].as_bytes());
+            self.push(term, row, run.len() as u32);
         }
     }
 
+    fn term_id(&mut self, name: &[u8]) -> u32 {
+        if let Some(&id) = self.terms.get(name) {
+            return id;
+        }
+        let id = u32::try_from(self.postings.len()).expect("at most 2^32 terms");
+        self.postings.push(BuildTerm { last: NONE, ..Default::default() });
+        self.terms.insert(name.to_vec(), id);
+        id
+    }
+
+    /// Appends (row, tf) to a term's postings; rows must increase per term.
+    fn push(&mut self, term: u32, row: u32, tf: u32) {
+        let p = &mut self.postings[term as usize];
+        if p.last == NONE || p.last >> SHIFT != row >> SHIFT {
+            self.singles += 1;
+            p.in_block = 1;
+        } else {
+            if p.in_block == 1 {
+                self.singles -= 1;
+                self.multis += 1;
+                self.multi_rows += 1;
+            }
+            self.multi_rows += 1;
+            p.in_block += 1;
+        }
+        put_varint(&mut p.bytes, if p.last == NONE { row } else { row - p.last });
+        put_varint(&mut p.bytes, tf);
+        p.last = row;
+    }
+
     pub fn finish(self) -> Index {
-        let Builder { terms, mut postings, dl, total_len, singles, multis, multi_rows } = self;
+        let Builder { terms, mut postings, dl, ids, total_len, singles, multis, multi_rows } = self;
         let n_terms = postings.len();
-        let mut names = vec![String::new(); n_terms];
+        let mut names = vec![Vec::new(); n_terms];
         for (name, id) in terms {
             names[id as usize] = name;
         }
         let mut order: Vec<u32> = (0..n_terms as u32).collect();
         order.sort_unstable_by(|&a, &b| names[a as usize].cmp(&names[b as usize]));
 
-        let mut lex_bytes = Vec::with_capacity(names.iter().map(String::len).sum());
+        let mut lex_bytes = Vec::with_capacity(names.iter().map(Vec::len).sum());
         let mut lex_off = Vec::with_capacity(n_terms + 1);
         let mut s_start = Vec::with_capacity(n_terms + 1);
         let mut m_start = Vec::with_capacity(n_terms + 1);
@@ -712,7 +855,7 @@ impl Builder {
         let mut rows: Vec<(u32, u32)> = Vec::new(); // one term's (row, tf), reused
         for (new_id, &old) in order.iter().enumerate() {
             lex_off.push(lex_bytes.len());
-            lex_bytes.extend_from_slice(std::mem::take(&mut names[old as usize]).as_bytes());
+            lex_bytes.extend_from_slice(&std::mem::take(&mut names[old as usize]));
             s_start.push(s_rows.len());
             m_start.push(m_blocks.len());
             mt_start.push(m_tfs.len());
@@ -771,6 +914,7 @@ impl Builder {
             big_keys: big_keys.into(),
             big_tfs: big_tfs.into(),
             dl: dl.into(),
+            ids: ids.into(),
             stats,
             crcs: None,
         }
@@ -778,7 +922,7 @@ impl Builder {
 }
 
 #[derive(PartialEq)]
-struct Hit(f32, u32);
+struct Hit(f32, u64);
 impl Eq for Hit {}
 impl Ord for Hit {
     fn cmp(&self, o: &Self) -> Ordering {
@@ -801,7 +945,7 @@ impl TopK {
         self.heap.peek().map_or(f32::NEG_INFINITY, |h| h.0)
     }
     /// Ties on score go to the lower row, so results don't depend on the order blocks are visited.
-    fn push(&mut self, row: u32, score: f32) {
+    fn push(&mut self, row: u64, score: f32) {
         let hit = Hit(score, row);
         if self.heap.len() < self.k {
             self.heap.push(hit);
@@ -810,7 +954,7 @@ impl TopK {
             self.heap.push(hit);
         }
     }
-    fn into_sorted(self) -> Vec<(u32, f32)> {
+    fn into_sorted(self) -> Vec<(u64, f32)> {
         self.heap.into_sorted_vec().into_iter().map(|Hit(s, r)| (r, s)).collect()
     }
 }
@@ -854,7 +998,7 @@ mod py {
         // Searches release the GIL so concurrent Python threads run in parallel. `exhaustive`
         // scores every match instead of stopping early, for checking results; it is slow.
         #[pyo3(signature = (terms, conjunctive = false, k = 10, exhaustive = false))]
-        fn top_k(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool, k: usize, exhaustive: bool) -> Vec<u32> {
+        fn top_k(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool, k: usize, exhaustive: bool) -> Vec<u64> {
             let t: Vec<&str> = terms.iter().map(String::as_str).collect();
             py.detach(|| {
                 let hits = if exhaustive { self.0.top_k_exhaustive(&t, conjunctive, k) } else { self.0.top_k(&t, conjunctive, k) };
@@ -873,8 +1017,62 @@ mod py {
         }
     }
 
+    /// A directory-backed index taking adds and deletes; see `Collection`.
+    #[pyclass(name = "Collection", frozen)]
+    struct PyCollection(super::Collection);
+
+    #[pymethods]
+    impl PyCollection {
+        #[new]
+        fn new(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
+            Ok(PyCollection(py.detach(|| super::Collection::open(path))?))
+        }
+
+        /// Adds a row and returns its id; visible after `commit`.
+        fn add(&self, doc: &str) -> u64 {
+            self.0.add(doc)
+        }
+
+        /// Adds rows from any iterable of str; returns their ids.
+        fn add_many(&self, docs: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
+            docs.try_iter()?.map(|d| Ok(self.0.add(d?.cast::<pyo3::types::PyString>()?.to_str()?))).collect()
+        }
+
+        fn delete(&self, id: u64) {
+            self.0.delete(id)
+        }
+
+        fn commit(&self, py: Python<'_>) -> PyResult<()> {
+            Ok(py.detach(|| self.0.commit())?)
+        }
+
+        fn verify(&self, py: Python<'_>) -> PyResult<()> {
+            Ok(py.detach(|| self.0.verify())?)
+        }
+
+        #[pyo3(signature = (terms, conjunctive = false, k = 10, exhaustive = false))]
+        fn top_k(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool, k: usize, exhaustive: bool) -> Vec<u64> {
+            let t: Vec<&str> = terms.iter().map(String::as_str).collect();
+            py.detach(|| {
+                let hits = if exhaustive { self.0.top_k_exhaustive(&t, conjunctive, k) } else { self.0.top_k(&t, conjunctive, k) };
+                hits.into_iter().map(|(r, _)| r).collect()
+            })
+        }
+
+        #[pyo3(signature = (terms, conjunctive = false))]
+        fn count(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool) -> u64 {
+            let t: Vec<&str> = terms.iter().map(String::as_str).collect();
+            py.detach(|| self.0.count(&t, conjunctive))
+        }
+
+        fn __len__(&self) -> usize {
+            self.0.len() as usize
+        }
+    }
+
     #[pymodule]
     fn bitbm25(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_class::<PyCollection>()?;
         m.add_class::<PyIndex>()
     }
 }
@@ -884,7 +1082,7 @@ mod tests {
     use super::*;
 
     /// Deterministic Zipf-ish corpus: small vocabulary so terms are dense, enough rows for many blocks.
-    fn corpus(n: usize, seed: u64, max_len: u64) -> Vec<String> {
+    pub(crate) fn corpus(n: usize, seed: u64, max_len: u64) -> Vec<String> {
         let mut s = seed;
         let mut next = move || {
             s ^= s << 13;
@@ -906,12 +1104,18 @@ mod tests {
             .collect()
     }
 
-    /// Exhaustive reference: (row, score) for every matching row.
-    fn brute(docs: &[String], q: &[&str], and: bool) -> Vec<(u32, f64)> {
+    /// Exhaustive reference: (row, score) for every matching row, row = position.
+    fn brute(docs: &[String], q: &[&str], and: bool) -> Vec<(u64, f64)> {
+        let rows: Vec<(u64, &str, bool)> = docs.iter().enumerate().map(|(i, d)| (i as u64, d.as_str(), true)).collect();
+        brute_rows(&rows, q, and)
+    }
+
+    /// Exhaustive reference over (id, doc, live) rows: statistics count every row, results only live ones.
+    pub(crate) fn brute_rows(rows: &[(u64, &str, bool)], q: &[&str], and: bool) -> Vec<(u64, f64)> {
         let mut seen = HashSet::new();
         let q: Vec<&str> = q.iter().copied().filter(|t| seen.insert(*t)).collect(); // duplicates count once
-        let toks: Vec<Vec<&str>> = docs.iter().map(|d| d.split_whitespace().collect()).collect();
-        let n = docs.len() as f64;
+        let toks: Vec<Vec<&str>> = rows.iter().map(|r| r.1.split_whitespace().collect()).collect();
+        let n = rows.len() as f64;
         let avgdl = toks.iter().map(|t| t.len() as f64).sum::<f64>() / n;
         let mut dfs: HashMap<&str, f64> = HashMap::new();
         for d in &toks {
@@ -921,9 +1125,9 @@ mod tests {
         }
         let df = |t: &str| dfs.get(t).copied().unwrap_or(0.0);
         let mut out = Vec::new();
-        for (row, d) in toks.iter().enumerate() {
+        for (r, d) in rows.iter().zip(&toks) {
             let hits = q.iter().filter(|t| d.contains(t)).count();
-            if hits == 0 || (and && hits < q.len()) {
+            if !r.2 || hits == 0 || (and && hits < q.len()) {
                 continue;
             }
             let score: f64 = q
@@ -934,7 +1138,7 @@ mod tests {
                     idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * d.len() as f64 / avgdl))
                 })
                 .sum();
-            out.push((row as u32, score));
+            out.push((r.0, score));
         }
         out
     }
@@ -955,22 +1159,24 @@ mod tests {
         }
     }
 
-    /// A path in the temp dir unique to this test, removed when dropped.
-    struct TempFile(std::path::PathBuf);
-    impl TempFile {
-        fn new(name: &str) -> Self {
-            TempFile(std::env::temp_dir().join(format!("bitbm25-test-{}-{name}", std::process::id())))
+    /// A path in the temp dir unique to this test, removed (file or directory) when dropped.
+    pub(crate) struct TempPath(pub(crate) std::path::PathBuf);
+    impl TempPath {
+        pub(crate) fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("bitbm25-test-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            TempPath(p)
         }
     }
-    impl Drop for TempFile {
+    impl Drop for TempPath {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(&self.0).or_else(|_| std::fs::remove_dir_all(&self.0));
         }
     }
 
     fn check_corpus(docs: &[String]) {
         let built = Index::build(docs);
-        let file = TempFile::new(&format!("corpus-{}", docs.len()));
+        let file = TempPath::new(&format!("corpus-{}", docs.len()));
         built.save(&file.0).unwrap();
         let opened = Index::open(&file.0).unwrap();
         opened.verify().unwrap();
@@ -993,16 +1199,16 @@ mod tests {
             for and in [false, true] {
                 let want = brute(docs, q, and);
                 for idx in [&built, &opened] {
-                    check_query(idx, q, and, &want);
+                    check_query(&[(idx, &[])], q, and, &want);
                 }
             }
         }
     }
 
-    fn check_query(idx: &Index, q: &[&str], and: bool, want: &[(u32, f64)]) {
-        assert_eq!(idx.count(q, and), want.len() as u64, "count {q:?} and={and}");
-        let got = idx.top_k(q, and, 10);
-        assert_eq!(idx.top_k_exhaustive(q, and, 10), got, "pruning changed {q:?} and={and}");
+    pub(crate) fn check_query(segs: &[SegView], q: &[&str], and: bool, want: &[(u64, f64)]) {
+        assert_eq!(count(segs, q, and), want.len() as u64, "count {q:?} and={and}");
+        let got = search(segs, q, and, 10, true);
+        assert_eq!(search(segs, q, and, 10, false), got, "pruning changed {q:?} and={and}");
         assert_eq!(got.len(), want.len().min(10), "len {q:?} and={and}");
         let mut sorted: Vec<f64> = want.iter().map(|w| w.1).collect();
         sorted.sort_by(|a, b| b.total_cmp(a));
@@ -1018,7 +1224,7 @@ mod tests {
     #[test]
     fn damaged_files_are_rejected() {
         let docs = corpus(500, 11, 40);
-        let file = TempFile::new("damaged");
+        let file = TempPath::new("damaged");
         Index::build(&docs).save(&file.0).unwrap();
         let good = std::fs::read(&file.0).unwrap();
         let with = |f: &dyn Fn(&mut Vec<u8>)| {
@@ -1029,12 +1235,12 @@ mod tests {
         };
         let err = |r: io::Result<Index>| r.err().expect("should fail").to_string();
         assert!(err(with(&|b| b[0] = b'X')).contains("not a bitbm25 index"));
-        assert!(err(with(&|b| b[8] = 2)).contains("version 2"));
+        assert!(err(with(&|b| b[8] = 9)).contains("version 9"));
         assert!(err(with(&|b| b[TABLE_AT + 3] ^= 1)).contains("header is corrupt"));
         assert!(err(with(&|b| b.truncate(b.len() - 100))).contains("out of bounds"));
         // A flipped bit in the postings opens (opening reads only the header) but fails verify.
         let idx = with(&|b| *b.last_mut().unwrap() ^= 1).unwrap();
-        assert!(idx.verify().unwrap_err().to_string().contains("section 15 is corrupt"));
+        assert!(idx.verify().unwrap_err().to_string().contains("section 16 is corrupt"));
         drop(idx); // unmap before the file is rewritten under it
         assert!(with(&|_| {}).unwrap().verify().is_ok());
     }
@@ -1045,17 +1251,17 @@ mod tests {
         for docs in corpora() {
             let idx = Index::build(&docs);
             for id in 0..idx.lex_off.len() as u32 - 1 {
-                let t = idx.term(id);
+                let t = idx.term(id, idx.stats.idf(idx.term_df(id)));
                 singles += t.singles.len();
                 multis += t.multis.len();
                 for e in t.singles.clone().map(Entry::Single).chain(t.multis.clone().map(Entry::Multi)) {
-                    let (mask, ub) = idx.mask_and_bound(&t, e);
+                    let (mask, ub) = idx.mask_and_bound(&idx.stats, &t, e);
                     let b = match e {
                         Entry::Single(k) => idx.s_rows[k] >> SHIFT,
                         Entry::Multi(i) => idx.m_blocks[i],
                     };
                     let mut scores = [0f32; 64];
-                    idx.score_block(&t, e, b, mask, &mut scores);
+                    idx.score_block(&idx.stats, &t, e, b, mask, &mut scores);
                     for s in (0..64).filter(|s| mask >> s & 1 == 1) {
                         assert!(scores[s] > 0.0 && scores[s] <= ub, "term {id} block {b}: {} above {ub}", scores[s]);
                     }
@@ -1072,7 +1278,7 @@ mod tests {
         let docs = vec!["a b"; 300];
         let idx = Index::build(&docs);
         for and in [false, true] {
-            let rows: Vec<u32> = idx.top_k(&["a", "b"], and, 10).into_iter().map(|(r, _)| r).collect();
+            let rows: Vec<u64> = idx.top_k(&["a", "b"], and, 10).into_iter().map(|(r, _)| r).collect();
             assert_eq!(rows, (0..10).collect::<Vec<_>>());
         }
     }

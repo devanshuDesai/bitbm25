@@ -1,6 +1,6 @@
 # bitbm25
 
-Experimental exact-BM25 search kernel (read-only for now).
+Experimental exact-BM25 search kernel.
 
 Rows are grouped into 64-row blocks keyed by row position. A term that occurs in one row of a block
 stores just that row, its term frequency and a one-byte score bound (6 bytes); a term with several
@@ -27,6 +27,12 @@ idx.save("wiki.idx")                      # atomic: temp file, fsync, rename
 idx = bitbm25.Index.open("wiki.idx")      # memory-maps the file; instant at any size
 idx.verify()                              # reads every byte and checks the checksums
 idx.top_k(terms, exhaustive=True)         # no early stopping: same answer, slowly, for checking
+
+col = bitbm25.Collection("wiki/")         # a directory; created if missing, one writer at a time
+ids = col.add_many(docs)                  # or col.add(doc); returns stable row ids
+col.delete(ids[3])
+col.commit()                              # durable and visible; merges segments
+col.top_k(["new", "york"], k=10)          # same query methods as Index
 ```
 
 The file is the in-memory arrays as they are, after a header holding a magic number, a format
@@ -37,4 +43,19 @@ cache is the only copy in memory and several processes share it. Damaged posting
 those checks make queries panic or return wrong results, never undefined behaviour; `verify` finds
 them. Little-endian 64-bit platforms only.
 
-Not yet: phrase queries (no positions), updates and deletes.
+A collection is a directory of immutable segments in that format, a deleted-rows bitset per
+segment, and a `MANIFEST` naming the current ones. `commit` writes buffered adds as a new segment,
+applies deletes, merges, and then atomically replaces the `MANIFEST`, which is the commit point: a
+crash leaves the previous commit, and leftover files are removed on the next open. Queries see the
+last commit, score every segment with statistics over all of them and share one top-k heap, so later
+segments prune against the best hits so far. Ids increase and survive merges; an update is a delete
+plus an add.
+
+Merges rebuild segments from their postings. The newest adjacent pair whose older segment is no
+larger than the newer one is merged until live sizes strictly decrease, so there are at most
+log2(rows) segments and each row is rewritten at most log2(rows) times. Deleted rows count toward
+the statistics (n, df, average length) until a merge drops them, as in Lucene, Tantivy and ParadeDB;
+a segment more than a fifth deleted is rewritten at the next commit.
+
+Not yet: phrase queries (no positions); merging in the background (merges run inside `commit` and
+block adds, not queries).

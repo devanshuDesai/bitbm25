@@ -1,0 +1,342 @@
+//! A collection: an index that takes adds and deletes. It is a directory of immutable segment files
+//! (the `Index` format), a deleted-rows bitset per segment, and a MANIFEST naming the current ones.
+//!
+//! Adds go to an in-memory builder and deletes to a pending list; `commit` writes the builder out as
+//! a new segment, applies the deletes, merges segments, and then replaces the MANIFEST, which is the
+//! commit point: a crash before it leaves the previous commit, and unreferenced files are removed on
+//! the next open or commit. Queries see the last commit and never wait for one.
+//!
+//! Each row has an id, assigned in increasing order and kept through merges. Segments hold disjoint,
+//! increasing ranges of ids, so an id is found by binary search.
+//!
+//! Deleted rows still count toward n, df and avgdl until a merge drops them (as in Lucene, Tantivy
+//! and ParadeDB); a segment more than a fifth deleted is rewritten at the next commit.
+
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+
+use crate::{invalid, merge, replace_file, Builder, Index, SegView, SHIFT};
+
+const MANIFEST_HEADER: &str = "bitbm25-collection 1";
+
+/// One segment as of one commit.
+#[derive(Clone)]
+struct Seg {
+    file: String, // "<n>.seg", in the collection's directory
+    idx: Arc<Index>,
+    del: Vec<u64>, // one bit per row, set if deleted; empty if none are
+    deleted: usize,
+    del_file: Option<String>, // where `del` is saved; None if not yet
+}
+
+impl Seg {
+    fn live(&self) -> usize {
+        self.idx.rows() - self.deleted
+    }
+}
+
+struct Writer {
+    buf: Builder,
+    pending: Vec<u64>, // ids to delete at the next commit
+    next_id: u64,
+    next_file: u64,
+}
+
+pub struct Collection {
+    dir: PathBuf,
+    _lock: File, // held for the collection's lifetime: one writer per directory
+    snap: RwLock<Arc<Vec<Seg>>>,
+    w: Mutex<Writer>,
+}
+
+impl Collection {
+    /// Opens the collection in `dir`, creating it if needed. Fails if another `Collection` (in this
+    /// process or another) has it open.
+    pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        fs::create_dir_all(&dir)?;
+        let lock = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("LOCK"))?;
+        lock.try_lock().map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "collection is open elsewhere"))?;
+        let (mut next_id, mut next_file, mut segs) = (0, 0, Vec::new());
+        match fs::read_to_string(dir.join("MANIFEST")) {
+            Ok(text) => {
+                let mut lines = text.lines();
+                let num = |line: Option<&str>, key: &str| {
+                    line.and_then(|l| l.strip_prefix(key)).and_then(|v| v.parse().ok()).ok_or_else(|| invalid("bad MANIFEST"))
+                };
+                if lines.next() != Some(MANIFEST_HEADER) {
+                    return Err(invalid("not a bitbm25 collection, or a newer format"));
+                }
+                next_id = num(lines.next(), "next_id ")?;
+                next_file = num(lines.next(), "next_file ")?;
+                for line in lines {
+                    let (file, del_file) = line.split_once(' ').ok_or_else(|| invalid("bad MANIFEST"))?;
+                    let idx = Arc::new(Index::open(dir.join(own_file(file)?))?);
+                    let (del, del_file) = match del_file {
+                        "-" => (Vec::new(), None),
+                        f => (read_del(&dir.join(own_file(f)?), idx.rows())?, Some(f.to_string())),
+                    };
+                    let deleted = del.iter().map(|w| w.count_ones() as usize).sum();
+                    segs.push(Seg { file: file.to_string(), idx, del, deleted, del_file });
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        remove_unreferenced(&dir, &segs)?;
+        Ok(Collection {
+            dir,
+            _lock: lock,
+            snap: RwLock::new(Arc::new(segs)),
+            w: Mutex::new(Writer { buf: Builder::default(), pending: Vec::new(), next_id, next_file }),
+        })
+    }
+
+    /// Adds a row (pre-tokenized: whitespace-separated terms) and returns its id. Visible to
+    /// queries after the next `commit`. Ids of rows not yet committed are reused after a crash.
+    pub fn add(&self, doc: &str) -> u64 {
+        let mut w = self.w.lock().unwrap();
+        let id = w.next_id;
+        w.next_id += 1;
+        w.buf.add_with_id(id, doc);
+        id
+    }
+
+    /// Deletes the row with this id at the next `commit`; ids that don't exist are ignored.
+    pub fn delete(&self, id: u64) {
+        self.w.lock().unwrap().pending.push(id);
+    }
+
+    /// Makes adds and deletes since the last commit durable and visible, and merges segments.
+    pub fn commit(&self) -> io::Result<()> {
+        let mut w = self.w.lock().unwrap();
+        let mut segs: Vec<Seg> = self.snapshot().as_ref().clone();
+        if !w.buf.ids.is_empty() {
+            let idx = std::mem::take(&mut w.buf).finish();
+            segs.push(self.write_segment(&mut w.next_file, idx)?);
+        }
+        for id in std::mem::take(&mut w.pending) {
+            let i = segs.partition_point(|s| s.idx.ids[0] <= id);
+            let Some(s) = i.checked_sub(1).map(|i| &mut segs[i]) else { continue };
+            let Ok(row) = s.idx.ids.binary_search(&id) else { continue };
+            if s.del.is_empty() {
+                s.del = vec![0; s.idx.rows().div_ceil(64)];
+            }
+            let bit = 1u64 << (row & 63);
+            if s.del[row >> SHIFT] & bit == 0 {
+                s.del[row >> SHIFT] |= bit;
+                s.deleted += 1;
+                s.del_file = None;
+            }
+        }
+
+        // ponytail: merges run inside commit, blocking adds (not queries); a background merger if that hurts.
+        segs.retain(|s| s.live() > 0);
+        for i in 0..segs.len() {
+            if segs[i].deleted * 5 > segs[i].idx.rows() {
+                segs[i] = self.merged(&mut w.next_file, &segs[i..=i])?;
+            }
+        }
+        // Merge the newest adjacent pair whose older segment is no larger than the newer, until
+        // live sizes strictly decrease: at most log2(rows) segments, and each merge at least doubles
+        // a row's segment, so a row is rewritten at most log2(rows) times.
+        while let Some(i) = (1..segs.len()).rev().find(|&i| segs[i - 1].live() <= segs[i].live()) {
+            let m = self.merged(&mut w.next_file, &segs[i - 1..=i])?;
+            segs.splice(i - 1..=i, [m]);
+        }
+
+        for s in segs.iter_mut().filter(|s| s.deleted > 0 && s.del_file.is_none()) {
+            let file = format!("{}.del", w.next_file);
+            w.next_file += 1;
+            replace_file(&self.dir.join(&file), |f| {
+                let bytes = crate::as_bytes(&s.del);
+                f.write_all(bytes)?;
+                f.write_all(&crc32fast::hash(bytes).to_le_bytes())
+            })?;
+            s.del_file = Some(file);
+        }
+        let mut manifest = format!("{MANIFEST_HEADER}\nnext_id {}\nnext_file {}\n", w.next_id, w.next_file);
+        for s in &segs {
+            manifest += &format!("{} {}\n", s.file, s.del_file.as_deref().unwrap_or("-"));
+        }
+        replace_file(&self.dir.join("MANIFEST"), |f| f.write_all(manifest.as_bytes()))?;
+        remove_unreferenced(&self.dir, &segs)?; // open snapshots keep their files mapped
+        *self.snap.write().unwrap() = Arc::new(segs);
+        Ok(())
+    }
+
+    fn write_segment(&self, next_file: &mut u64, idx: Index) -> io::Result<Seg> {
+        let file = format!("{next_file}.seg");
+        *next_file += 1;
+        idx.save(self.dir.join(&file))?;
+        drop(idx); // serve the mapped file instead, so the heap copy is freed
+        let idx = Arc::new(Index::open(self.dir.join(&file))?);
+        Ok(Seg { file, idx, del: Vec::new(), deleted: 0, del_file: None })
+    }
+
+    fn merged(&self, next_file: &mut u64, segs: &[Seg]) -> io::Result<Seg> {
+        self.write_segment(next_file, merge(&views(segs)))
+    }
+
+    fn snapshot(&self) -> Arc<Vec<Seg>> {
+        self.snap.read().unwrap().clone()
+    }
+
+    /// Exact BM25 top-k over committed rows as (id, score), best first. Ties go to the lower id.
+    pub fn top_k(&self, terms: &[&str], and: bool, k: usize) -> Vec<(u64, f32)> {
+        crate::search(&views(&self.snapshot()), terms, and, k, true)
+    }
+
+    /// `top_k` without early stopping, for checking.
+    pub fn top_k_exhaustive(&self, terms: &[&str], and: bool, k: usize) -> Vec<(u64, f32)> {
+        crate::search(&views(&self.snapshot()), terms, and, k, false)
+    }
+
+    /// Exact number of matching committed rows.
+    pub fn count(&self, terms: &[&str], and: bool) -> u64 {
+        crate::count(&views(&self.snapshot()), terms, and)
+    }
+
+    /// Committed rows that are not deleted.
+    pub fn len(&self) -> u64 {
+        self.snapshot().iter().map(|s| s.live() as u64).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Checks every segment file and deleted-rows file against its checksums.
+    pub fn verify(&self) -> io::Result<()> {
+        self.snapshot().iter().try_for_each(|s| s.idx.verify())
+    }
+}
+
+fn views(segs: &[Seg]) -> Vec<SegView<'_>> {
+    segs.iter().map(|s| (&*s.idx, &s.del[..])).collect()
+}
+
+/// A file name from the MANIFEST, refused if it could point outside the directory.
+fn own_file(name: &str) -> io::Result<&str> {
+    let ok = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') && !name.starts_with('.');
+    ok.then_some(name).ok_or_else(|| invalid(format!("bad file name in MANIFEST: {name:?}")))
+}
+
+fn read_del(path: &Path, rows: usize) -> io::Result<Vec<u64>> {
+    let bytes = fs::read(path)?;
+    let words = rows.div_ceil(64);
+    if bytes.len() != words * 8 + 4 || crc32fast::hash(&bytes[..words * 8]).to_le_bytes() != bytes[words * 8..] {
+        return Err(invalid(format!("{} is corrupt", path.display())));
+    }
+    Ok(bytes[..words * 8].as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect())
+}
+
+/// Removes segment, deleted-rows and temporary files that `segs` doesn't use: left by merges, or by
+/// a commit that crashed before writing its MANIFEST.
+fn remove_unreferenced(dir: &Path, segs: &[Seg]) -> io::Result<()> {
+    let keep: HashSet<&str> = segs.iter().flat_map(|s| [Some(s.file.as_str()), s.del_file.as_deref()]).flatten().collect();
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let ours = [".seg", ".del", ".tmp"].iter().any(|ext| name.ends_with(ext));
+        if ours && !keep.contains(name) {
+            fs::remove_file(dir.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{brute_rows, check_query, corpus, TempPath};
+    use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn matches_brute_force_through_adds_deletes_merges_and_reopens() {
+        let dir = TempPath::new("collection");
+        // Short and long rows in alternate batches give segments very different average lengths,
+        // so their bounds need scaling to the collection's.
+        let pools = [corpus(3_000, 0x5EED, 6), corpus(3_000, 0xFEED, 150)];
+        let mut c = Collection::open(&dir.0).unwrap();
+        assert!(Collection::open(&dir.0).is_err(), "a second writer is refused");
+        // The model: committed live rows, and the text of every row ever committed (deleted rows
+        // still count toward statistics until merged away).
+        let mut live: BTreeMap<u64, String> = BTreeMap::new();
+        let mut text: HashMap<u64, String> = HashMap::new();
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        let mut rand = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let queries: &[&[&str]] = &[&["t0"], &["t1", "t3"], &["t2", "t150", "t299"], &["t5", "t40", "t80", "t200"], &["t0", "missing"]];
+        let mut next = 0;
+        for round in 0..14 {
+            // Batches of very different sizes, so the merge policy has work to do.
+            let mut added = Vec::new();
+            for _ in 0..[1, 40, 700, 5, 300, 0, 2][round % 7] {
+                let doc = &pools[round % 2][next % 3_000];
+                next += 1;
+                added.push((c.add(doc), doc.clone()));
+            }
+            let assigned = live.keys().last().map_or(0, |&id| id + 1) + added.len() as u64;
+            let deleted: Vec<u64> = (0..rand(150)).map(|_| rand(assigned + 20)).collect(); // some twice, uncommitted or unassigned
+            deleted.iter().for_each(|&id| c.delete(id));
+            if round == 6 {
+                drop(c); // a crash: the adds and deletes are never committed
+                c = Collection::open(&dir.0).unwrap();
+            } else {
+                c.commit().unwrap();
+                text.extend(added.iter().cloned());
+                live.extend(added);
+                deleted.iter().for_each(|id| drop(live.remove(id)));
+            }
+            if round % 5 == 4 {
+                drop(c);
+                c = Collection::open(&dir.0).unwrap();
+            }
+            c.verify().unwrap();
+            assert_eq!(c.len(), live.len() as u64);
+            let segs = c.snapshot();
+            let rows: Vec<(u64, &str, bool)> = segs
+                .iter()
+                .flat_map(|s| s.idx.ids.iter().map(|id| (*id, text[id].as_str(), live.contains_key(id))))
+                .collect();
+            assert_eq!(rows.iter().filter(|r| r.2).count(), live.len(), "every live row is stored");
+            assert!(segs.len() as f64 <= (live.len().max(1) as f64).log2() + 2.0, "{} segments", segs.len());
+            for w in segs.windows(2) {
+                assert!(w[0].live() > w[1].live() && w[0].idx.ids.last() < w[1].idx.ids.first());
+            }
+            for q in queries {
+                for and in [false, true] {
+                    check_query(&views(&segs), q, and, &brute_rows(&rows, q, and));
+                }
+            }
+        }
+        let files: HashSet<String> = fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        let used = c.snapshot().iter().flat_map(|s| [Some(s.file.clone()), s.del_file.clone()]).flatten().count();
+        assert_eq!(files.len(), used + 2, "only live files, MANIFEST and LOCK remain: {files:?}");
+    }
+
+    #[test]
+    fn a_crash_before_the_manifest_leaves_the_last_commit() {
+        let dir = TempPath::new("crash");
+        let c = Collection::open(&dir.0).unwrap();
+        c.add("a b");
+        c.commit().unwrap();
+        c.add("a c");
+        c.commit().unwrap();
+        drop(c);
+        // Simulate a crash mid-commit: a later segment and a temp file exist, the MANIFEST doesn't name them.
+        fs::write(dir.0.join("99.seg"), b"partial").unwrap();
+        fs::write(dir.0.join("MANIFEST.tmp"), b"partial").unwrap();
+        let c = Collection::open(&dir.0).unwrap();
+        assert_eq!(c.count(&["a"], false), 2);
+        assert!(!dir.0.join("99.seg").exists() && !dir.0.join("MANIFEST.tmp").exists());
+    }
+}
