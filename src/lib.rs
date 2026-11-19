@@ -1225,26 +1225,41 @@ mod py {
     use pyo3::prelude::*;
     use std::path::PathBuf;
 
+    /// An index and the analyzer its text went through, which query text must go through too.
     #[pyclass(name = "Index", frozen)]
-    struct PyIndex(super::Index);
+    struct PyIndex(super::Index, super::Analyzer);
+
+    /// `terms` as given (a flat AND or OR), or `query` text parsed with `analyzer`: exactly one.
+    fn query(analyzer: &super::Analyzer, terms: Option<Vec<String>>, and: bool, text: Option<&str>) -> PyResult<super::Query> {
+        match (terms, text) {
+            (Some(t), None) => Ok(super::Query::words(&t.iter().map(String::as_str).collect::<Vec<_>>(), and)),
+            (None, Some(text)) => Ok(super::Query::parse(analyzer, text)?),
+            _ => Err(pyo3::exceptions::PyValueError::new_err("pass either terms or query, not both")),
+        }
+    }
 
     #[pymethods]
     impl PyIndex {
         // Takes any iterable of str and indexes it in one streaming pass, so the caller can stream a
-        // corpus from disk; each string is borrowed only while it is being indexed.
+        // corpus from disk; each string is borrowed only while it is being indexed. Row id = position.
         #[new]
-        fn new(docs: &Bound<'_, PyAny>) -> PyResult<Self> {
-            let mut b = super::Builder::new(super::Params::default(), super::Analyzer::whitespace())?;
+        #[pyo3(signature = (docs, analyzer = "whitespace", k1 = 1.2, b = 0.75))]
+        fn new(docs: &Bound<'_, PyAny>, analyzer: &str, k1: f64, b: f64) -> PyResult<Self> {
+            let analyzer = super::Analyzer::parse(analyzer)?;
+            let mut builder = super::Builder::new(super::Params { k1, b }, analyzer.clone())?;
             for (id, d) in docs.try_iter()?.enumerate() {
-                b.add(id as u64, d?.cast::<pyo3::types::PyString>()?.to_str()?)?;
+                builder.add(id as u64, d?.cast::<pyo3::types::PyString>()?.to_str()?)?;
             }
-            Ok(PyIndex(b.finish()))
+            Ok(PyIndex(builder.finish(), analyzer))
         }
 
-        /// Maps a file written by `save`; see `Index::open`.
+        /// Maps a file written by `save`; see `Index::open`. The analyzer isn't stored in the file:
+        /// pass the one the index was built with.
         #[staticmethod]
-        fn open(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
-            Ok(PyIndex(py.detach(|| super::Index::open(path))?))
+        #[pyo3(signature = (path, analyzer = "whitespace"))]
+        fn open(py: Python<'_>, path: PathBuf, analyzer: &str) -> PyResult<Self> {
+            let analyzer = super::Analyzer::parse(analyzer)?;
+            Ok(PyIndex(py.detach(|| super::Index::open(path))?, analyzer))
         }
 
         fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
@@ -1256,22 +1271,30 @@ mod py {
             Ok(py.detach(|| self.0.verify())?)
         }
 
-        // Searches release the GIL so concurrent Python threads run in parallel. `exhaustive`
+        // Searches release the GIL so concurrent Python threads run in parallel. `terms` are used
+        // as given; `query` is text in the query syntax, analyzed like the index. `exhaustive`
         // scores every match instead of stopping early, for checking results; it is slow.
-        #[pyo3(signature = (terms, conjunctive = false, k = 10, exhaustive = false))]
-        fn top_k(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool, k: usize, exhaustive: bool) -> PyResult<Vec<u64>> {
-            let t: Vec<&str> = terms.iter().map(String::as_str).collect();
-            let q = super::Query::words(&t, conjunctive);
+        #[pyo3(signature = (terms = None, conjunctive = false, k = 10, exhaustive = false, query = None))]
+        fn top_k(
+            &self,
+            py: Python<'_>,
+            terms: Option<Vec<String>>,
+            conjunctive: bool,
+            k: usize,
+            exhaustive: bool,
+            query: Option<&str>,
+        ) -> PyResult<Vec<u64>> {
+            let q = self::query(&self.1, terms, conjunctive, query)?;
+            let segs = [(&self.0, &[][..])];
             py.detach(|| {
-                let hits = if exhaustive { super::top_k_exhaustive(&[(&self.0, &[])], &q, k) } else { super::top_k(&[(&self.0, &[])], &q, k) }?;
+                let hits = if exhaustive { super::top_k_exhaustive(&segs, &q, k) } else { super::top_k(&segs, &q, k) }?;
                 Ok(hits.into_iter().map(|(r, _)| r).collect())
             })
         }
 
-        #[pyo3(signature = (terms, conjunctive = false))]
-        fn count(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool) -> PyResult<u64> {
-            let t: Vec<&str> = terms.iter().map(String::as_str).collect();
-            let q = super::Query::words(&t, conjunctive);
+        #[pyo3(signature = (terms = None, conjunctive = false, query = None))]
+        fn count(&self, py: Python<'_>, terms: Option<Vec<String>>, conjunctive: bool, query: Option<&str>) -> PyResult<u64> {
+            let q = self::query(&self.1, terms, conjunctive, query)?;
             Ok(py.detach(|| super::count(&[(&self.0, &[])], &q))?)
         }
 
