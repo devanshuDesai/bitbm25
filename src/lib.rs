@@ -36,7 +36,9 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
+mod analyzer;
 mod collection;
+pub use analyzer::Analyzer;
 pub use collection::Collection;
 
 pub const K1: f64 = 1.2;

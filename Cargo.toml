@@ -13,6 +13,10 @@ crate-type = ["cdylib", "rlib"]
 crc32fast = "1.5.5"
 memmap2 = "0.9.12"
 pyo3 = { version = "0.30", features = ["extension-module", "abi3-py312"], optional = true }
+rust-stemmers = "1.2"
+stop-words = { version = "0.10.1", default-features = false, features = ["nltk"] }
+unicode-normalization = "0.1"
+unicode-segmentation = "1.13"
 
 [features]
 python = ["dep:pyo3"]
