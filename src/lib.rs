@@ -38,8 +38,10 @@ use memmap2::Mmap;
 
 mod analyzer;
 mod collection;
+mod query;
 pub use analyzer::Analyzer;
 pub use collection::Collection;
+pub use query::Query;
 
 /// BM25's k1 and b. Chosen per index when it is built: they are written in each segment and baked
 /// into its stored bounds, so every segment a query reads must share them.
