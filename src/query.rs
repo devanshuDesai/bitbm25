@@ -111,7 +111,6 @@ impl Query {
     }
 
     /// The distinct terms not under a NOT, in order of first appearance: the terms that score.
-    #[allow(dead_code)] // used by search from Task 5
     pub(crate) fn positive_terms(&self) -> Vec<&str> {
         fn walk<'a>(q: &'a Query, out: &mut Vec<&'a str>) {
             match q {

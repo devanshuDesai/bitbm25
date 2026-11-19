@@ -27,7 +27,7 @@
 //! any byte buffer the host holds) and reads nothing else; see `Index::write_to` for the layout.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::ops::{Deref, Range};
@@ -211,6 +211,7 @@ impl<T: Plain> Arr<T> {
 }
 
 /// A term's slices of the shared arrays, resolved for one query.
+#[derive(Clone)]
 struct Term {
     id: u32,
     idf: f32,
@@ -455,25 +456,56 @@ impl Index {
         let mut ub = vec![0f32; n_blocks];
         let mut mask = vec![0u64; n_blocks];
         for t in ts {
-            for k in t.singles.clone() {
-                let (m, bound) = self.mask_and_bound(st, t, Entry::Single(k));
-                let b = (self.s_rows[k] >> SHIFT) as usize;
-                ub[b] += bound;
-                mask[b] |= m;
-            }
-            for i in t.multis.clone() {
-                let (m, bound) = self.mask_and_bound(st, t, Entry::Multi(i));
-                let b = self.m_blocks[i] as usize;
-                ub[b] += bound;
-                mask[b] |= m;
-            }
+            self.add_term_blocks(st, t, &mut mask, &mut ub);
         }
         (0..n_blocks).filter(|&b| mask[b] != 0).map(|b| (b as u32, ub[b], mask[b])).collect()
     }
 
-    /// Blocks where the terms match (all of them if `and`), less rows deleted in `del`.
-    fn blocks(&self, st: &Stats, ts: &[Term], and: bool, del: &[u64]) -> Vec<(u32, f32, u64)> {
-        let mut blocks = if and { self.and_blocks(st, ts) } else { self.or_blocks(st, ts) };
+    /// ORs term `t`'s row mask into `mask` and adds its bound to `ub`, per block.
+    fn add_term_blocks(&self, st: &Stats, t: &Term, mask: &mut [u64], ub: &mut [f32]) {
+        for k in t.singles.clone() {
+            let (m, bound) = self.mask_and_bound(st, t, Entry::Single(k));
+            let b = (self.s_rows[k] >> SHIFT) as usize;
+            ub[b] += bound;
+            mask[b] |= m;
+        }
+        for i in t.multis.clone() {
+            let (m, bound) = self.mask_and_bound(st, t, Entry::Multi(i));
+            let b = self.m_blocks[i] as usize;
+            ub[b] += bound;
+            mask[b] |= m;
+        }
+    }
+
+    /// (block, bound, matching rows) for every block where the query tree `node` matches. The
+    /// bound sums the bounds of the positive terms present in the block.
+    fn tree_blocks(&self, st: &Stats, node: &Node, sp: &SegPlan, n_pos: usize) -> Vec<(u32, f32, u64)> {
+        // ponytail: dense per-term block arrays; merge sparse postings if memory matters at scale
+        let n_blocks = self.dl.len().div_ceil(64);
+        let (mut masks, mut ubs) = (vec![Vec::new(); sp.terms.len()], vec![Vec::new(); n_pos]);
+        for (i, t) in sp.terms.iter().enumerate() {
+            let Some(t) = t else { continue };
+            let mut ub = vec![0f32; n_blocks];
+            masks[i] = vec![0u64; n_blocks];
+            self.add_term_blocks(st, t, &mut masks[i], &mut ub);
+            if i < n_pos {
+                ubs[i] = ub;
+            }
+        }
+        let present = |i: usize, b: usize| masks[i].get(b).is_some_and(|&m| m != 0);
+        let bound = |b: usize| (0..n_pos).filter(|&i| present(i, b)).map(|i| ubs[i][b]).sum();
+        let matched = (0..n_blocks).map(|b| (b, node.eval(b, &masks))).filter(|&(_, m)| m != 0);
+        matched.map(|(b, m)| (b as u32, bound(b), m)).collect()
+    }
+
+    /// Blocks where the query matches, in ascending order, less rows excluded in `del`. The
+    /// segment's plan must have a positive term (`sp.ts` not empty).
+    fn blocks(&self, plan: &Plan, sp: &SegPlan, del: &[u64]) -> Vec<(u32, f32, u64)> {
+        let mut blocks = match &plan.shape {
+            Shape::Any => self.or_blocks(&sp.st, &sp.ts),
+            Shape::All => self.and_blocks(&sp.st, &sp.ts),
+            Shape::Tree(node) => self.tree_blocks(&sp.st, node, sp, plan.n_pos),
+        };
         if !del.is_empty() {
             blocks.retain_mut(|(b, _, m)| {
                 *m &= !del[*b as usize];
@@ -483,14 +515,15 @@ impl Index {
         blocks
     }
 
-    /// Scores this segment's matches into `top`, which may already hold other segments' hits.
-    #[allow(clippy::too_many_arguments)]
-    fn search_into(&self, st: &Stats, ts: &[Term], and: bool, del: &[u64], prune: bool, top: &mut TopK) {
+    /// Scores this segment's matches into `top`, which may already hold other segments' hits. Each
+    /// row scores the positive terms (`sp.ts`) it contains.
+    fn search_into(&self, plan: &Plan, sp: &SegPlan, del: &[u64], prune: bool, top: &mut TopK) {
+        let (st, ts) = (&sp.st, &sp.ts);
         // A max-heap on the bound: heapifying is O(n) and only the blocks actually visited are
         // popped, where a full sort would order all of them. Bounds are non-negative, so their bit
         // patterns sort like their values.
         let mut blocks: BinaryHeap<(u32, u32, u64)> =
-            self.blocks(st, ts, and, del).into_iter().map(|(b, ub, m)| (ub.to_bits(), u32::MAX - b, m)).collect();
+            self.blocks(plan, sp, del).into_iter().map(|(b, ub, m)| (ub.to_bits(), u32::MAX - b, m)).collect();
         while let Some((ub, rb, present)) = blocks.pop() {
             let (b, ub) = (u32::MAX - rb, f32::from_bits(ub));
             // Strict `<` keeps blocks that could hold a tie (a lower id wins it). The 1e-5 margin
@@ -511,22 +544,6 @@ impl Index {
                 bits &= bits - 1;
             }
         }
-    }
-
-    /// Exact BM25 top-k as (row id, score), best first. Ties on score go to the lower id.
-    pub fn top_k(&self, terms: &[&str], and: bool, k: usize) -> Vec<(u64, f32)> {
-        search(&[(self, &[])], terms, and, k, true)
-    }
-
-    /// `top_k` scoring every matching row instead of stopping early: the same answer, slowly. For
-    /// checking that pruning never changes results.
-    pub fn top_k_exhaustive(&self, terms: &[&str], and: bool, k: usize) -> Vec<(u64, f32)> {
-        search(&[(self, &[])], terms, and, k, false)
-    }
-
-    /// Exact number of matching rows.
-    pub fn count(&self, terms: &[&str], and: bool) -> u64 {
-        count(&[(self, &[])], terms, and)
     }
 
     /// Size of the index's arrays, which is also its file size less a few hundred bytes of header.
@@ -699,59 +716,166 @@ impl Index {
     }
 }
 
-/// A segment as a query sees it: its index, and its deleted rows as one bit per row (empty if none).
-type SegView<'a> = (&'a Index, &'a [u64]);
+/// A segment as a query sees it: its index, and the rows to leave out as one bit per row (empty
+/// if none). The host decides what is left out: deleted rows, or any filter of its own.
+pub type SegView<'a> = (&'a Index, &'a [u64]);
 
-/// The distinct query terms (a repeated term counts once) found in each segment, with idf from
-/// statistics over all segments, and those statistics adjusted for each segment. A segment's list is
-/// empty when it can't match. None when no segment can.
-fn resolve(segs: &[SegView], terms: &[&str], and: bool) -> Option<Vec<(Stats, Vec<Term>)>> {
-    let mut seen = HashSet::new();
-    let terms: Vec<&str> = terms.iter().copied().filter(|t| seen.insert(*t)).collect();
-    let ids: Vec<Vec<Option<u32>>> = segs.iter().map(|(s, _)| terms.iter().map(|t| s.lookup(t)).collect()).collect();
-    let df: Vec<usize> = (0..terms.len())
-        .map(|j| segs.iter().zip(&ids).map(|((s, _), ids)| ids[j].map_or(0, |id| s.term_df(id))).sum())
-        .collect();
-    if df.iter().all(|&d| d == 0) || (and && df.contains(&0)) {
-        return None;
-    }
-    // ponytail: deleted rows count toward n, df and avgdl until a merge drops them, as in Lucene;
-    // exact live statistics would need each deleted row's terms.
-    let rows = segs.iter().map(|(s, _)| s.rows()).sum();
-    let all = Stats::new(rows, segs.iter().map(|(s, _)| s.stats.total_len).sum(), segs[0].0.params());
-    let plans = segs.iter().zip(&ids).map(|((s, _), ids)| {
-        let ts = if and && ids.contains(&None) {
-            vec![]
-        } else {
-            ids.iter().zip(&df).filter_map(|(id, &df)| id.map(|id| s.term(id, all.idf(df)))).collect()
-        };
-        (all.for_segment(&s.stats), ts)
-    });
-    Some(plans.collect())
+/// Exact BM25 top-k over `segs` as (id, score), best first; ties on score go to the lower id.
+/// Statistics (row count, document frequencies, average length) cover every row of every segment,
+/// left-out rows included. Fails on a query that fails `Query::check` (as `parse`'s output never
+/// does) or segments built with different k1/b.
+pub fn top_k(segs: &[SegView], q: &Query, k: usize) -> io::Result<Vec<(u64, f32)>> {
+    search(segs, q, k, true)
 }
 
-fn search(segs: &[SegView], terms: &[&str], and: bool, k: usize, prune: bool) -> Vec<(u64, f32)> {
-    let Some(plans) = resolve(segs, terms, and) else { return vec![] };
-    if k == 0 {
-        return vec![];
-    }
-    let mut top = TopK { k, heap: BinaryHeap::with_capacity(k + 1) };
-    for ((idx, del), (st, ts)) in segs.iter().zip(&plans) {
-        if !ts.is_empty() {
-            idx.search_into(st, ts, and, del, prune, &mut top); // the k-th score carries over, so later segments prune more
+/// `top_k` scoring every match instead of stopping early: the same answer, slowly. For checking.
+pub fn top_k_exhaustive(segs: &[SegView], q: &Query, k: usize) -> io::Result<Vec<(u64, f32)>> {
+    search(segs, q, k, false)
+}
+
+/// Exact number of matching rows.
+pub fn count(segs: &[SegView], q: &Query) -> io::Result<u64> {
+    let Some((plan, sps)) = prepare(segs, q)? else { return Ok(0) };
+    let per_segment = segs.iter().zip(&sps).map(|((idx, del), sp)| match (&plan.shape, sp.ts.as_slice()) {
+        (_, []) => 0,
+        (Shape::Any, [t]) if del.is_empty() => t.df(idx) as u64,
+        _ => idx.blocks(&plan, sp, del).iter().map(|&(_, _, m)| m.count_ones() as u64).sum(),
+    });
+    Ok(per_segment.sum())
+}
+
+/// Calls `f(id)` for every matching row, unscored: segment by segment, in row order.
+pub fn for_each_match(segs: &[SegView], q: &Query, mut f: impl FnMut(u64)) -> io::Result<()> {
+    let Some((plan, sps)) = prepare(segs, q)? else { return Ok(()) };
+    for ((idx, del), sp) in segs.iter().zip(&sps).filter(|(_, sp)| !sp.ts.is_empty()) {
+        for (b, _, mut bits) in idx.blocks(&plan, sp, del) {
+            while bits != 0 {
+                f(idx.ids[((b << SHIFT) | bits.trailing_zeros()) as usize]);
+                bits &= bits - 1;
+            }
         }
     }
-    top.into_sorted()
+    Ok(())
 }
 
-fn count(segs: &[SegView], terms: &[&str], and: bool) -> u64 {
-    let Some(plans) = resolve(segs, terms, and) else { return 0 };
-    let per_segment = segs.iter().zip(&plans).map(|((idx, del), (st, ts))| match ts.as_slice() {
-        [] => 0,
-        [t] if del.is_empty() => t.df(idx) as u64,
-        _ => idx.blocks(st, ts, and, del).iter().map(|&(_, _, m)| m.count_ones() as u64).sum(),
+fn search(segs: &[SegView], q: &Query, k: usize, prune: bool) -> io::Result<Vec<(u64, f32)>> {
+    let Some((plan, sps)) = prepare(segs, q)? else { return Ok(vec![]) };
+    if k == 0 {
+        return Ok(vec![]);
+    }
+    let mut top = TopK { k, heap: BinaryHeap::with_capacity(k + 1) };
+    for ((idx, del), sp) in segs.iter().zip(&sps).filter(|(_, sp)| !sp.ts.is_empty()) {
+        idx.search_into(&plan, sp, del, prune, &mut top); // the k-th score carries over, so later segments prune more
+    }
+    Ok(top.into_sorted())
+}
+
+/// A query compiled for search: its distinct terms, positive ones (those that score) first.
+struct Plan<'q> {
+    terms: Vec<&'q str>,
+    n_pos: usize,
+    shape: Shape,
+}
+
+/// How a plan's terms combine. Flat ORs and ANDs of terms keep their own fast paths.
+enum Shape {
+    Any, // OR of the positive terms
+    All, // AND of the positive terms
+    Tree(Node),
+}
+
+/// A query tree over a plan's term indices.
+enum Node {
+    Term(usize),
+    And(Vec<Node>),
+    Or(Vec<Node>),
+    Not(Box<Node>),
+}
+
+impl Node {
+    fn new<'q>(q: &'q Query, terms: &mut Vec<&'q str>) -> Node {
+        match q {
+            Query::Term(t) => Node::Term(terms.iter().position(|x| x == t).unwrap_or_else(|| {
+                terms.push(t);
+                terms.len() - 1
+            })),
+            Query::And(qs) => Node::And(qs.iter().map(|q| Node::new(q, terms)).collect()),
+            Query::Or(qs) => Node::Or(qs.iter().map(|q| Node::new(q, terms)).collect()),
+            Query::Not(q) => Node::Not(Box::new(Node::new(q, terms))),
+        }
+    }
+
+    /// Rows of block `b` matching this node, from each term's per-block masks (empty if absent).
+    fn eval(&self, b: usize, masks: &[Vec<u64>]) -> u64 {
+        match self {
+            Node::Term(i) => masks[*i].get(b).copied().unwrap_or(0),
+            Node::And(kids) if kids.is_empty() => 0,
+            Node::And(kids) => kids.iter().fold(u64::MAX, |m, k| match k {
+                Node::Not(k) => m & !k.eval(b, masks),
+                k => m & k.eval(b, masks),
+            }),
+            Node::Or(kids) => kids.iter().fold(0, |m, k| m | k.eval(b, masks)),
+            Node::Not(_) => 0, // only valid under And, handled there (Query::check)
+        }
+    }
+}
+
+impl<'q> Plan<'q> {
+    fn new(q: &'q Query) -> Plan<'q> {
+        let mut terms = q.positive_terms();
+        let n_pos = terms.len();
+        let flat = |qs: &[Query]| qs.iter().all(|q| matches!(q, Query::Term(_)));
+        let shape = match q {
+            Query::Term(_) => Shape::Any,
+            Query::Or(qs) if flat(qs) => Shape::Any,
+            Query::And(qs) if flat(qs) => Shape::All,
+            q => Shape::Tree(Node::new(q, &mut terms)),
+        };
+        Plan { terms, n_pos, shape }
+    }
+}
+
+/// A plan resolved in one segment: statistics adjusted for it, each plan term present here (idf
+/// set for positive ones), and the positive terms present, which are what score. `ts` is empty
+/// when the segment can't match.
+struct SegPlan {
+    st: Stats,
+    terms: Vec<Option<Term>>,
+    ts: Vec<Term>,
+}
+
+/// Checks the query and segments and resolves the query in each segment. None when nothing can match.
+fn prepare<'q>(segs: &[SegView], q: &'q Query) -> io::Result<Option<(Plan<'q>, Vec<SegPlan>)>> {
+    q.check()?;
+    let Some(&(first, _)) = segs.first() else { return Ok(None) };
+    if segs.iter().any(|(s, _)| s.params() != first.params()) {
+        return Err(bad_input("segments built with different k1/b can't be searched together"));
+    }
+    let plan = Plan::new(q);
+    let ids: Vec<Vec<Option<u32>>> = segs.iter().map(|(s, _)| plan.terms.iter().map(|t| s.lookup(t)).collect()).collect();
+    let df: Vec<usize> = (0..plan.n_pos)
+        .map(|j| segs.iter().zip(&ids).map(|((s, _), ids)| ids[j].map_or(0, |id| s.term_df(id))).sum())
+        .collect();
+    let all_needed = matches!(plan.shape, Shape::All);
+    if df.iter().all(|&d| d == 0) || (all_needed && df.contains(&0)) {
+        return Ok(None); // also when there are no positive terms
+    }
+    // ponytail: left-out rows count toward n, df and avgdl until a merge drops them, as in Lucene;
+    // exact live statistics would need each left-out row's terms.
+    let rows = segs.iter().map(|(s, _)| s.rows()).sum();
+    let all = Stats::new(rows, segs.iter().map(|(s, _)| s.stats.total_len).sum(), first.params());
+    let sps = segs.iter().zip(&ids).map(|((s, _), ids)| {
+        let terms: Vec<Option<Term>> = ids
+            .iter()
+            .enumerate()
+            .map(|(j, id)| id.map(|id| s.term(id, df.get(j).map_or(0.0, |&df| all.idf(df)))))
+            .collect();
+        let missing = all_needed && terms[..plan.n_pos].iter().any(Option::is_none);
+        let ts = if missing { vec![] } else { terms[..plan.n_pos].iter().flatten().cloned().collect() };
+        SegPlan { st: all.for_segment(&s.stats), terms, ts }
     });
-    per_segment.sum()
+    let sps = sps.collect();
+    Ok(Some((plan, sps)))
 }
 
 fn is_deleted(del: &[u64], row: usize) -> bool {
@@ -1100,18 +1224,20 @@ mod py {
         // Searches release the GIL so concurrent Python threads run in parallel. `exhaustive`
         // scores every match instead of stopping early, for checking results; it is slow.
         #[pyo3(signature = (terms, conjunctive = false, k = 10, exhaustive = false))]
-        fn top_k(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool, k: usize, exhaustive: bool) -> Vec<u64> {
+        fn top_k(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool, k: usize, exhaustive: bool) -> PyResult<Vec<u64>> {
             let t: Vec<&str> = terms.iter().map(String::as_str).collect();
+            let q = super::Query::words(&t, conjunctive);
             py.detach(|| {
-                let hits = if exhaustive { self.0.top_k_exhaustive(&t, conjunctive, k) } else { self.0.top_k(&t, conjunctive, k) };
-                hits.into_iter().map(|(r, _)| r).collect()
+                let hits = if exhaustive { super::top_k_exhaustive(&[(&self.0, &[])], &q, k) } else { super::top_k(&[(&self.0, &[])], &q, k) }?;
+                Ok(hits.into_iter().map(|(r, _)| r).collect())
             })
         }
 
         #[pyo3(signature = (terms, conjunctive = false))]
-        fn count(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool) -> u64 {
+        fn count(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool) -> PyResult<u64> {
             let t: Vec<&str> = terms.iter().map(String::as_str).collect();
-            py.detach(|| self.0.count(&t, conjunctive))
+            let q = super::Query::words(&t, conjunctive);
+            Ok(py.detach(|| super::count(&[(&self.0, &[])], &q))?)
         }
 
         fn size_bytes(&self) -> usize {
@@ -1153,18 +1279,20 @@ mod py {
         }
 
         #[pyo3(signature = (terms, conjunctive = false, k = 10, exhaustive = false))]
-        fn top_k(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool, k: usize, exhaustive: bool) -> Vec<u64> {
+        fn top_k(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool, k: usize, exhaustive: bool) -> PyResult<Vec<u64>> {
             let t: Vec<&str> = terms.iter().map(String::as_str).collect();
+            let q = super::Query::words(&t, conjunctive);
             py.detach(|| {
-                let hits = if exhaustive { self.0.top_k_exhaustive(&t, conjunctive, k) } else { self.0.top_k(&t, conjunctive, k) };
-                hits.into_iter().map(|(r, _)| r).collect()
+                let hits = if exhaustive { self.0.top_k_exhaustive(&q, k) } else { self.0.top_k(&q, k) }?;
+                Ok(hits.into_iter().map(|(r, _)| r).collect())
             })
         }
 
         #[pyo3(signature = (terms, conjunctive = false))]
-        fn count(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool) -> u64 {
+        fn count(&self, py: Python<'_>, terms: Vec<String>, conjunctive: bool) -> PyResult<u64> {
             let t: Vec<&str> = terms.iter().map(String::as_str).collect();
-            py.detach(|| self.0.count(&t, conjunctive))
+            let q = super::Query::words(&t, conjunctive);
+            Ok(py.detach(|| self.0.count(&q))?)
         }
 
         fn __len__(&self) -> usize {
@@ -1182,6 +1310,7 @@ mod py {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     /// Deterministic Zipf-ish corpus: small vocabulary so terms are dense, enough rows for many blocks.
     pub(crate) fn corpus(n: usize, seed: u64, max_len: u64) -> Vec<String> {
@@ -1207,22 +1336,17 @@ mod tests {
     }
 
     /// Exhaustive reference: (row, score) for every matching row, row = position.
-    fn brute(docs: &[String], q: &[&str], and: bool) -> Vec<(u64, f64)> {
+    fn brute(docs: &[String], q: &Query) -> Vec<(u64, f64)> {
         let rows: Vec<(u64, &str, bool)> = docs.iter().enumerate().map(|(i, d)| (i as u64, d.as_str(), true)).collect();
-        brute_rows(&rows, q, and, Params::default(), &Analyzer::whitespace())
+        brute_rows(&rows, q, Params::default(), &Analyzer::whitespace())
     }
 
-    /// Exhaustive reference over (id, doc, live) rows: statistics count every row, results only live ones.
-    pub(crate) fn brute_rows(
-        rows: &[(u64, &str, bool)],
-        q: &[&str],
-        and: bool,
-        p: Params,
-        analyzer: &Analyzer,
-    ) -> Vec<(u64, f64)> {
-        let mut seen = HashSet::new();
-        let q: Vec<&str> = q.iter().copied().filter(|t| seen.insert(*t)).collect(); // duplicates count once
-        let toks: Vec<Vec<String>> = rows.iter().map(|r| analyzer.terms(r.1)).collect();
+    /// Exhaustive reference over (id, doc, live) rows: statistics count every row, results only live
+    /// ones. A row matches by `Query::matches`; it scores the positive terms it contains.
+    pub(crate) fn brute_rows(rows: &[(u64, &str, bool)], q: &Query, p: Params, analyzer: &Analyzer) -> Vec<(u64, f64)> {
+        let positive = q.positive_terms();
+        let owned: Vec<Vec<String>> = rows.iter().map(|r| analyzer.terms(r.1)).collect();
+        let toks = &owned;
         let toks: Vec<Vec<&str>> = toks.iter().map(|t| t.iter().map(String::as_str).collect()).collect();
         let n = rows.len() as f64;
         let avgdl = toks.iter().map(|t| t.len() as f64).sum::<f64>() / n;
@@ -1234,12 +1358,11 @@ mod tests {
         }
         let df = |t: &str| dfs.get(t).copied().unwrap_or(0.0);
         let mut out = Vec::new();
-        for (r, d) in rows.iter().zip(&toks) {
-            let hits = q.iter().filter(|t| d.contains(t)).count();
-            if !r.2 || hits == 0 || (and && hits < q.len()) {
+        for ((r, d), terms) in rows.iter().zip(&toks).zip(&owned) {
+            if !r.2 || !q.matches(terms) {
                 continue;
             }
-            let score: f64 = q
+            let score: f64 = positive
                 .iter()
                 .map(|t| {
                     let tf = d.iter().filter(|x| *x == t).count() as f64;
@@ -1306,26 +1429,33 @@ mod tests {
         ];
         for q in queries {
             for and in [false, true] {
-                let want = brute(docs, q, and);
+                let q = Query::words(q, and);
+                let want = brute(docs, &q);
                 for idx in [&built, &opened] {
-                    check_query(&[(idx, &[])], q, and, &want);
+                    check_query(&[(idx, &[])], &q, &want);
                 }
             }
         }
     }
 
-    pub(crate) fn check_query(segs: &[SegView], q: &[&str], and: bool, want: &[(u64, f64)]) {
-        assert_eq!(count(segs, q, and), want.len() as u64, "count {q:?} and={and}");
-        let got = search(segs, q, and, 10, true);
-        assert_eq!(search(segs, q, and, 10, false), got, "pruning changed {q:?} and={and}");
-        assert_eq!(got.len(), want.len().min(10), "len {q:?} and={and}");
+    pub(crate) fn check_query(segs: &[SegView], q: &Query, want: &[(u64, f64)]) {
+        assert_eq!(count(segs, q).unwrap(), want.len() as u64, "count {q:?}");
+        let mut seen = Vec::new();
+        for_each_match(segs, q, |id| seen.push(id)).unwrap();
+        let mut want_ids: Vec<u64> = want.iter().map(|w| w.0).collect();
+        seen.sort_unstable();
+        want_ids.sort_unstable();
+        assert_eq!(seen, want_ids, "matches {q:?}");
+        let got = top_k(segs, q, 10).unwrap();
+        assert_eq!(top_k_exhaustive(segs, q, 10).unwrap(), got, "pruning changed {q:?}");
+        assert_eq!(got.len(), want.len().min(10), "len {q:?}");
         let mut sorted: Vec<f64> = want.iter().map(|w| w.1).collect();
         sorted.sort_by(|a, b| b.total_cmp(a));
         if let Some(&kth) = sorted.get(got.len().wrapping_sub(1)) {
             for (row, score) in &got {
                 let s = want.iter().find(|w| w.0 == *row).unwrap().1;
-                assert!(s >= kth * (1.0 - 1e-5), "{q:?} and={and}: row {row} scores {s} < kth {kth}");
-                assert!((*score as f64 - s).abs() <= s * 1e-5, "{q:?} and={and}: row {row} {score} vs {s}");
+                assert!(s >= kth * (1.0 - 1e-5), "{q:?}: row {row} scores {s} < kth {kth}");
+                assert!((*score as f64 - s).abs() <= s * 1e-5, "{q:?}: row {row} {score} vs {s}");
             }
         }
     }
@@ -1359,7 +1489,8 @@ mod tests {
         let idx = Index::from_bytes(Arc::new(Aligned::new(&bytes, 0))).unwrap();
         idx.verify().unwrap();
         for (q, and) in [(&["t0", "t1"][..], false), (&["t2", "t3"][..], true)] {
-            assert_eq!(idx.top_k(q, and, 10), built.top_k(q, and, 10));
+            let q = Query::words(q, and);
+            assert_eq!(top_k(&[(&idx, &[])], &q, 10).unwrap(), top_k(&[(&built, &[])], &q, 10).unwrap());
         }
         let off = Index::from_bytes(Arc::new(Aligned::new(&bytes, 1))).err().unwrap();
         assert_eq!(off.kind(), io::ErrorKind::InvalidData);
@@ -1384,8 +1515,9 @@ mod tests {
             let rows: Vec<_> = ids.iter().zip(&docs).map(|(i, d)| (*i, d.as_str(), true)).collect();
             for q in [&["t0", "t1"][..], &["t5", "t40", "t80"]] {
                 for and in [false, true] {
-                    let want = brute_rows(&rows, q, and, params, &Analyzer::whitespace());
-                    check_query(&[(&reopened, &[])], q, and, &want);
+                    let q = Query::words(q, and);
+                    let want = brute_rows(&rows, &q, params, &Analyzer::whitespace());
+                    check_query(&[(&reopened, &[])], &q, &want);
                 }
             }
         }
@@ -1403,7 +1535,8 @@ mod tests {
         }
         let idx = b.finish();
         for and in [false, true] {
-            let got: Vec<u64> = idx.top_k(&["a", "b"], and, 10).into_iter().map(|h| h.0).collect();
+            let got = top_k(&[(&idx, &[])], &Query::words(&["a", "b"], and), 10).unwrap();
+            let got: Vec<u64> = got.into_iter().map(|h| h.0).collect();
             assert_eq!(got, (0..10).map(|i| i * 3).collect::<Vec<_>>());
         }
     }
@@ -1414,9 +1547,107 @@ mod tests {
         for (id, d) in ["", "Café 🚀", "e\u{301}te\u{301} CAFE", "   "].iter().enumerate() {
             b.add(id as u64, d).unwrap();
         }
-        let hits = b.finish().top_k(&["cafe"], false, 10);
+        let idx = b.finish();
+        let hits = top_k(&[(&idx, &[])], &Query::words(&["cafe"], false), 10).unwrap();
         assert_eq!(hits.iter().map(|h| h.0).collect::<Vec<_>>(), [1, 2]);
         assert!(hits.iter().all(|h| h.1.is_finite() && h.1 > 0.0));
+    }
+
+    /// A random query over t0..t300 (skewed toward common terms, like `corpus`) that passes
+    /// `Query::check`: NOTs only inside ANDs, which always keep a positive child.
+    pub(crate) fn random_query(seed: u64, depth: u32) -> Query {
+        fn gen(s: &mut u64, depth: u32) -> Query {
+            let mut next = || {
+                *s ^= *s << 13;
+                *s ^= *s >> 7;
+                *s ^= *s << 17;
+                *s
+            };
+            let r = next();
+            if depth == 0 || r % 3 == 0 {
+                let x = (next() % 1000) as f64 / 1000.0;
+                return Query::Term(format!("t{}", (x * x * x * 300.0) as u32));
+            }
+            let (n, negate, or) = (1 + next() % 3, next() % 2 == 0, r % 2 == 0);
+            let mut kids: Vec<Query> = (0..n).map(|_| gen(s, depth - 1)).collect();
+            if or {
+                return Query::Or(kids);
+            }
+            if negate {
+                kids.push(Query::Not(Box::new(gen(s, depth - 1))));
+            }
+            Query::And(kids)
+        }
+        let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        gen(&mut s, depth)
+    }
+
+    #[test]
+    fn tree_queries_match_brute_force() {
+        let docs = corpus(4_000, 21, 40);
+        // three segments with scattered ids; the middle one fully excluded, the last partly
+        let ids: Vec<u64> = (0..docs.len() as u64).map(|i| i * 7 % 4_001).collect();
+        let mut segs = Vec::new();
+        for (s, chunk) in docs.chunks(1_400).enumerate() {
+            let mut b = Builder::new(Params::default(), Analyzer::whitespace()).unwrap();
+            for (j, d) in chunk.iter().enumerate() {
+                b.add(ids[s * 1_400 + j], d).unwrap();
+            }
+            segs.push(b.finish());
+        }
+        let excl: Vec<Vec<u64>> = segs
+            .iter()
+            .enumerate()
+            .map(|(s, i)| match s {
+                1 => vec![u64::MAX; i.rows().div_ceil(64)],
+                2 => (0..i.rows().div_ceil(64) as u64).map(|w| w.wrapping_mul(0x9E3779B97F4A7C15)).collect(),
+                _ => vec![],
+            })
+            .collect();
+        let views: Vec<SegView> = segs.iter().zip(&excl).map(|(i, e)| (i, &e[..])).collect();
+        let rows: Vec<(u64, &str, bool)> =
+            docs.iter().enumerate().map(|(r, d)| (ids[r], d.as_str(), !is_deleted(&excl[r / 1_400], r % 1_400))).collect();
+        let (mut trees, mut matched) = (0, 0);
+        for seed in 0..300 {
+            let q = random_query(seed, 4);
+            let want = brute_rows(&rows, &q, Params::default(), &Analyzer::whitespace());
+            trees += matches!(&q, Query::And(k) | Query::Or(k) if k.iter().any(|c| !matches!(c, Query::Term(_)))) as u32;
+            matched += !want.is_empty() as u32;
+            check_query(&views, &q, &want);
+        }
+        assert!(trees > 100 && matched > 100, "the generator exercises nested queries that match: {trees} {matched}");
+    }
+
+    #[test]
+    fn errors_and_edges() {
+        let a = Index::build(&corpus(200, 1, 20));
+        let mut b = Builder::new(Params { k1: 0.9, b: 0.4 }, Analyzer::whitespace()).unwrap();
+        b.add(1, "t0").unwrap();
+        let b = b.finish();
+        let q = Query::words(&["t0"], false);
+        assert_eq!(top_k(&[(&a, &[]), (&b, &[])], &q, 10).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let not = Query::Not(Box::new(q.clone()));
+        assert_eq!(top_k(&[(&a, &[])], &not, 10).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(count(&[(&a, &[])], &not).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(top_k(&[], &q, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn k_edges() {
+        let a = Index::build(&corpus(500, 2, 20));
+        let q = Query::words(&["t0", "t1"], false);
+        assert!(top_k(&[(&a, &[])], &q, 0).unwrap().is_empty());
+        let n = count(&[(&a, &[])], &q).unwrap() as usize;
+        assert_eq!(top_k(&[(&a, &[])], &q, n + 100).unwrap().len(), n);
+    }
+
+    #[test]
+    fn empty_query_matches_nothing() {
+        let a = Index::build(&corpus(500, 2, 20));
+        let q = Query::parse(&Analyzer::parse("standard stop=english").unwrap(), "the of").unwrap();
+        assert!(top_k(&[(&a, &[])], &q, 10).unwrap().is_empty());
+        assert_eq!(count(&[(&a, &[])], &q).unwrap(), 0);
+        assert!(top_k(&[(&a, &[])], &Query::And(vec![]), 10).unwrap().is_empty());
     }
 
     #[test]
@@ -1476,7 +1707,8 @@ mod tests {
         let docs = vec!["a b"; 300];
         let idx = Index::build(&docs);
         for and in [false, true] {
-            let rows: Vec<u64> = idx.top_k(&["a", "b"], and, 10).into_iter().map(|(r, _)| r).collect();
+            let rows = top_k(&[(&idx, &[])], &Query::words(&["a", "b"], and), 10).unwrap();
+            let rows: Vec<u64> = rows.into_iter().map(|(r, _)| r).collect();
             assert_eq!(rows, (0..10).collect::<Vec<_>>());
         }
     }

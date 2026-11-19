@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::{invalid, merge, replace_file, Analyzer, Builder, Index, Params, SegView, SHIFT};
+use crate::{invalid, merge, replace_file, Analyzer, Builder, Index, Params, Query, SegView, SHIFT};
 
 const MANIFEST_HEADER: &str = "bitbm25-collection 1";
 
@@ -186,18 +186,18 @@ impl Collection {
     }
 
     /// Exact BM25 top-k over committed rows as (id, score), best first. Ties go to the lower id.
-    pub fn top_k(&self, terms: &[&str], and: bool, k: usize) -> Vec<(u64, f32)> {
-        crate::search(&views(&self.snapshot()), terms, and, k, true)
+    pub fn top_k(&self, q: &Query, k: usize) -> io::Result<Vec<(u64, f32)>> {
+        crate::top_k(&views(&self.snapshot()), q, k)
     }
 
     /// `top_k` without early stopping, for checking.
-    pub fn top_k_exhaustive(&self, terms: &[&str], and: bool, k: usize) -> Vec<(u64, f32)> {
-        crate::search(&views(&self.snapshot()), terms, and, k, false)
+    pub fn top_k_exhaustive(&self, q: &Query, k: usize) -> io::Result<Vec<(u64, f32)>> {
+        crate::top_k_exhaustive(&views(&self.snapshot()), q, k)
     }
 
     /// Exact number of matching committed rows.
-    pub fn count(&self, terms: &[&str], and: bool) -> u64 {
-        crate::count(&views(&self.snapshot()), terms, and)
+    pub fn count(&self, q: &Query) -> io::Result<u64> {
+        crate::count(&views(&self.snapshot()), q)
     }
 
     /// Committed rows that are not deleted.
@@ -321,7 +321,8 @@ mod tests {
             }
             for q in queries {
                 for and in [false, true] {
-                    check_query(&views(&segs), q, and, &brute_rows(&rows, q, and, Params::default(), &Analyzer::whitespace()));
+                    let q = Query::words(q, and);
+                    check_query(&views(&segs), &q, &brute_rows(&rows, &q, Params::default(), &Analyzer::whitespace()));
                 }
             }
         }
@@ -343,7 +344,7 @@ mod tests {
         fs::write(dir.0.join("99.seg"), b"partial").unwrap();
         fs::write(dir.0.join("MANIFEST.tmp"), b"partial").unwrap();
         let c = Collection::open(&dir.0).unwrap();
-        assert_eq!(c.count(&["a"], false), 2);
+        assert_eq!(c.count(&Query::words(&["a"], false)).unwrap(), 2);
         assert!(!dir.0.join("99.seg").exists() && !dir.0.join("MANIFEST.tmp").exists());
     }
 }
