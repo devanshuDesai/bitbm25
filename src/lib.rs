@@ -763,11 +763,46 @@ fn search(segs: &[SegView], q: &Query, k: usize, prune: bool) -> io::Result<Vec<
     if k == 0 {
         return Ok(vec![]);
     }
-    let mut top = TopK { k, heap: BinaryHeap::with_capacity(k + 1) };
+    let mut top = TopK { k, heap: BinaryHeap::with_capacity(k.saturating_add(1).min(1 << 16)) };
     for ((idx, del), sp) in segs.iter().zip(&sps).filter(|(_, sp)| !sp.ts.is_empty()) {
         idx.search_into(&plan, sp, del, prune, &mut top); // the k-th score carries over, so later segments prune more
     }
     Ok(top.into_sorted())
+}
+
+/// Matches best first, for as long as the caller asks: for a host that drops some rows after the
+/// index (Postgres re-checks each row's visibility) and so can't know k up front. When its hits run
+/// out it reruns top-k with k doubled; ties break on the lower id, so the first k of top-2k are
+/// top-k and the stream never repeats or skips a row. Total work is about twice the final top-k.
+pub struct Cursor<'a> {
+    segs: &'a [SegView<'a>],
+    q: &'a Query,
+    k: usize,
+    hits: Vec<(u64, f32)>,
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    /// Fails as `top_k` does.
+    pub fn new(segs: &'a [SegView<'a>], q: &'a Query) -> io::Result<Cursor<'a>> {
+        let k = 10;
+        Ok(Cursor { segs, q, k, hits: top_k(segs, q, k)?, pos: 0 })
+    }
+}
+
+impl Iterator for Cursor<'_> {
+    type Item = (u64, f32);
+
+    fn next(&mut self) -> Option<(u64, f32)> {
+        if self.pos == self.hits.len() && self.hits.len() == self.k {
+            self.k = self.k.saturating_mul(2);
+            let err = "the query and segments already passed in Cursor::new";
+            self.hits = top_k(self.segs, self.q, self.k).expect(err);
+        }
+        let hit = self.hits.get(self.pos).copied()?;
+        self.pos += 1;
+        Some(hit)
+    }
 }
 
 /// A query compiled for search: its distinct terms, positive ones (those that score) first.
@@ -1648,6 +1683,23 @@ mod tests {
         assert!(top_k(&[(&a, &[])], &q, 10).unwrap().is_empty());
         assert_eq!(count(&[(&a, &[])], &q).unwrap(), 0);
         assert!(top_k(&[(&a, &[])], &Query::And(vec![]), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cursor_is_the_ranked_list() {
+        let docs = corpus(3_000, 4, 40);
+        let a = Index::build(&docs);
+        let views = [(&a, &[][..])];
+        let queries = [Query::words(&["t0", "t1"], false), Query::words(&["t2", "t3"], true), random_query(7, 3), Query::Or(vec![])];
+        for q in queries {
+            let all = top_k(&views, &q, usize::MAX).unwrap(); // every match, best first
+            let streamed: Vec<_> = Cursor::new(&views, &q).unwrap().collect();
+            assert_eq!(streamed, all);
+            for n in [1, 10, 11, 37] {
+                assert_eq!(Cursor::new(&views, &q).unwrap().take(n).collect::<Vec<_>>(), all[..n.min(all.len())]);
+            }
+        }
+        assert!(Cursor::new(&views, &Query::Not(Box::new(Query::words(&["t0"], false)))).is_err());
     }
 
     #[test]
