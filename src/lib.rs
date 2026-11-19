@@ -23,8 +23,8 @@
 //! All postings live in a few flat arrays shared by every term, and terms are a sorted lexicon, so
 //! a term costs about 40 bytes of overhead however rare it is (millions of terms occur once).
 //!
-//! On disk an index is those arrays as they are in memory, so opening one maps the file and reads
-//! nothing else; see `Index::save` for the layout.
+//! On disk an index is those arrays as they are in memory, so opening one maps the file (or takes
+//! any byte buffer the host holds) and reads nothing else; see `Index::write_to` for the layout.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -110,8 +110,8 @@ fn as_bytes<T: Plain>(a: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(a.as_ptr().cast(), std::mem::size_of_val(a)) }
 }
 
-/// A read-only array: an owned Vec, or a view into a mapped index file. Holding the pointer directly
-/// keeps indexing as cheap as a plain slice.
+/// A read-only array: an owned Vec, or a view into a host's buffer (a mapped file, a cache, any
+/// bytes). Holding the pointer directly keeps indexing as cheap as a plain slice.
 struct Arr<T> {
     ptr: *const T,
     len: usize,
@@ -120,7 +120,7 @@ struct Arr<T> {
 
 enum Owner<T> {
     Vec(#[allow(dead_code)] Vec<T>), // moving a Vec never moves its buffer, so `ptr` stays valid
-    Map(#[allow(dead_code)] Arc<Mmap>),
+    Bytes(#[allow(dead_code)] Buf), // a shared buffer's memory never moves while it is shared
 }
 
 // SAFETY: an Arr is never written through, and its owner keeps the memory alive.
@@ -160,9 +160,13 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+/// A segment's bytes as a host holds them.
+type Buf = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 impl<T: Plain> Arr<T> {
     /// The `bytes` bytes at `off` in `map`, which must be in bounds, aligned and whole elements.
-    fn mapped(map: &Arc<Mmap>, off: u64, bytes: u64) -> io::Result<Self> {
+    fn mapped(buf: &Buf, off: u64, bytes: u64) -> io::Result<Self> {
+        let map: &[u8] = (**buf).as_ref();
         let (off, bytes) = (off as usize, bytes as usize);
         let size = std::mem::size_of::<T>();
         if off.checked_add(bytes).is_none_or(|end| end > map.len())
@@ -171,10 +175,10 @@ impl<T: Plain> Arr<T> {
         {
             return Err(invalid("section out of bounds or misaligned"));
         }
-        // SAFETY: checked above that the range is inside the map and aligned; T is Plain. The map
-        // is page-aligned, so offset alignment is address alignment.
+        // SAFETY: checked above that the range is inside the buffer and aligned; T is Plain. The
+        // buffer starts 8-aligned (checked by `from_bytes`), so offset alignment is address alignment.
         let ptr = unsafe { map.as_ptr().add(off) }.cast();
-        Ok(Arr { ptr, len: bytes / size, _owner: Owner::Map(map.clone()) })
+        Ok(Arr { ptr, len: bytes / size, _owner: Owner::Bytes(buf.clone()) })
     }
 }
 
@@ -516,7 +520,11 @@ impl Index {
     /// Writes the index to `path`, atomically: it goes to `path.tmp`, is synced, then renamed, so a
     /// crash leaves the old file or the new one, and processes with the old file open keep reading it.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let path = path.as_ref();
+        replace_file(path.as_ref(), |w| self.write_to(w))
+    }
+
+    /// Writes the index in its file format: what `save` puts in a file and `from_bytes` reads.
+    pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
         let secs = self.sections();
         let mut h = Vec::with_capacity(DATA_AT);
         h.extend_from_slice(MAGIC);
@@ -539,14 +547,12 @@ impl Index {
         h.extend_from_slice(&crc32fast::hash(&h).to_le_bytes());
         h.resize(DATA_AT, 0);
 
-        replace_file(path, |w| {
-            w.write_all(&h)?;
-            for s in secs {
-                w.write_all(s)?;
-                w.write_all(&[0; 8][..s.len().next_multiple_of(8) - s.len()])?;
-            }
-            Ok(())
-        })
+        w.write_all(&h)?;
+        for s in secs {
+            w.write_all(s)?;
+            w.write_all(&[0; 8][..s.len().next_multiple_of(8) - s.len()])?;
+        }
+        Ok(())
     }
 
     /// Opens a saved index by mapping it: nothing is read until queries touch it, so this is
@@ -558,8 +564,18 @@ impl Index {
         let file = File::open(path)?;
         // SAFETY: see above. Writes to the file by another process would be visible through the
         // map; bitbm25 itself never writes to a file in place.
-        let map = Arc::new(unsafe { Mmap::map(&file)? });
-        let h: &[u8] = &map;
+        Self::from_bytes(Arc::new(unsafe { Mmap::map(&file)? }))
+    }
+
+    /// Opens an index from bytes in its file format, held by the host: a mapped file, a cache, any
+    /// buffer whose address is 8-byte aligned. Nothing is copied; the index keeps the buffer alive.
+    /// Checks the header and that the sections fit together; `verify` checks their contents.
+    pub fn from_bytes(buf: Arc<dyn AsRef<[u8]> + Send + Sync>) -> io::Result<Index> {
+        let map: Buf = buf;
+        let h: &[u8] = (*map).as_ref();
+        if h.as_ptr() as usize % 8 != 0 {
+            return Err(invalid("buffer is not 8-byte aligned"));
+        }
         if h.len() < DATA_AT || &h[..8] != MAGIC {
             return Err(invalid("not a bitbm25 index"));
         }
@@ -1219,6 +1235,42 @@ mod tests {
                 assert!((*score as f64 - s).abs() <= s * 1e-5, "{q:?} and={and}: row {row} {score} vs {s}");
             }
         }
+    }
+
+    /// `bytes` copied `shift` bytes into an 8-aligned buffer, so its address is aligned or not.
+    pub(crate) struct Aligned(Vec<u64>, usize, usize);
+    impl Aligned {
+        pub(crate) fn new(bytes: &[u8], shift: usize) -> Self {
+            let mut words = vec![0u64; (bytes.len() + shift).div_ceil(8)];
+            // SAFETY: the Vec<u64> holds at least bytes.len() + shift initialised bytes.
+            let all = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8) };
+            all[shift..shift + bytes.len()].copy_from_slice(bytes);
+            Aligned(words, shift, bytes.len())
+        }
+    }
+    impl AsRef<[u8]> for Aligned {
+        fn as_ref(&self) -> &[u8] {
+            &as_bytes(&self.0)[self.1..self.1 + self.2]
+        }
+    }
+
+    #[test]
+    fn opens_from_any_buffer() {
+        let docs = corpus(2_000, 5, 40);
+        let built = Index::build(&docs);
+        let mut bytes = Vec::new();
+        built.write_to(&mut bytes).unwrap();
+        let file = TempPath::new("from-bytes");
+        built.save(&file.0).unwrap();
+        assert_eq!(std::fs::read(&file.0).unwrap(), bytes); // save writes exactly write_to's bytes
+        let idx = Index::from_bytes(Arc::new(Aligned::new(&bytes, 0))).unwrap();
+        idx.verify().unwrap();
+        for (q, and) in [(&["t0", "t1"][..], false), (&["t2", "t3"][..], true)] {
+            assert_eq!(idx.top_k(q, and, 10), built.top_k(q, and, 10));
+        }
+        let off = Index::from_bytes(Arc::new(Aligned::new(&bytes, 1))).err().unwrap();
+        assert_eq!(off.kind(), io::ErrorKind::InvalidData);
+        assert!(off.to_string().contains("aligned"));
     }
 
     #[test]
