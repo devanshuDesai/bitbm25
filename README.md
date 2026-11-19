@@ -42,8 +42,8 @@ seg.write_to(&mut bytes)?;                  // the file format; `save(path)` wri
 let seg = Index::from_bytes(Arc::new(bytes_8_aligned))?; // or Index::open(path), which maps a file
 seg.verify()?;                              // checks every byte against the checksums
 
-let q = Query::parse(&analyzer, "fox AND (quick OR fast) -slow")?;
-let segs = [(&seg, &excluded[..])];         // excluded: one bit per row to leave out (deletes, filters)
+let q = Query::parse(&analyzer, "fox AND (quick OR fast) AND -slow")?;
+let segs = [(&seg, &excluded[..])];         // one bit per row to leave out (deletes, filters): rows.div_ceil(64) words, or none
 bitbm25::top_k(&segs, &q, 10)?;            // (id, score), best first
 bitbm25::count(&segs, &q)?;
 bitbm25::for_each_match(&segs, &q, |id| ...)?;   // every match, unscored
@@ -62,7 +62,7 @@ not stored in segments.
   There are 18 languages, named in lowercase English.
 
 `Query::parse` reads:
-- words, `AND`, `OR`, `NOT` (or `-word`) and parentheses;
+- words, `AND`, `OR`, `NOT` (or `-word`, `-(...)`) and parentheses;
 - adjacent words are ORed;
 - NOT binds tighter than AND, and AND tighter than OR.
 
@@ -80,7 +80,7 @@ A row matches by ordinary boolean logic. It scores the sum of the BM25 scores of
 positive terms (those not under a NOT) that it contains. `Query::matches(&terms)` checks one row's
 terms without an index, for hosts that re-check rows.
 
-k1 and b are chosen per index at build time. They are written in each segment and baked into its
+k1 (0 to 1000) and b (0 to 1) are chosen per index at build time. They are written in each segment and baked into its
 bounds, so segments with different values can't be searched or merged together.
 
 ## Python
@@ -89,7 +89,7 @@ bounds, so segments with different values can't be searched or merged together.
 idx = bitbm25.Index(docs)                 # any iterable of str; row id = position; analyzer="whitespace"
 idx = bitbm25.Index(docs, analyzer="standard stem=english", k1=0.9, b=0.4)
 idx.top_k(["new", "york"], k=10)          # terms as given; conjunctive=True for AND
-idx.top_k(query="new AND york -city")     # query text, analyzed like the index
+idx.top_k(query="new AND york AND -city") # query text, analyzed like the index
 idx.count(["new", "york"], conjunctive=True)
 idx.save("wiki.idx")                      # atomic: temp file, fsync, rename
 idx = bitbm25.Index.open("wiki.idx", analyzer="standard stem=english")  # maps the file; instant

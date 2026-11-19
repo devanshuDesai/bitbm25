@@ -58,8 +58,9 @@ impl Default for Params {
 }
 
 impl Params {
+    /// k1 in [0, 1000] (larger would overflow f32 scores), b in [0, 1].
     fn valid(self) -> bool {
-        self.k1.is_finite() && self.k1 >= 0.0 && (0.0..=1.0).contains(&self.b)
+        (0.0..=1000.0).contains(&self.k1) && (0.0..=1.0).contains(&self.b)
     }
 }
 const SHIFT: u32 = 6; // 64 rows per block
@@ -198,13 +199,14 @@ impl<T: Plain> Arr<T> {
         let (off, bytes) = (off as usize, bytes as usize);
         let size = std::mem::size_of::<T>();
         if off.checked_add(bytes).is_none_or(|end| end > map.len())
-            || off % std::mem::align_of::<T>() != 0
+            || !(map.as_ptr() as usize + off).is_multiple_of(std::mem::align_of::<T>())
             || bytes % size != 0
         {
             return Err(invalid("section out of bounds or misaligned"));
         }
-        // SAFETY: checked above that the range is inside the buffer and aligned; T is Plain. The
-        // buffer starts 8-aligned (checked by `from_bytes`), so offset alignment is address alignment.
+        // SAFETY: checked above, on this very slice, that the range is inside it and its address is
+        // aligned; T is Plain. The owner keeps that memory alive and unchanged (it's only ever
+        // borrowed shared).
         let ptr = unsafe { map.as_ptr().add(off) }.cast();
         Ok(Arr { ptr, len: bytes / size, _owner: Owner::Bytes(buf.clone()) })
     }
@@ -477,25 +479,23 @@ impl Index {
         }
     }
 
-    /// (block, bound, matching rows) for every block where the query tree `node` matches. The
-    /// bound sums the bounds of the positive terms present in the block.
-    fn tree_blocks(&self, st: &Stats, node: &Node, sp: &SegPlan, n_pos: usize) -> Vec<(u32, f32, u64)> {
-        // ponytail: dense per-term block arrays; merge sparse postings if memory matters at scale
-        let n_blocks = self.dl.len().div_ceil(64);
-        let (mut masks, mut ubs) = (vec![Vec::new(); sp.terms.len()], vec![Vec::new(); n_pos]);
-        for (i, t) in sp.terms.iter().enumerate() {
-            let Some(t) = t else { continue };
-            let mut ub = vec![0f32; n_blocks];
-            masks[i] = vec![0u64; n_blocks];
-            self.add_term_blocks(st, t, &mut masks[i], &mut ub);
-            if i < n_pos {
-                ubs[i] = ub;
+    /// (block, bound, matching rows) for every block where the query tree `node` matches. Every
+    /// match contains a positive term, so candidates are the blocks those touch, with their summed
+    /// bounds (as for OR); each term's mask in a candidate comes from a cursor over its postings,
+    /// so memory doesn't grow with the number of terms.
+    fn tree_blocks(&self, st: &Stats, node: &Node, sp: &SegPlan) -> Vec<(u32, f32, u64)> {
+        let mut cursors = vec![(0, 0); sp.terms.len()];
+        let mut masks = vec![0u64; sp.terms.len()];
+        let mut out = self.or_blocks(st, &sp.ts);
+        out.retain_mut(|(b, _, m)| {
+            for ((t, cursor), mask) in sp.terms.iter().zip(&mut cursors).zip(&mut masks) {
+                let e = t.as_ref().and_then(|t| self.seek(t, cursor, *b).map(|e| (t, e)));
+                *mask = e.map_or(0, |(t, e)| self.mask_and_bound(st, t, e).0);
             }
-        }
-        let present = |i: usize, b: usize| masks[i].get(b).is_some_and(|&m| m != 0);
-        let bound = |b: usize| (0..n_pos).filter(|&i| present(i, b)).map(|i| ubs[i][b]).sum();
-        let matched = (0..n_blocks).map(|b| (b, node.eval(b, &masks))).filter(|&(_, m)| m != 0);
-        matched.map(|(b, m)| (b as u32, bound(b), m)).collect()
+            *m = node.eval(&masks);
+            *m != 0
+        });
+        out
     }
 
     /// Blocks where the query matches, in ascending order, less rows excluded in `del`. The
@@ -504,7 +504,7 @@ impl Index {
         let mut blocks = match &plan.shape {
             Shape::Any => self.or_blocks(&sp.st, &sp.ts),
             Shape::All => self.and_blocks(&sp.st, &sp.ts),
-            Shape::Tree(node) => self.tree_blocks(&sp.st, node, sp, plan.n_pos),
+            Shape::Tree(node) => self.tree_blocks(&sp.st, node, sp),
         };
         if !del.is_empty() {
             blocks.retain_mut(|(b, _, m)| {
@@ -840,16 +840,16 @@ impl Node {
         }
     }
 
-    /// Rows of block `b` matching this node, from each term's per-block masks (empty if absent).
-    fn eval(&self, b: usize, masks: &[Vec<u64>]) -> u64 {
+    /// Rows of one block matching this node, from each term's row mask in that block.
+    fn eval(&self, masks: &[u64]) -> u64 {
         match self {
-            Node::Term(i) => masks[*i].get(b).copied().unwrap_or(0),
+            Node::Term(i) => masks[*i],
             Node::And(kids) if kids.is_empty() => 0,
             Node::And(kids) => kids.iter().fold(u64::MAX, |m, k| match k {
-                Node::Not(k) => m & !k.eval(b, masks),
-                k => m & k.eval(b, masks),
+                Node::Not(k) => m & !k.eval(masks),
+                k => m & k.eval(masks),
             }),
-            Node::Or(kids) => kids.iter().fold(0, |m, k| m | k.eval(b, masks)),
+            Node::Or(kids) => kids.iter().fold(0, |m, k| m | k.eval(masks)),
             Node::Not(_) => 0, // only valid under And, handled there (Query::check)
         }
     }
@@ -885,6 +885,9 @@ fn prepare<'q>(segs: &[SegView], q: &'q Query) -> io::Result<Option<(Plan<'q>, V
     let Some(&(first, _)) = segs.first() else { return Ok(None) };
     if segs.iter().any(|(s, _)| s.params() != first.params()) {
         return Err(bad_input("segments built with different k1/b can't be searched together"));
+    }
+    if segs.iter().any(|(s, del)| !del.is_empty() && del.len() != s.rows().div_ceil(64)) {
+        return Err(bad_input("an excluded-rows bitset needs one bit per row: rows.div_ceil(64) words, or none"));
     }
     let plan = Plan::new(q);
     let ids: Vec<Vec<Option<u32>>> = segs.iter().map(|(s, _)| plan.terms.iter().map(|t| s.lookup(t)).collect()).collect();
@@ -1004,7 +1007,7 @@ impl Builder {
     /// A builder for a segment scored with `params`, turning text into terms with `analyzer`.
     pub fn new(params: Params, analyzer: Analyzer) -> io::Result<Builder> {
         if !params.valid() {
-            return Err(bad_input(format!("k1 must be finite and >= 0, and b in [0, 1]; got {params:?}")));
+            return Err(bad_input(format!("k1 must be in [0, 1000] and b in [0, 1]; got {params:?}")));
         }
         Ok(Builder {
             params,
@@ -1688,6 +1691,42 @@ mod tests {
         assert_eq!(top_k(&[(&a, &[])], &not, 10).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(count(&[(&a, &[])], &not).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(top_k(&[], &q, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn short_exclusion_bitsets_are_refused() {
+        let a = Index::build(&corpus(300, 1, 20)); // 5 blocks
+        let q = Query::words(&["t0", "t1"], false);
+        let short = vec![0u64; 1];
+        assert_eq!(top_k(&[(&a, &short)], &q, 10).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(count(&[(&a, &short)], &q).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(top_k(&[(&a, &[0u64; 5])], &q, 10).is_ok());
+    }
+
+    #[test]
+    fn k1_too_large_for_f32_scores_is_refused() {
+        let bad = |k1| Builder::new(Params { k1, b: 0.75 }, Analyzer::whitespace()).err().map(|e| e.kind());
+        assert_eq!(bad(1e37), Some(io::ErrorKind::InvalidInput));
+        assert_eq!(bad(1e4), Some(io::ErrorKind::InvalidInput));
+        assert_eq!(bad(1000.0), None);
+    }
+
+    /// A buffer whose `as_ref` gives an aligned slice the first time and a shifted one after.
+    struct Shifty(Aligned, Aligned, std::sync::atomic::AtomicBool);
+    impl AsRef<[u8]> for Shifty {
+        fn as_ref(&self) -> &[u8] {
+            let later = self.2.swap(true, std::sync::atomic::Ordering::Relaxed);
+            if later { self.1.as_ref() } else { self.0.as_ref() }
+        }
+    }
+
+    #[test]
+    fn a_buffer_that_moves_is_refused_not_misread() {
+        let mut bytes = Vec::new();
+        Index::build(&corpus(300, 1, 20)).write_to(&mut bytes).unwrap();
+        let shifty = Shifty(Aligned::new(&bytes, 0), Aligned::new(&bytes, 4), false.into());
+        let err = Index::from_bytes(Arc::new(shifty)).err().expect("a misaligned section must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

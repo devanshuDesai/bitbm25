@@ -171,7 +171,7 @@ impl<'a> Parser<'a> {
         Ok(join(kids, Query::And))
     }
 
-    /// unary := "NOT" unary | "-" atom | atom
+    /// unary := "NOT" unary | "-" atom | atom   ("-word" is "-" then "word")
     fn unary(&mut self) -> io::Result<Option<Query>> {
         match self.peek() {
             Some(Tok::Not) => {
@@ -184,6 +184,14 @@ impl<'a> Parser<'a> {
             Some(Tok::Word(w)) if w.len() > 1 && w.starts_with('-') => {
                 self.pos += 1;
                 Ok(self.word(&w[1..]).map(|q| Query::Not(Box::new(q))))
+            }
+            Some(Tok::Word("-")) => {
+                // a lone '-' negates what follows: "-(a OR b)", "- a"
+                self.pos += 1;
+                self.deeper()?;
+                let q = self.atom()?;
+                self.depth -= 1;
+                Ok(q.map(|q| Query::Not(Box::new(q))))
             }
             _ => self.atom(),
         }
@@ -246,6 +254,13 @@ mod tests {
         // "a -b" is an Or holding a Not: refused, since a bare negation would match every row
         assert_eq!(Query::parse(&Analyzer::default(), "a -b").unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(p("Wi-Fi"), And(vec![t("wi"), t("fi")]));
+        let excl = |kid| And(vec![t("cat"), Not(Box::new(kid))]);
+        assert_eq!(p("cat AND -(dog OR fish)"), excl(Or(vec![t("dog"), t("fish")])));
+        assert_eq!(p("cat AND - dog"), excl(t("dog")));
+        assert_eq!(Query::parse(&Analyzer::default(), "cat AND -").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        // the README's examples
+        assert!(Query::parse(&Analyzer::default(), "fox AND (quick OR fast) AND -slow").is_ok());
+        assert!(Query::parse(&Analyzer::default(), "new AND york AND -city").is_ok());
         assert_eq!(p("cat AND -wi-fi"), And(vec![t("cat"), Not(Box::new(And(vec![t("wi"), t("fi")])))]));
     }
 
