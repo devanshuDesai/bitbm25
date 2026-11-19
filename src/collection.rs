@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::{invalid, merge, replace_file, Builder, Index, SegView, SHIFT};
+use crate::{invalid, merge, replace_file, Analyzer, Builder, Index, Params, SegView, SHIFT};
 
 const MANIFEST_HEADER: &str = "bitbm25-collection 1";
 
@@ -91,18 +91,18 @@ impl Collection {
             dir,
             _lock: lock,
             snap: RwLock::new(Arc::new(segs)),
-            w: Mutex::new(Writer { buf: Builder::default(), pending: Vec::new(), next_id, next_file }),
+            w: Mutex::new(Writer { buf: new_builder(), pending: Vec::new(), next_id, next_file }),
         })
     }
 
     /// Adds a row (pre-tokenized: whitespace-separated terms) and returns its id. Visible to
     /// queries after the next `commit`. Ids of rows not yet committed are reused after a crash.
-    pub fn add(&self, doc: &str) -> u64 {
+    pub fn add(&self, doc: &str) -> io::Result<u64> {
         let mut w = self.w.lock().unwrap();
         let id = w.next_id;
+        w.buf.add(id, doc)?;
         w.next_id += 1;
-        w.buf.add_with_id(id, doc);
-        id
+        Ok(id)
     }
 
     /// Deletes the row with this id at the next `commit`; ids that don't exist are ignored.
@@ -115,7 +115,7 @@ impl Collection {
         let mut w = self.w.lock().unwrap();
         let mut segs: Vec<Seg> = self.snapshot().as_ref().clone();
         if !w.buf.ids.is_empty() {
-            let idx = std::mem::take(&mut w.buf).finish();
+            let idx = std::mem::replace(&mut w.buf, new_builder()).finish();
             segs.push(self.write_segment(&mut w.next_file, idx)?);
         }
         for id in std::mem::take(&mut w.pending) {
@@ -178,7 +178,7 @@ impl Collection {
     }
 
     fn merged(&self, next_file: &mut u64, segs: &[Seg]) -> io::Result<Seg> {
-        self.write_segment(next_file, merge(&views(segs)))
+        self.write_segment(next_file, merge(&views(segs))?)
     }
 
     fn snapshot(&self) -> Arc<Vec<Seg>> {
@@ -213,6 +213,12 @@ impl Collection {
     pub fn verify(&self) -> io::Result<()> {
         self.snapshot().iter().try_for_each(|s| s.idx.verify())
     }
+}
+
+/// A collection's segments: pre-split text, default k1/b. Ids increase, so a row is found by binary
+/// search.
+fn new_builder() -> Builder {
+    Builder::new(Params::default(), Analyzer::whitespace()).expect("default params are valid")
 }
 
 fn views(segs: &[Seg]) -> Vec<SegView<'_>> {
@@ -253,6 +259,7 @@ fn remove_unreferenced(dir: &Path, segs: &[Seg]) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::tests::{brute_rows, check_query, corpus, TempPath};
+    use crate::{Analyzer, Params};
     use std::collections::{BTreeMap, HashMap};
 
     #[test]
@@ -282,7 +289,7 @@ mod tests {
             for _ in 0..[1, 40, 700, 5, 300, 0, 2][round % 7] {
                 let doc = &pools[round % 2][next % 3_000];
                 next += 1;
-                added.push((c.add(doc), doc.clone()));
+                added.push((c.add(doc).unwrap(), doc.clone()));
             }
             let assigned = live.keys().last().map_or(0, |&id| id + 1) + added.len() as u64;
             let deleted: Vec<u64> = (0..rand(150)).map(|_| rand(assigned + 20)).collect(); // some twice, uncommitted or unassigned
@@ -314,7 +321,7 @@ mod tests {
             }
             for q in queries {
                 for and in [false, true] {
-                    check_query(&views(&segs), q, and, &brute_rows(&rows, q, and));
+                    check_query(&views(&segs), q, and, &brute_rows(&rows, q, and, Params::default(), &Analyzer::whitespace()));
                 }
             }
         }
@@ -327,9 +334,9 @@ mod tests {
     fn a_crash_before_the_manifest_leaves_the_last_commit() {
         let dir = TempPath::new("crash");
         let c = Collection::open(&dir.0).unwrap();
-        c.add("a b");
+        c.add("a b").unwrap();
         c.commit().unwrap();
-        c.add("a c");
+        c.add("a c").unwrap();
         c.commit().unwrap();
         drop(c);
         // Simulate a crash mid-commit: a later segment and a temp file exist, the MANIFEST doesn't name them.

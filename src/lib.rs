@@ -41,8 +41,25 @@ mod collection;
 pub use analyzer::Analyzer;
 pub use collection::Collection;
 
-pub const K1: f64 = 1.2;
-pub const B: f64 = 0.75;
+/// BM25's k1 and b. Chosen per index when it is built: they are written in each segment and baked
+/// into its stored bounds, so every segment a query reads must share them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Params {
+    pub k1: f64,
+    pub b: f64,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params { k1: 1.2, b: 0.75 }
+    }
+}
+
+impl Params {
+    fn valid(self) -> bool {
+        self.k1.is_finite() && self.k1 >= 0.0 && (0.0..=1.0).contains(&self.b)
+    }
+}
 const SHIFT: u32 = 6; // 64 rows per block
 const TF_ESCAPE: u8 = u8::MAX; // stored tf meaning "255 or more, see Index::big_tf"
 const NONE: u32 = u32::MAX; // builder: term has no row yet
@@ -52,13 +69,13 @@ const NONE: u32 = u32::MAX; // builder: term has no row yet
 const _: () = assert!(cfg!(target_endian = "little") && usize::BITS == 64);
 
 /// The length-dependent part of BM25 for one term: tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl)).
-fn tf_part(tf: f64, dl: f64, avgdl: f64) -> f64 {
-    tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avgdl))
+fn tf_part(tf: f64, dl: f64, avgdl: f64, p: Params) -> f64 {
+    tf * (p.k1 + 1.0) / (tf + p.k1 * (1.0 - p.b + p.b * dl / avgdl))
 }
 
 /// tf_part of one row as a bound byte: units of (k1 + 1) / 255, rounded up.
-fn ub_byte(tf: u32, dl: u32, avgdl: f64) -> u8 {
-    let units = tf_part(tf as f64, dl as f64, avgdl) / ((K1 + 1.0) / 255.0);
+fn ub_byte(tf: u32, dl: u32, avgdl: f64, p: Params) -> u8 {
+    let units = tf_part(tf as f64, dl as f64, avgdl, p) / ((p.k1 + 1.0) / 255.0);
     (units.ceil() as u32).clamp(1, 255) as u8 // tf_part < k1 + 1, so at most 255
 }
 
@@ -72,17 +89,20 @@ fn stored_tf(tf: usize) -> u8 {
 struct Stats {
     total_len: u64,
     n: f64,
-    c0: f32, // k1 * (1 - b)
+    params: Params,
+    k1p1: f32, // k1 + 1
+    c0: f32,   // k1 * (1 - b)
     c1: f32, // k1 * b / avgdl
     avgdl: f64,
     unit: f32, // tf_part represented by one unit of a bound byte, nudged up for f32 rounding
 }
 
 impl Stats {
-    fn new(n: usize, total_len: u64) -> Self {
+    fn new(n: usize, total_len: u64, p: Params) -> Self {
         let avgdl = (total_len as f64 / n.max(1) as f64).max(f64::MIN_POSITIVE);
-        let unit = ((K1 + 1.0) / 255.0 * (1.0 + 1e-6)) as f32;
-        Stats { total_len, n: n as f64, c0: (K1 * (1.0 - B)) as f32, c1: (K1 * B / avgdl) as f32, avgdl, unit }
+        let unit = ((p.k1 + 1.0) / 255.0 * (1.0 + 1e-6)) as f32;
+        let (k1p1, c0, c1) = ((p.k1 + 1.0) as f32, (p.k1 * (1.0 - p.b)) as f32, (p.k1 * p.b / avgdl) as f32);
+        Stats { total_len, n: n as f64, params: p, k1p1, c0, c1, avgdl, unit }
     }
 
     fn idf(&self, df: usize) -> f32 {
@@ -160,6 +180,10 @@ fn replace_file(path: &Path, write: impl FnOnce(&mut BufWriter<File>) -> io::Res
 
 fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+fn bad_input(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg.into())
 }
 
 /// A segment's bytes as a host holds them.
@@ -242,11 +266,13 @@ const HEADER_CRC_AT: usize = TABLE_AT + 24 * SECTIONS;
 const DATA_AT: usize = (HEADER_CRC_AT + 4).next_multiple_of(8);
 
 impl Index {
-    /// Builds an in-memory index; row id = position in `docs`. Docs are pre-tokenized: whitespace-separated terms.
+    /// Builds an in-memory index with default params and the `whitespace` analyzer; id = position in
+    /// `docs`. Panics past the limits `Builder::add` reports as errors (2^32 - 1 rows, terms or
+    /// terms per row).
     pub fn build<S: AsRef<str>>(docs: &[S]) -> Self {
-        let mut b = Builder::default();
-        for d in docs {
-            b.add(d.as_ref());
+        let mut b = Builder::new(Params::default(), Analyzer::whitespace()).expect("default params are valid");
+        for (id, d) in docs.iter().enumerate() {
+            b.add(id as u64, d.as_ref()).expect("within a segment's limits");
         }
         b.finish()
     }
@@ -279,8 +305,18 @@ impl Index {
         self.term(id, 0.0).df(self)
     }
 
-    fn rows(&self) -> usize {
+    /// Number of rows, deleted or not.
+    pub fn rows(&self) -> usize {
         self.dl.len()
+    }
+
+    /// Each row's id, by row: how a host maps its own ids to rows (to build an excluded-rows bitset).
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+
+    pub fn params(&self) -> Params {
+        self.stats.params
     }
 
     fn mask_and_bound(&self, st: &Stats, t: &Term, e: Entry) -> (u64, f32) {
@@ -340,7 +376,7 @@ impl Index {
             tf => tf as f32,
         };
         let s = st;
-        t.idf * tf * (K1 + 1.0) as f32 / (tf + s.c0 + s.c1 * self.dl[row as usize] as f32)
+        t.idf * tf * s.k1p1 / (tf + s.c0 + s.c1 * self.dl[row as usize] as f32)
     }
 
     /// Adds the scores of term `t` in block `b` to `scores`, for the rows in `present`.
@@ -532,8 +568,8 @@ impl Index {
         h.extend_from_slice(MAGIC);
         h.extend_from_slice(&VERSION.to_le_bytes());
         h.extend_from_slice(&(SECTIONS as u32).to_le_bytes());
-        h.extend_from_slice(&K1.to_le_bytes());
-        h.extend_from_slice(&B.to_le_bytes());
+        h.extend_from_slice(&self.stats.params.k1.to_le_bytes());
+        h.extend_from_slice(&self.stats.params.b.to_le_bytes());
         h.extend_from_slice(&SHIFT.to_le_bytes());
         h.extend_from_slice(&(TF_ESCAPE as u32).to_le_bytes());
         h.extend_from_slice(&(self.dl.len() as u64).to_le_bytes());
@@ -590,9 +626,10 @@ impl Index {
         if u32_at(HEADER_CRC_AT) != crc32fast::hash(&h[..HEADER_CRC_AT]) {
             return Err(invalid("index header is corrupt (checksum mismatch)"));
         }
-        let params = (f64::from_bits(u64_at(16)), f64::from_bits(u64_at(24)), u32_at(32), u32_at(36));
-        if u32_at(12) as usize != SECTIONS || params != (K1, B, SHIFT, TF_ESCAPE as u32) {
-            return Err(invalid(format!("index built with (k1, b, block shift, tf escape) = {params:?}")));
+        let params = Params { k1: f64::from_bits(u64_at(16)), b: f64::from_bits(u64_at(24)) };
+        let layout = (u32_at(32), u32_at(36));
+        if u32_at(12) as usize != SECTIONS || layout != (SHIFT, TF_ESCAPE as u32) || !params.valid() {
+            return Err(invalid(format!("index built with {params:?}, (block shift, tf escape) = {layout:?}")));
         }
         let (rows, total_len) = (u64_at(40), u64_at(48));
         let sec = |i: usize| (u64_at(TABLE_AT + 24 * i), u64_at(TABLE_AT + 24 * i + 8));
@@ -621,7 +658,7 @@ impl Index {
             big_tfs: arr!(14),
             dl: arr!(15),
             ids: arr!(16),
-            stats: Stats::new(rows as usize, total_len),
+            stats: Stats::new(rows as usize, total_len, params),
             crcs: Some(crcs),
         };
         if !idx.consistent() || idx.dl.len() as u64 != rows {
@@ -679,7 +716,7 @@ fn resolve(segs: &[SegView], terms: &[&str], and: bool) -> Option<Vec<(Stats, Ve
     // ponytail: deleted rows count toward n, df and avgdl until a merge drops them, as in Lucene;
     // exact live statistics would need each deleted row's terms.
     let rows = segs.iter().map(|(s, _)| s.rows()).sum();
-    let all = Stats::new(rows, segs.iter().map(|(s, _)| s.stats.total_len).sum());
+    let all = Stats::new(rows, segs.iter().map(|(s, _)| s.stats.total_len).sum(), segs[0].0.params());
     let plans = segs.iter().zip(&ids).map(|((s, _), ids)| {
         let ts = if and && ids.contains(&None) {
             vec![]
@@ -719,9 +756,14 @@ fn is_deleted(del: &[u64], row: usize) -> bool {
     del.get(row >> SHIFT).is_some_and(|w| w >> (row & 63) & 1 == 1)
 }
 
-/// The live rows of `segs`, which must be in id order, as one new segment.
-fn merge(segs: &[SegView]) -> Index {
-    let mut b = Builder::default();
+/// The live rows of `segs` as one new segment, in segment order, ids kept. The segments must share
+/// params.
+pub fn merge(segs: &[SegView]) -> io::Result<Index> {
+    let params = segs.first().map_or_else(Params::default, |s| s.0.params());
+    if segs.iter().any(|s| s.0.params() != params) {
+        return Err(bad_input("segments built with different k1/b can't be merged"));
+    }
+    let mut b = Builder::new(params, Analyzer::whitespace())?;
     for &(idx, del) in segs {
         let mut remap = vec![NONE; idx.rows()]; // old row -> new row, NONE if deleted
         for (r, new) in remap.iter_mut().enumerate().filter(|(r, _)| !is_deleted(del, *r)) {
@@ -733,6 +775,9 @@ fn merge(segs: &[SegView]) -> Index {
         for t in 0..idx.lex_off.len() - 1 {
             let name = &idx.lex_bytes[idx.lex_off[t]..idx.lex_off[t + 1]];
             let mut id = None; // a term with no live rows is left out
+            if b.postings.len() >= NONE as usize {
+                return Err(bad_input("a segment holds at most 2^32 - 1 distinct terms"));
+            }
             idx.for_each_posting(t as u32, |row, tf| {
                 let r = remap[row as usize];
                 if r != NONE {
@@ -742,7 +787,7 @@ fn merge(segs: &[SegView]) -> Index {
             });
         }
     }
-    b.finish()
+    Ok(b.finish())
 }
 
 /// Per-term state while building: (row delta, tf) pairs as LEB128 varints, which is far smaller than
@@ -775,11 +820,14 @@ fn get_varint(bytes: &[u8], pos: &mut usize) -> u32 {
     }
 }
 
-/// Streaming index construction: docs are added one at a time in row order and not retained, so a
-/// corpus never has to be in memory alongside its index. Rows only ever increase, so each term's
-/// postings are appended already sorted.
-#[derive(Default)]
+/// Streaming index construction: docs are added one at a time and not retained, so a corpus never
+/// has to be in memory alongside its index. Each doc is the next row, so each term's postings are
+/// appended already sorted. Ids are the host's, in any order.
 pub struct Builder {
+    params: Params,
+    analyzer: Analyzer,
+    text: String,             // one doc's terms, back to back, reused
+    spans: Vec<Range<usize>>, // each term's place in `text`
     terms: HashMap<Vec<u8>, u32>,
     postings: Vec<BuildTerm>,
     dl: Vec<u32>,
@@ -792,33 +840,67 @@ pub struct Builder {
 }
 
 impl Builder {
-    /// Adds a row whose id is its position.
-    pub fn add(&mut self, doc: &str) {
-        self.add_with_id(self.dl.len() as u64, doc);
+    /// A builder for a segment scored with `params`, turning text into terms with `analyzer`.
+    pub fn new(params: Params, analyzer: Analyzer) -> io::Result<Builder> {
+        if !params.valid() {
+            return Err(bad_input(format!("k1 must be finite and >= 0, and b in [0, 1]; got {params:?}")));
+        }
+        Ok(Builder {
+            params,
+            analyzer,
+            text: String::new(),
+            spans: Vec::new(),
+            terms: HashMap::new(),
+            postings: Vec::new(),
+            dl: Vec::new(),
+            ids: Vec::new(),
+            total_len: 0,
+            singles: 0,
+            multis: 0,
+            multi_rows: 0,
+        })
     }
 
-    /// Adds a row; ids must increase.
-    pub fn add_with_id(&mut self, id: u64, doc: &str) {
-        assert!(self.dl.len() < NONE as usize, "a segment holds at most 2^32 - 1 rows");
-        assert!(self.ids.last().is_none_or(|&last| last < id), "row ids must increase");
+    /// Adds `text` as the next row, with the host's `id`. Fails, changing nothing, past a segment's
+    /// limits: 2^32 - 1 rows, terms in a row, or distinct terms.
+    pub fn add(&mut self, id: u64, text: &str) -> io::Result<()> {
+        if self.dl.len() >= NONE as usize {
+            return Err(bad_input("a segment holds at most 2^32 - 1 rows"));
+        }
+        let (buf, spans) = (&mut self.text, &mut self.spans);
+        buf.clear();
+        spans.clear();
+        self.analyzer.for_each_term(text, |t| {
+            buf.push_str(t);
+            spans.push(buf.len() - t.len()..buf.len());
+        });
+        let len = u32::try_from(spans.len()).map_err(|_| bad_input("a row holds at most 2^32 - 1 terms"))?;
+        let buf = &self.text;
+        spans.sort_unstable_by(|a, b| buf[a.clone()].cmp(&buf[b.clone()]));
+        let runs = || spans.chunk_by(|a, b| buf[a.clone()] == buf[b.clone()]);
+        let new_terms = runs().filter(|r| !self.terms.contains_key(buf[r[0].clone()].as_bytes())).count();
+        if self.postings.len() + new_terms > NONE as usize {
+            return Err(bad_input("a segment holds at most 2^32 - 1 distinct terms"));
+        }
         let row = self.dl.len() as u32;
-        let mut toks: Vec<&str> = doc.split_ascii_whitespace().collect();
-        let len = u32::try_from(toks.len()).expect("a row has at most 2^32 - 1 tokens");
         self.dl.push(len);
         self.ids.push(id);
         self.total_len += len as u64;
-        toks.sort_unstable();
-        for run in toks.chunk_by(|a, b| a == b) {
-            let term = self.term_id(run[0].as_bytes());
+        let (text, spans) = (std::mem::take(&mut self.text), std::mem::take(&mut self.spans));
+        for run in spans.chunk_by(|a, b| text[a.clone()] == text[b.clone()]) {
+            let term = self.term_id(text[run[0].clone()].as_bytes());
             self.push(term, row, run.len() as u32);
         }
+        (self.text, self.spans) = (text, spans);
+        Ok(())
     }
 
+    /// Callers check first that a new term fits (fewer than 2^32 - 1 terms).
     fn term_id(&mut self, name: &[u8]) -> u32 {
         if let Some(&id) = self.terms.get(name) {
             return id;
         }
-        let id = u32::try_from(self.postings.len()).expect("at most 2^32 terms");
+        let id = self.postings.len() as u32;
         self.postings.push(BuildTerm { last: NONE, ..Default::default() });
         self.terms.insert(name.to_vec(), id);
         id
@@ -845,7 +927,7 @@ impl Builder {
     }
 
     pub fn finish(self) -> Index {
-        let Builder { terms, mut postings, dl, ids, total_len, singles, multis, multi_rows } = self;
+        let Builder { params, terms, mut postings, dl, ids, total_len, singles, multis, multi_rows, .. } = self;
         let n_terms = postings.len();
         let mut names = vec![Vec::new(); n_terms];
         for (name, id) in terms {
@@ -868,7 +950,7 @@ impl Builder {
         let mut m_ub = Vec::with_capacity(multis);
         let mut m_tfs = Vec::with_capacity(multi_rows);
         let (mut big_keys, mut big_tfs) = (Vec::new(), Vec::new());
-        let stats = Stats::new(dl.len(), total_len);
+        let stats = Stats::new(dl.len(), total_len, params);
         let avgdl = stats.avgdl;
         let mut rows: Vec<(u32, u32)> = Vec::new(); // one term's (row, tf), reused
         for (new_id, &old) in order.iter().enumerate() {
@@ -895,14 +977,14 @@ impl Builder {
                 if let [(row, tf)] = group {
                     s_rows.push(*row);
                     s_tfs.push(stored_tf(*tf as usize));
-                    s_ub.push(ub_byte(*tf, dl[*row as usize], avgdl));
+                    s_ub.push(ub_byte(*tf, dl[*row as usize], avgdl, params));
                     continue;
                 }
                 let (mut mask, mut ub) = (0u64, 0u8);
                 m_tf_off.push((m_tfs.len() - tfs_start) as u32);
                 for &(row, tf) in group {
                     mask |= 1 << (row & 63);
-                    ub = ub.max(ub_byte(tf, dl[row as usize], avgdl));
+                    ub = ub.max(ub_byte(tf, dl[row as usize], avgdl, params));
                     m_tfs.push(stored_tf(tf as usize));
                 }
                 m_blocks.push(group[0].0 >> SHIFT);
@@ -991,9 +1073,9 @@ mod py {
         // corpus from disk; each string is borrowed only while it is being indexed.
         #[new]
         fn new(docs: &Bound<'_, PyAny>) -> PyResult<Self> {
-            let mut b = super::Builder::default();
-            for d in docs.try_iter()? {
-                b.add(d?.cast::<pyo3::types::PyString>()?.to_str()?);
+            let mut b = super::Builder::new(super::Params::default(), super::Analyzer::whitespace())?;
+            for (id, d) in docs.try_iter()?.enumerate() {
+                b.add(id as u64, d?.cast::<pyo3::types::PyString>()?.to_str()?)?;
             }
             Ok(PyIndex(b.finish()))
         }
@@ -1047,13 +1129,13 @@ mod py {
         }
 
         /// Adds a row and returns its id; visible after `commit`.
-        fn add(&self, doc: &str) -> u64 {
-            self.0.add(doc)
+        fn add(&self, doc: &str) -> PyResult<u64> {
+            Ok(self.0.add(doc)?)
         }
 
         /// Adds rows from any iterable of str; returns their ids.
         fn add_many(&self, docs: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
-            docs.try_iter()?.map(|d| Ok(self.0.add(d?.cast::<pyo3::types::PyString>()?.to_str()?))).collect()
+            docs.try_iter()?.map(|d| Ok(self.0.add(d?.cast::<pyo3::types::PyString>()?.to_str()?)?)).collect()
         }
 
         fn delete(&self, id: u64) {
@@ -1125,14 +1207,21 @@ mod tests {
     /// Exhaustive reference: (row, score) for every matching row, row = position.
     fn brute(docs: &[String], q: &[&str], and: bool) -> Vec<(u64, f64)> {
         let rows: Vec<(u64, &str, bool)> = docs.iter().enumerate().map(|(i, d)| (i as u64, d.as_str(), true)).collect();
-        brute_rows(&rows, q, and)
+        brute_rows(&rows, q, and, Params::default(), &Analyzer::whitespace())
     }
 
     /// Exhaustive reference over (id, doc, live) rows: statistics count every row, results only live ones.
-    pub(crate) fn brute_rows(rows: &[(u64, &str, bool)], q: &[&str], and: bool) -> Vec<(u64, f64)> {
+    pub(crate) fn brute_rows(
+        rows: &[(u64, &str, bool)],
+        q: &[&str],
+        and: bool,
+        p: Params,
+        analyzer: &Analyzer,
+    ) -> Vec<(u64, f64)> {
         let mut seen = HashSet::new();
         let q: Vec<&str> = q.iter().copied().filter(|t| seen.insert(*t)).collect(); // duplicates count once
-        let toks: Vec<Vec<&str>> = rows.iter().map(|r| r.1.split_whitespace().collect()).collect();
+        let toks: Vec<Vec<String>> = rows.iter().map(|r| analyzer.terms(r.1)).collect();
+        let toks: Vec<Vec<&str>> = toks.iter().map(|t| t.iter().map(String::as_str).collect()).collect();
         let n = rows.len() as f64;
         let avgdl = toks.iter().map(|t| t.len() as f64).sum::<f64>() / n;
         let mut dfs: HashMap<&str, f64> = HashMap::new();
@@ -1153,7 +1242,7 @@ mod tests {
                 .map(|t| {
                     let tf = d.iter().filter(|x| *x == t).count() as f64;
                     let idf = (1.0 + (n - df(t) + 0.5) / (df(t) + 0.5)).ln();
-                    idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * d.len() as f64 / avgdl))
+                    idf * tf * (p.k1 + 1.0) / (tf + p.k1 * (1.0 - p.b + p.b * d.len() as f64 / avgdl))
                 })
                 .sum();
             out.push((r.0, score));
@@ -1273,6 +1362,59 @@ mod tests {
         let off = Index::from_bytes(Arc::new(Aligned::new(&bytes, 1))).err().unwrap();
         assert_eq!(off.kind(), io::ErrorKind::InvalidData);
         assert!(off.to_string().contains("aligned"));
+    }
+
+    #[test]
+    fn ids_in_any_order_and_custom_params() {
+        let docs = corpus(1_500, 9, 60);
+        let mut ids: Vec<u64> = (0..docs.len() as u64).map(|i| i.wrapping_mul(0x9E3779B97F4A7C15) >> 16).collect();
+        ids[7] = ids[3] + 1; // two near-equal ids out of order
+        for params in [Params::default(), Params { k1: 0.9, b: 0.4 }, Params { k1: 2.0, b: 1.0 }] {
+            let mut b = Builder::new(params, Analyzer::whitespace()).unwrap();
+            for (id, d) in ids.iter().zip(&docs) {
+                b.add(*id, d).unwrap();
+            }
+            let idx = b.finish();
+            let mut bytes = Vec::new();
+            idx.write_to(&mut bytes).unwrap();
+            let reopened = Index::from_bytes(Arc::new(Aligned::new(&bytes, 0))).unwrap();
+            assert_eq!(reopened.params(), params);
+            let rows: Vec<_> = ids.iter().zip(&docs).map(|(i, d)| (*i, d.as_str(), true)).collect();
+            for q in [&["t0", "t1"][..], &["t5", "t40", "t80"]] {
+                for and in [false, true] {
+                    let want = brute_rows(&rows, q, and, params, &Analyzer::whitespace());
+                    check_query(&[(&reopened, &[])], q, and, &want);
+                }
+            }
+        }
+        let bad = |p| Builder::new(p, Analyzer::whitespace()).err().unwrap().kind();
+        assert_eq!(bad(Params { k1: -1.0, b: 0.5 }), io::ErrorKind::InvalidInput);
+        assert_eq!(bad(Params { k1: 1.2, b: 1.5 }), io::ErrorKind::InvalidInput);
+        assert_eq!(bad(Params { k1: f64::NAN, b: 0.5 }), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn ties_go_to_the_lowest_ids_in_any_order() {
+        let mut b = Builder::new(Params::default(), Analyzer::whitespace()).unwrap();
+        for id in (0..300u64).rev() {
+            b.add(id * 3, "a b").unwrap();
+        }
+        let idx = b.finish();
+        for and in [false, true] {
+            let got: Vec<u64> = idx.top_k(&["a", "b"], and, 10).into_iter().map(|h| h.0).collect();
+            assert_eq!(got, (0..10).map(|i| i * 3).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn empty_and_unicode_docs() {
+        let mut b = Builder::new(Params::default(), Analyzer::default()).unwrap();
+        for (id, d) in ["", "Café 🚀", "e\u{301}te\u{301} CAFE", "   "].iter().enumerate() {
+            b.add(id as u64, d).unwrap();
+        }
+        let hits = b.finish().top_k(&["cafe"], false, 10);
+        assert_eq!(hits.iter().map(|h| h.0).collect::<Vec<_>>(), [1, 2]);
+        assert!(hits.iter().all(|h| h.1.is_finite() && h.1 > 0.0));
     }
 
     #[test]
