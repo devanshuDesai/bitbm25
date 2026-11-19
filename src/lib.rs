@@ -573,7 +573,7 @@ impl Index {
     pub fn from_bytes(buf: Arc<dyn AsRef<[u8]> + Send + Sync>) -> io::Result<Index> {
         let map: Buf = buf;
         let h: &[u8] = (*map).as_ref();
-        if h.as_ptr() as usize % 8 != 0 {
+        if !(h.as_ptr() as usize).is_multiple_of(8) {
             return Err(invalid("buffer is not 8-byte aligned"));
         }
         if h.len() < DATA_AT || &h[..8] != MAGIC {
