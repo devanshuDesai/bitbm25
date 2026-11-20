@@ -6,6 +6,8 @@ build-backend = "maturin"
 name = "bitbm25"
 version = "0.1.0"
 requires-python = ">=3.12"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 
 [tool.maturin]
 features = ["python"]

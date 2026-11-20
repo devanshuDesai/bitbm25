@@ -145,3 +145,10 @@ next commit.
 Not yet:
 - **Positions:** no phrase or proximity queries.
 - **Background merging:** merges run inside `commit` and block adds, though not queries.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT)
+at your option. Unless you explicitly state otherwise, any contribution you intentionally submit for
+inclusion in this crate, as defined in the Apache-2.0 license, is dual licensed as above, without
+any additional terms or conditions.

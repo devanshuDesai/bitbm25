@@ -3,6 +3,8 @@ name = "bitbm25"
 version = "0.1.0"
 edition = "2021"
 description = "Exact BM25 over 64-row bitmap blocks keyed by row position"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/devanshuDesai/bitbm25"
 publish = false
 
 [lib]
