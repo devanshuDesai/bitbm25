@@ -22,10 +22,12 @@ unicode-segmentation = "1.13"
 
 [features]
 python = ["dep:pyo3"]
+prof = [] # keeps hot functions out of line so a sampling profiler can tell them apart
 
 [profile.release]
 lto = true
 codegen-units = 1
+debug = 1 # line tables, for profilers
 
 [profile.test]
 opt-level = 2 # the brute-force reference is slow unoptimised

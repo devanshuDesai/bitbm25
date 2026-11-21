@@ -7,7 +7,7 @@
 //! the next open or commit. Queries see the last commit and never wait for one.
 //!
 //! Each row has an id, assigned in increasing order and kept through merges. Segments hold disjoint,
-//! increasing ranges of ids, so an id is found by binary search.
+//! increasing ranges of ids; a segment finds an id's row with `Index::row_of`.
 //!
 //! Deleted rows still count toward n, df and avgdl until a merge drops them (as in Lucene, Tantivy
 //! and ParadeDB); a segment more than a fifth deleted is rewritten at the next commit.
@@ -18,7 +18,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::{invalid, merge, replace_file, Analyzer, Builder, Index, Params, Query, SegView, SHIFT};
+use crate::seg::SHIFT;
+use crate::{invalid, merge, replace_file, Analyzer, Builder, Index, Params, Query, SegView};
 
 const MANIFEST_HEADER: &str = "bitbm25-collection 1";
 
@@ -114,14 +115,12 @@ impl Collection {
     pub fn commit(&self) -> io::Result<()> {
         let mut w = self.w.lock().unwrap();
         let mut segs: Vec<Seg> = self.snapshot().as_ref().clone();
-        if !w.buf.ids.is_empty() {
+        if w.buf.rows() > 0 {
             let idx = std::mem::replace(&mut w.buf, new_builder()).finish();
             segs.push(self.write_segment(&mut w.next_file, idx)?);
         }
         for id in std::mem::take(&mut w.pending) {
-            let i = segs.partition_point(|s| s.idx.ids[0] <= id);
-            let Some(s) = i.checked_sub(1).map(|i| &mut segs[i]) else { continue };
-            let Ok(row) = s.idx.ids.binary_search(&id) else { continue };
+            let Some((s, row)) = segs.iter_mut().find_map(|s| s.idx.row_of(id).map(|row| (s, row))) else { continue };
             if s.del.is_empty() {
                 s.del = vec![0; s.idx.rows().div_ceil(64)];
             }
@@ -215,8 +214,7 @@ impl Collection {
     }
 }
 
-/// A collection's segments: pre-split text, default k1/b. Ids increase, so a row is found by binary
-/// search.
+/// A collection's segments: pre-split text, default k1/b.
 fn new_builder() -> Builder {
     Builder::new(Params::default(), Analyzer::whitespace()).expect("default params are valid")
 }
@@ -317,7 +315,7 @@ mod tests {
             assert_eq!(rows.iter().filter(|r| r.2).count(), live.len(), "every live row is stored");
             assert!(segs.len() as f64 <= (live.len().max(1) as f64).log2() + 2.0, "{} segments", segs.len());
             for w in segs.windows(2) {
-                assert!(w[0].live() > w[1].live() && w[0].idx.ids.last() < w[1].idx.ids.first());
+                assert!(w[0].live() > w[1].live() && w[0].idx.ids().iter().max() < w[1].idx.ids().iter().min());
             }
             for q in queries {
                 for and in [false, true] {
