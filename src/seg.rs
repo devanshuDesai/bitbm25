@@ -217,7 +217,7 @@ fn spread(stored: u64, present: u8) -> u64 {
 /// Row bytes of the blocks before `b` in its group of eight: the bits set in their presence bytes.
 #[inline]
 fn groups_before(present: &[u8], b: usize) -> usize {
-    present[b & !7..b].iter().map(|p| p.count_ones() as usize).sum()
+    (word_at(present, b & !7) & ((1u64 << (8 * (b & 7))) - 1)).count_ones() as usize
 }
 
 /// `first` as `Postings::block` returns it when finding it would cost extra: ask `Postings::first`.
@@ -394,7 +394,7 @@ impl<'a> Postings<'a> {
                 }
             }
             Rows::Bytes { present, at, groups } => {
-                let (start, end) = (blocks.start as usize, (blocks.end as usize).min(present.len()));
+                let (start, end) = (blocks.start as usize, (blocks.end as usize).min(present.len())); // blocks past the last are absent
                 if start >= end {
                     return;
                 }
@@ -880,7 +880,7 @@ impl Index {
             let words = take(w, blocks);
             Rows::Bitmap { words, rank: bits::as_u32(take(w, blocks.div_ceil(8).div_ceil(2))) }
         } else if m.kind & FORM_MASK == FORM_BYTES {
-            let present = &bits::as_u8(take(w, blocks.div_ceil(8)))[..blocks];
+            let present = bits::as_u8(take(w, blocks.div_ceil(8))); // whole words: bytes past the last block are 0
             let at = bits::as_u32(take(w, blocks.div_ceil(8) + 1));
             let n_groups = at[2 * blocks.div_ceil(8)] as usize;
             Rows::Bytes { present, at, groups: bits::as_u8(take(w, n_groups.div_ceil(8) + 1)) }

@@ -60,55 +60,90 @@ pub(crate) struct Seg<'a> {
     pub(crate) n_pos: usize,
 }
 
-/// Rows whose summed weight reaches `need`: `terms` are (rows holding the term, its weight), and
-/// sums saturate at 255. Sixty-four u8 lanes, one per row.
+/// A saturating u8 sum per row of a block: sixty-four lanes. Terms are added one at a time (the rows
+/// holding the term, its weight), and `reaching` gives the rows whose sum is at least a value.
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(feature = "prof", inline(never))]
-#[cfg_attr(not(feature = "prof"), inline)]
-fn rows_reaching(terms: &[(u64, u8)], need: u8) -> u64 {
-    use std::arch::aarch64::*;
+struct Lanes([std::arch::aarch64::uint8x16_t; 4]);
+
+#[cfg(target_arch = "aarch64")]
+impl Lanes {
     const BIT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    // which byte of the mask each lane's row is in
     const SPREAD: [[u8; 16]; 4] = [
         [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
         [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3],
         [4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5],
         [6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7],
     ];
-    // SAFETY: NEON is part of aarch64's baseline; the loads read the 16-byte constants above.
-    unsafe {
-        let bit = vld1q_u8(BIT.as_ptr());
-        let spread = [vld1q_u8(SPREAD[0].as_ptr()), vld1q_u8(SPREAD[1].as_ptr()), vld1q_u8(SPREAD[2].as_ptr()), vld1q_u8(SPREAD[3].as_ptr())];
-        let mut acc = [vdupq_n_u8(0); 4];
-        for &(m, q) in terms {
-            let (mv, qv) = (vreinterpretq_u8_u64(vdupq_n_u64(m)), vdupq_n_u8(q));
-            for c in 0..4 {
+
+    #[inline]
+    fn new() -> Self {
+        // SAFETY: NEON is part of aarch64's baseline, here and below.
+        Lanes([unsafe { std::arch::aarch64::vdupq_n_u8(0) }; 4])
+    }
+
+    #[inline]
+    fn add(&mut self, rows: u64, weight: u8) {
+        use std::arch::aarch64::*;
+        // SAFETY: the loads read the 16-byte constants above.
+        unsafe {
+            let (bit, mv, qv) = (vld1q_u8(Self::BIT.as_ptr()), vreinterpretq_u8_u64(vdupq_n_u64(rows)), vdupq_n_u8(weight));
+            for (c, acc) in self.0.iter_mut().enumerate() {
                 // each lane gets its row's byte of the mask, then its own bit of that byte
-                let has = vtstq_u8(vqtbl1q_u8(mv, spread[c]), bit);
-                acc[c] = vqaddq_u8(acc[c], vandq_u8(has, qv));
+                let has = vtstq_u8(vqtbl1q_u8(mv, vld1q_u8(Self::SPREAD[c].as_ptr())), bit);
+                *acc = vqaddq_u8(*acc, vandq_u8(has, qv));
             }
         }
-        let (needv, mut out) = (vdupq_n_u8(need), 0u64);
-        for (c, a) in acc.iter().enumerate() {
-            let ge = vandq_u8(vcgeq_u8(*a, needv), bit);
-            let bits = vaddv_u8(vget_low_u8(ge)) as u64 | (vaddv_u8(vget_high_u8(ge)) as u64) << 8;
-            out |= bits << (16 * c);
+    }
+
+    /// Whether any row's sum is at least `need`.
+    #[inline]
+    fn any_reaching(&self, need: u8) -> bool {
+        use std::arch::aarch64::*;
+        // SAFETY: as above.
+        unsafe { vmaxvq_u8(vmaxq_u8(vmaxq_u8(self.0[0], self.0[1]), vmaxq_u8(self.0[2], self.0[3]))) >= need }
+    }
+
+    #[inline]
+    fn reaching(&self, need: u8) -> u64 {
+        use std::arch::aarch64::*;
+        // SAFETY: as above.
+        unsafe {
+            let (bit, needv, mut out) = (vld1q_u8(Self::BIT.as_ptr()), vdupq_n_u8(need), 0u64);
+            for (c, a) in self.0.iter().enumerate() {
+                let ge = vandq_u8(vcgeq_u8(*a, needv), bit);
+                let bits = vaddv_u8(vget_low_u8(ge)) as u64 | (vaddv_u8(vget_high_u8(ge)) as u64) << 8;
+                out |= bits << (16 * c);
+            }
+            out
         }
-        out
     }
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-#[inline]
-fn rows_reaching(terms: &[(u64, u8)], need: u8) -> u64 {
-    let mut acc = [0u8; 64];
-    for &(mut m, q) in terms {
-        while m != 0 {
-            let r = m.trailing_zeros() as usize;
-            acc[r] = acc[r].saturating_add(q);
-            m &= m - 1;
+struct Lanes([u8; 64]);
+
+#[cfg(not(target_arch = "aarch64"))]
+impl Lanes {
+    fn new() -> Self {
+        Lanes([0; 64])
+    }
+
+    fn add(&mut self, mut rows: u64, weight: u8) {
+        while rows != 0 {
+            let r = rows.trailing_zeros() as usize;
+            self.0[r] = self.0[r].saturating_add(weight);
+            rows &= rows - 1;
         }
     }
-    (0..64).filter(|&r| acc[r] >= need).fold(0, |o, r| o | 1 << r)
+
+    fn any_reaching(&self, need: u8) -> bool {
+        self.0.iter().any(|&a| a >= need)
+    }
+
+    fn reaching(&self, need: u8) -> u64 {
+        (0..64).filter(|&r| self.0[r] >= need).fold(0, |o, r| o | 1 << r)
+    }
 }
 
 /// Adds `ceil(byte * mul / 256)` to `acc[b - from]` for blocks `from..to`, whose bound bytes are in
@@ -147,6 +182,27 @@ fn add_bounds(acc: &mut [u16], bounds: &[u64], from: u32, to: u32, mul: u16) {
     scalar(acc, from, to);
 }
 
+/// The first index at or after `from` whose accumulator is at least `min` (which is at least 1).
+#[inline]
+fn next_reaching(acc: &[u16], from: usize, min: u16) -> Option<usize> {
+    let mut i = from;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64; each step reads 8 accumulators inside the slice.
+    unsafe {
+        use std::arch::aarch64::*;
+        let minv = vdupq_n_u16(min);
+        while i + 8 <= acc.len() {
+            // one byte per accumulator: 255 where it reaches
+            let hit = vget_lane_u64(vreinterpret_u64_u8(vmovn_u16(vcgeq_u16(vld1q_u16(acc[i..i + 8].as_ptr()), minv))), 0);
+            if hit != 0 {
+                return Some(i + hit.trailing_zeros() as usize / 8);
+            }
+            i += 8;
+        }
+    }
+    acc[i.min(acc.len())..].iter().position(|&a| a >= min).map(|p| i + p)
+}
+
 /// Runs the query over one segment into `sink`. The segment must be able to match: a scoring term
 /// present, and for `Shape::All` every term present.
 pub(crate) fn run(seg: &Seg, shape: &Shape, sink: &mut Sink) {
@@ -168,7 +224,7 @@ struct Scan<'a, 's> {
     unit: f32,                        // score per bound-byte unit (before idf), nudged up; grows if the average length has
     cur: Vec<Option<(u64, usize)>>,   // each plan term's rows in the block at hand, and its first posting there
     masks: Vec<u64>,                  // the same rows, for evaluating a tree
-    mq: Vec<(u64, u8)>,               // scratch for `rows_reaching`
+    later: Vec<(usize, u8)>,          // scratch: the terms of the block at hand and their weights
     // Ranked scans decode a term that keeps no bounds once per window, while summing bounds: its
     // (block, rows, first posting, largest tf) there, read back in block order when blocks are scored.
     lists: Vec<Option<Vec<Listed>>>,
@@ -186,7 +242,7 @@ impl<'a, 's> Scan<'a, 's> {
         let unit = (st.params.k1 + 1.0) / 255.0 * (st.avgdl / seg.idx.stats.avgdl).max(1.0) * (1.0 + 1e-6);
         let n = seg.terms.len();
         let lists = (0..n).map(|_| None).collect();
-        Scan { seg, shape, norm, unit: unit as f32, cur: vec![None; n], masks: vec![0; n], mq: Vec::with_capacity(n), lists, read: vec![0; n], tf: vec![0; n] }
+        Scan { seg, shape, norm, unit: unit as f32, cur: vec![None; n], masks: vec![0; n], later: Vec::with_capacity(n), lists, read: vec![0; n], tf: vec![0; n] }
     }
 
     /// The scoring terms this segment has, with their place in the plan.
@@ -283,7 +339,8 @@ impl<'a, 's> Scan<'a, 's> {
             clock = std::time::Instant::now();
         };
         let (idx, st) = (self.seg.idx, self.seg.st);
-        let ts: Vec<(usize, &QTerm)> = self.scoring().collect();
+        let mut ts: Vec<(usize, &QTerm)> = self.scoring().collect();
+        ts.sort_by(|a, b| b.1.idf.total_cmp(&a.1.idf)); // heaviest first: see `ranked_or_block`
         // Accumulators count units of a 255th of the largest bound any term can have here.
         let top_idf = ts.iter().map(|(_, t)| t.idf).fold(f32::MIN_POSITIVE, f32::max);
         let unit = top_idf * self.unit.max(st.k1p1 / 255.0);
@@ -309,11 +366,14 @@ impl<'a, 's> Scan<'a, 's> {
                         let list = self.lists[*j].get_or_insert_default();
                         list.clear();
                         let (scale, norm) = (t.idf * st.k1p1 / unit * (1.0 + 1e-6), &self.norm);
+                        // units for tf = 1, which most postings have, by length class
+                        let ones: [u16; 256] = std::array::from_fn(|c| (scale / (1.0 + norm[c])).ceil() as u16);
                         t.p.for_each_bounded(b0..b1, |b, m, first, tf| {
                             list.push((b, m, first, tf));
-                            let units = (scale * tf as f32 / (tf as f32 + norm[idx.blen[b as usize] as usize])).ceil();
+                            let c = idx.blen[b as usize] as usize;
+                            let units = if tf == 1 { ones[c] } else { (scale * tf as f32 / (tf as f32 + norm[c])).ceil() as u16 };
                             let a = &mut acc[(b - b0) as usize];
-                            *a = a.saturating_add(units as u16);
+                            *a = a.saturating_add(units);
                         });
                     }
                 }
@@ -343,16 +403,13 @@ impl<'a, 's> Scan<'a, 's> {
                 }
                 self.read.fill(0);
             }
-            let (mut theta, mut min) = (top.threshold(), need(top));
-            for b in b0..b1 {
-                let a = acc[(b - b0) as usize];
-                if a == 0 || a < min {
-                    continue;
-                }
-                self.ranked_block(b, top, prune, &ts);
+            let (mut theta, mut min, mut at) = (top.threshold(), need(top), 0);
+            while let Some(i) = next_reaching(acc, at, min) {
+                self.ranked_block(b0 + i as u32, top, prune, &ts);
                 if top.threshold() != theta {
                     (theta, min) = (top.threshold(), need(top));
                 }
+                at = i + 1;
             }
             #[cfg(feature = "prof")]
             lap(2);
@@ -369,24 +426,76 @@ impl<'a, 's> Scan<'a, 's> {
     #[cfg_attr(feature = "prof", inline(never))]
     #[cfg_attr(not(feature = "prof"), inline)]
     fn ranked_block(&mut self, b: u32, top: &mut TopK, prune: bool, ts: &[(usize, &QTerm)]) {
-        let mut rows = self.locate(b);
         #[cfg(feature = "prof")]
         work(3, 1);
+        let filter = prune && top.heap.len() == top.k;
+        if filter && matches!(self.shape, Shape::Any) {
+            return self.ranked_or_block(b, top, ts);
+        }
+        let mut rows = self.locate(b);
         if rows == 0 {
             return;
         }
-        if prune && top.heap.len() == top.k {
+        if filter {
             // Bounds in 200ths of the threshold, rounded up, so a row needs 200 of them.
             let per_unit = 200.0 * (1.0 + 2e-5) / top.threshold().max(f32::MIN_POSITIVE);
-            self.mq.clear();
+            let mut lanes = Lanes::new();
             for &(j, t) in ts {
                 if let Some((m, _)) = self.cur[j] {
-                    let units = (self.bound(j, t, b) * per_unit).ceil();
-                    self.mq.push((m, units.clamp(1.0, 255.0) as u8));
+                    lanes.add(m, (self.bound(j, t, b) * per_unit).ceil().clamp(1.0, 255.0) as u8);
                 }
             }
-            rows &= rows_reaching(&self.mq, 200);
+            rows &= lanes.reaching(200);
         }
+        #[cfg(feature = "prof")]
+        work(4, rows.count_ones() as u64);
+        self.push_rows(b, rows, top);
+    }
+
+    /// `ranked_block` for a plain OR with the heap full. `ts` is in descending order of idf. Each
+    /// term's bound in the block is known before its rows are (a bound byte, or its window list), so
+    /// terms are added heaviest first and the block is dropped as soon as no row can qualify even if
+    /// it held every term not yet added: usually after two or three of them.
+    #[inline]
+    fn ranked_or_block(&mut self, b: u32, top: &mut TopK, ts: &[(usize, &QTerm)]) {
+        // Bounds in 200ths of the threshold, rounded up, so a row needs 200 of them.
+        let per_unit = 200.0 * (1.0 + 2e-5) / top.threshold().max(f32::MIN_POSITIVE);
+        let units = |bound: f32| (bound * per_unit).ceil().clamp(1.0, 255.0) as u8;
+        self.later.clear();
+        let mut rest = 0u32; // units of the terms not yet added
+        for &(j, t) in ts {
+            self.cur[j] = None;
+            let u = if let Some(list) = &self.lists[j] {
+                let at = &mut self.read[j];
+                while list.get(*at).is_some_and(|e| e.0 < b) {
+                    *at += 1;
+                }
+                let Some(e) = list.get(*at).filter(|e| e.0 == b) else { continue };
+                (self.cur[j], self.tf[j]) = (Some((e.1, e.2)), e.3);
+                units(self.bound(j, t, b))
+            } else {
+                match t.p.bound(b) {
+                    Some(byte) if byte != 0 => units(t.idf * byte as f32 * self.unit),
+                    _ => continue,
+                }
+            };
+            rest += u as u32;
+            self.later.push((j, u));
+        }
+        let mut lanes = Lanes::new();
+        for i in 0..self.later.len() {
+            let (j, u) = self.later[i];
+            if self.cur[j].is_none() {
+                let t = self.seg.terms[j].as_ref().expect("a scoring term of this segment");
+                self.cur[j] = t.p.block(b);
+            }
+            lanes.add(self.cur[j].expect("its bound byte says the term is here").0, u);
+            rest -= u as u32;
+            if rest < 200 && !lanes.any_reaching((200 - rest) as u8) {
+                return;
+            }
+        }
+        let rows = lanes.reaching(200) & !self.excluded(b);
         #[cfg(feature = "prof")]
         work(4, rows.count_ones() as u64);
         self.push_rows(b, rows, top);
