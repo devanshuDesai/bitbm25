@@ -30,8 +30,8 @@
 //! postings are.
 
 use std::fs::File;
-use std::io::{self, Write};
-use std::path::Path;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
@@ -1108,35 +1108,9 @@ impl Index {
 
     /// Writes the index in its file format: what `save` puts in a file and `from_bytes` reads.
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
-        let secs = self.sections();
-        let mut h = Vec::with_capacity(DATA_AT);
-        h.extend_from_slice(MAGIC);
-        h.extend_from_slice(&VERSION.to_le_bytes());
-        h.extend_from_slice(&(SECTIONS as u32).to_le_bytes());
-        h.extend_from_slice(&self.stats.params.k1.to_le_bytes());
-        h.extend_from_slice(&self.stats.params.b.to_le_bytes());
-        h.extend_from_slice(&SHIFT.to_le_bytes());
-        h.extend_from_slice(&(self.order as u32 | (self.pos.is_some() as u32) << 1).to_le_bytes());
-        h.extend_from_slice(&(self.dl.len() as u64).to_le_bytes());
-        h.extend_from_slice(&self.stats.total_len.to_le_bytes());
-        h.extend_from_slice(&(self.n_terms as u64).to_le_bytes());
-        let mut off = DATA_AT;
-        for s in &secs {
-            h.extend_from_slice(&(off as u64).to_le_bytes());
-            h.extend_from_slice(&(s.len() as u64).to_le_bytes());
-            h.extend_from_slice(&crc32fast::hash(s).to_le_bytes());
-            h.extend_from_slice(&[0; 4]);
-            off = (off + s.len()).next_multiple_of(8);
-        }
-        h.extend_from_slice(&crc32fast::hash(&h).to_le_bytes());
-        h.resize(DATA_AT, 0);
-
-        w.write_all(&h)?;
-        for s in secs {
-            w.write_all(s)?;
-            w.write_all(&[0; 8][..s.len().next_multiple_of(8) - s.len()])?;
-        }
-        Ok(())
+        let flags = self.order as u32 | (self.pos.is_some() as u32) << 1;
+        let parts = self.sections().map(Part::Bytes);
+        write_segment(w, self.stats.params, flags, self.dl.len() as u64, self.stats.total_len, self.n_terms as u64, parts)
     }
 
     /// Opens a saved index by mapping it: nothing is read until queries touch it, so this is
@@ -1256,6 +1230,85 @@ impl TermIter<'_> {
     }
 }
 
+/// Where an assembler's postings (or positions) go: memory, or a file that is copied into the
+/// segment file at the end, so that assembling needs memory for one term at a time.
+enum Words {
+    Mem(Vec<u64>),
+    File { w: BufWriter<File>, path: PathBuf, words: u64, crc: crc32fast::Hasher },
+}
+
+impl Words {
+    fn len(&self) -> u64 {
+        match self {
+            Words::Mem(v) => v.len() as u64,
+            Words::File { words, .. } => *words,
+        }
+    }
+
+    fn put(&mut self, more: &[u64]) -> io::Result<()> {
+        match self {
+            Words::Mem(v) => v.extend_from_slice(more),
+            Words::File { w, words, crc, .. } => {
+                w.write_all(as_bytes(more))?;
+                crc.update(as_bytes(more));
+                *words += more.len() as u64;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One section of a segment file about to be written: bytes at hand, or a file of them with its
+/// length in bytes and checksum.
+enum Part<'a> {
+    Bytes(&'a [u8]),
+    File(&'a Path, u64, u32),
+}
+
+/// Writes a segment file: the header, then each part, 8-byte aligned.
+fn write_segment(w: &mut impl Write, params: Params, flags: u32, rows: u64, total_len: u64, terms: u64, parts: [Part; SECTIONS]) -> io::Result<()> {
+    let mut h = Vec::with_capacity(DATA_AT);
+    h.extend_from_slice(MAGIC);
+    h.extend_from_slice(&VERSION.to_le_bytes());
+    h.extend_from_slice(&(SECTIONS as u32).to_le_bytes());
+    h.extend_from_slice(&params.k1.to_le_bytes());
+    h.extend_from_slice(&params.b.to_le_bytes());
+    h.extend_from_slice(&SHIFT.to_le_bytes());
+    h.extend_from_slice(&flags.to_le_bytes());
+    h.extend_from_slice(&rows.to_le_bytes());
+    h.extend_from_slice(&total_len.to_le_bytes());
+    h.extend_from_slice(&terms.to_le_bytes());
+    let mut off = DATA_AT as u64;
+    for part in &parts {
+        let (len, crc) = match part {
+            Part::Bytes(s) => (s.len() as u64, crc32fast::hash(s)),
+            Part::File(_, len, crc) => (*len, *crc),
+        };
+        h.extend_from_slice(&off.to_le_bytes());
+        h.extend_from_slice(&len.to_le_bytes());
+        h.extend_from_slice(&crc.to_le_bytes());
+        h.extend_from_slice(&[0; 4]);
+        off = (off + len).next_multiple_of(8);
+    }
+    h.extend_from_slice(&crc32fast::hash(&h).to_le_bytes());
+    h.resize(DATA_AT, 0);
+    w.write_all(&h)?;
+    for part in parts {
+        let len = match part {
+            Part::Bytes(s) => {
+                w.write_all(s)?;
+                s.len() as u64
+            }
+            Part::File(path, len, _) => {
+                io::copy(&mut File::open(path)?, w)?;
+                len
+            }
+        };
+        w.write_all(&[0; 8][..(len.next_multiple_of(8) - len) as usize])?;
+    }
+    Ok(())
+}
+
 /// Puts a segment together from its rows (already in their final order) and then each term's
 /// postings, terms in ascending order.
 pub(crate) struct Assembler {
@@ -1264,45 +1317,119 @@ pub(crate) struct Assembler {
     avgdl: f64, // of this segment's rows: what its bound bytes are computed under
     dl: Vec<u32>,
     ids: Vec<u64>,
-    post: Vec<u64>,
-    pos: Option<Vec<u64>>, // positions, if the segment stores them
+    post: Words,
+    pos: Option<Words>,           // positions, if the segment stores them
+    term: (Vec<u64>, Vec<u64>), // the term being added: its postings and positions, before they are appended
     lex: LexWriter,
 }
 
 impl Assembler {
     pub(crate) fn new(params: Params, order: Order, positions: bool, dl: Vec<u32>, ids: Vec<u64>) -> Self {
         let avgdl = Stats::new(dl.len(), dl.iter().map(|&d| d as u64).sum(), params).avgdl;
-        Assembler { params, order, avgdl, dl, ids, post: Vec::new(), pos: positions.then(Vec::new), lex: LexWriter::default() }
+        let (post, pos) = (Words::Mem(Vec::new()), positions.then(|| Words::Mem(Vec::new())));
+        Assembler { params, order, avgdl, dl, ids, post, pos, term: Default::default(), lex: LexWriter::default() }
+    }
+
+    /// Sends postings and positions to files in `dir` instead of memory; `finish_file` then copies
+    /// them into the segment file. Call before adding terms.
+    pub(crate) fn spill(mut self, dir: &Path) -> io::Result<Self> {
+        let file = |name: &str| {
+            let path = dir.join(name);
+            let w = BufWriter::with_capacity(1 << 20, File::create(&path)?);
+            Ok::<_, io::Error>(Words::File { w, path, words: 0, crc: crc32fast::Hasher::new() })
+        };
+        self.post = file("post")?;
+        if self.pos.is_some() {
+            self.pos = Some(file("pos")?);
+        }
+        Ok(self)
     }
 
     /// Adds a term: its rows ascending, a tf for each and, if the segment stores positions, each
     /// row's positions ascending, back to back. Terms must be added in ascending order.
-    pub(crate) fn term(&mut self, name: &[u8], rows: &[u32], tfs: &[u32], positions: &[u32]) {
-        let mut meta = write_term(rows, tfs, &self.dl, self.avgdl, self.params, &mut self.post);
-        if let Some(pos) = self.pos.as_mut().filter(|_| rows.len() > 2) {
-            meta.pos = pos.len() as u64;
+    pub(crate) fn term(&mut self, name: &[u8], rows: &[u32], tfs: &[u32], positions: &[u32]) -> io::Result<()> {
+        let (post, pos) = &mut self.term;
+        post.clear();
+        let mut meta = write_term(rows, tfs, &self.dl, self.avgdl, self.params, post);
+        meta.off += self.post.len(); // write_term counted from the start of this term's words
+        self.post.put(post)?;
+        if let Some(out) = self.pos.as_mut().filter(|_| rows.len() > 2) {
+            pos.clear();
             write_positions(rows, tfs, positions, &self.dl, pos);
+            meta.pos = out.len();
+            out.put(pos)?;
         }
         self.lex.push(name, &meta, self.pos.as_ref().map(|_| positions));
+        Ok(())
     }
 
+    fn block_lengths(&self) -> Vec<u8> {
+        self.dl.chunks(64).map(|c| len_class(*c.iter().min().expect("chunks are not empty"))).collect()
+    }
+
+    /// The segment, in memory. Only for an assembler that was not spilled.
     pub(crate) fn finish(self) -> Index {
         let total_len = self.dl.iter().map(|&d| d as u64).sum();
-        let blen: Vec<u8> = self.dl.chunks(64).map(|c| len_class(*c.iter().min().expect("chunks are not empty"))).collect();
+        let blen = self.block_lengths();
+        let words = |w: Words| match w {
+            Words::Mem(v) => v,
+            Words::File { .. } => unreachable!("a spilled assembler is finished with finish_file"),
+        };
         Index {
             lex_heads: self.lex.heads.into(),
             lex: self.lex.bytes.into(),
-            post: self.post.into(),
+            post: words(self.post).into(),
             stats: Stats::new(self.dl.len(), total_len, self.params),
             dl: self.dl.into(),
             ids: self.ids.into(),
             blen: blen.into(),
-            pos: self.pos.map(Into::into),
+            pos: self.pos.map(|p| words(p).into()),
             n_terms: self.lex.n,
             order: self.order,
             crcs: None,
             by_id: Default::default(),
         }
+    }
+
+    /// Writes the segment to `path` (atomically, as `Index::save` does) without holding its
+    /// postings or positions in memory, if the assembler was spilled.
+    pub(crate) fn finish_file(self, path: &Path) -> io::Result<()> {
+        let blen = self.block_lengths();
+        let flags = self.order as u32 | (self.pos.is_some() as u32) << 1;
+        let total_len = self.dl.iter().map(|&d| d as u64).sum();
+        // close the spill files; what is left of each is its path, length and checksum
+        let close = |w: Words| match w {
+            Words::Mem(v) => Ok((None, v)),
+            Words::File { w, path, words, crc } => {
+                w.into_inner().map_err(|e| e.into_error())?;
+                Ok::<_, io::Error>((Some((path, words * 8, crc.finalize())), Vec::new()))
+            }
+        };
+        let (post, pos) = (close(self.post)?, self.pos.map(close).transpose()?.unwrap_or_default());
+        fn part(closed: &(Option<(PathBuf, u64, u32)>, Vec<u64>)) -> Part<'_> {
+            match closed {
+                (Some((path, len, crc)), _) => Part::File(path, *len, *crc),
+                (None, mem) => Part::Bytes(as_bytes(mem)),
+            }
+        }
+        replace_file(path, |w| {
+            let parts = [
+                Part::Bytes(as_bytes(&self.lex.heads)),
+                Part::Bytes(&self.lex.bytes),
+                part(&post),
+                Part::Bytes(as_bytes(&self.dl)),
+                Part::Bytes(as_bytes(&self.ids)),
+                Part::Bytes(&blen),
+                part(&pos),
+            ];
+            write_segment(w, self.params, flags, self.dl.len() as u64, total_len, self.lex.n as u64, parts)
+        })?;
+        for (file, _) in [post, pos] {
+            if let Some((path, ..)) = file {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1472,7 +1599,7 @@ impl Builder {
                     sorted.extend_from_slice(&at[start..start + tf as usize]);
                 }
             }
-            asm.term(&name, &rows, &tfs, &sorted);
+            asm.term(&name, &rows, &tfs, &sorted).expect("appending to memory can't fail");
         }
         asm.finish()
     }
@@ -1528,7 +1655,7 @@ mod tests {
                 .collect();
             let mut asm = Assembler::new(Params::default(), Order::Added, true, dl, (0..n_rows as u64).collect());
             for (i, (rows, tfs)) in cases.iter().enumerate() {
-                asm.term(format!("term{i:03}").as_bytes(), rows, tfs, &positions[i]);
+                asm.term(format!("term{i:03}").as_bytes(), rows, tfs, &positions[i]).unwrap();
             }
             let idx = asm.finish();
             let blocks = idx.blocks();

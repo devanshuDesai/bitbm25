@@ -1,8 +1,8 @@
 //! Lab tool for experiments on real corpora (see open-search-bench/lab/export.py for the inputs).
 //!
 //!   lab build <corpus.txt> <docs> <out.idx> [added] [nopos]   index the first <docs> lines (whitespace
-//!                                                     analyzer); `added` keeps rows in the order added,
-//!                                                     `nopos` stores no positions
+//!                                                     analyzer) on $THREADS threads (4); `added` keeps
+//!                                                     rows in the order added, `nopos` stores no positions
 //!   lab stats <index>                                 what the index is made of
 //!   lab bench <index> <queries.tsv> [reps]            time top-10 and count per query kind, check exactness
 //!   lab hot <index> <queries.tsv> <kind> <top10|count> <seconds>   one workload in a loop, to profile
@@ -21,17 +21,12 @@ fn main() -> std::io::Result<()> {
             let (limit, t0) = (args[3].parse::<usize>().unwrap(), Instant::now());
             let opt = |o: &str| args[5..].iter().any(|a| a == o);
             let order = if opt("added") { Order::Added } else { Order::Length };
-            let mut b = Builder::new(Params::default(), Analyzer::whitespace())?.order(order).positions(!opt("nopos"));
-            let mut n = 0u64;
-            for line in BufReader::with_capacity(1 << 20, std::fs::File::open(&args[2])?).lines().take(limit) {
-                b.add(n, &line?)?;
-                n += 1;
-            }
-            let added = t0.elapsed().as_secs_f64();
-            let idx = b.finish();
-            let built = t0.elapsed().as_secs_f64();
-            idx.save(&args[4])?;
-            println!("{n} docs  add {added:.1}s  finish {:.1}s  save {:.1}s  {:.1} MB", built - added, t0.elapsed().as_secs_f64() - built, idx.size_bytes() as f64 / 1e6);
+            let threads = std::env::var("THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or(4);
+            let lines = BufReader::with_capacity(1 << 20, std::fs::File::open(&args[2])?).lines().take(limit);
+            let builder = || Ok(Builder::new(Params::default(), Analyzer::whitespace())?.order(order).positions(!opt("nopos")));
+            bitbm25::build_file(&args[4], lines.enumerate().map(|(i, l)| l.map(|l| (i as u64, l))), builder, threads)?;
+            let idx = Index::open(&args[4])?;
+            println!("{} docs  {threads} threads  {:.1}s  {:.1} MB", idx.rows(), t0.elapsed().as_secs_f64(), idx.size_bytes() as f64 / 1e6);
         }
         Some("stats") => print!("{}", bitbm25::lab::composition(&Index::open(&args[2])?)),
         Some("hot") => {

@@ -404,6 +404,16 @@ fn prepare<'q, 'a>(segs: &'a [SegView<'a>], q: &'q Query) -> io::Result<Option<(
 /// The live rows of `segs` as one new segment, ids kept, in the first segment's row order (by
 /// length, or segment by segment). The segments must share params.
 pub fn merge(segs: &[SegView]) -> io::Result<Index> {
+    Ok(merged(segs, None)?.finish())
+}
+
+/// `merge` written straight to a file at `path`, holding one term at a time in memory rather than
+/// the whole result. `scratch` is a directory for its temporary files.
+pub fn merge_to(segs: &[SegView], scratch: &Path, path: &Path) -> io::Result<()> {
+    merged(segs, Some(scratch))?.finish_file(path)
+}
+
+fn merged(segs: &[SegView], spill: Option<&Path>) -> io::Result<seg::Assembler> {
     let params = segs.first().map_or_else(Params::default, |s| s.0.params());
     if segs.iter().any(|s| s.0.params() != params) {
         return Err(bad_input("segments built with different k1/b can't be merged"));
@@ -427,6 +437,9 @@ pub fn merge(segs: &[SegView]) -> io::Result<Index> {
     let ids = rows.iter().map(|&(_, s, r)| segs[s as usize].0.ids[r as usize]).collect();
     let positions = segs.iter().all(|s| s.0.has_positions()); // kept only if every segment has them
     let mut asm = seg::Assembler::new(params, order, positions, rows.iter().map(|r| r.0).collect(), ids);
+    if let Some(dir) = spill {
+        asm = asm.spill(dir)?;
+    }
 
     // Every term of every segment, in order: the segments' sorted lexicons, merged.
     let mut iters: Vec<seg::TermIter> = segs.iter().map(|s| s.0.terms()).collect();
@@ -459,7 +472,7 @@ pub fn merge(segs: &[SegView]) -> io::Result<Index> {
             continue; // a term with no live rows is left out
         }
         if order == Order::Length {
-            pairs.sort_unstable();
+            pairs.sort(); // each segment's rows arrive in order: a stable sort merges those runs
         }
         term_rows.clear();
         tfs.clear();
@@ -471,9 +484,97 @@ pub fn merge(segs: &[SegView]) -> io::Result<Index> {
                 sorted.extend_from_slice(&at[start..start + tf as usize]);
             }
         }
-        asm.term(&name, &term_rows, &tfs, &sorted);
+        asm.term(&name, &term_rows, &tfs, &sorted)?;
     }
-    Ok(asm.finish())
+    Ok(asm)
+}
+
+/// Builds a segment file at `path` from `docs` (id and text), on `threads` threads, in memory that
+/// doesn't grow with the corpus: rows are indexed a batch at a time into temporary segments under
+/// `<path>.parts`, each by a builder from `builder`, and those are merged straight into the file.
+pub fn build_file(
+    path: impl AsRef<Path>,
+    docs: impl Iterator<Item = io::Result<(u64, String)>>,
+    builder: impl Fn() -> io::Result<Builder> + Sync,
+    threads: usize,
+) -> io::Result<()> {
+    build_batched(path.as_ref(), docs, builder, threads, 64 << 20)
+}
+
+/// `build_file` with `batch` bytes of text per temporary segment.
+fn build_batched(
+    path: &Path,
+    docs: impl Iterator<Item = io::Result<(u64, String)>>,
+    builder: impl Fn() -> io::Result<Builder> + Sync,
+    threads: usize,
+    batch_bytes: usize,
+) -> io::Result<()> {
+    let mut parts = path.as_os_str().to_owned();
+    parts.push(".parts");
+    let parts = Path::new(&parts);
+    std::fs::create_dir_all(parts)?;
+    let built = build_in(parts, path, docs, builder, threads, batch_bytes);
+    std::fs::remove_dir_all(parts)?;
+    built
+}
+
+/// `build_batched` with its temporary files in the directory `parts`.
+fn build_in(
+    parts: &Path,
+    path: &Path,
+    docs: impl Iterator<Item = io::Result<(u64, String)>>,
+    builder: impl Fn() -> io::Result<Builder> + Sync,
+    threads: usize,
+    batch_bytes: usize,
+) -> io::Result<()> {
+    let (send, recv) = std::sync::mpsc::sync_channel::<(usize, Vec<(u64, String)>)>(threads.max(1));
+    let recv = std::sync::Mutex::new(recv);
+    let work = || -> io::Result<()> {
+        loop {
+            let next = recv.lock().expect("no worker panics holding it").recv();
+            let Ok((i, batch)) = next else { return Ok(()) }; // the sender is done
+            let mut b = builder()?;
+            for (id, text) in batch {
+                b.add(id, &text)?;
+            }
+            b.finish().save(parts.join(format!("{i}.seg")))?;
+        }
+    };
+    let n = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads.max(1)).map(|_| scope.spawn(work)).collect();
+        let (mut n, mut batch, mut bytes) = (0, Vec::new(), 0);
+        let mut fed = Ok(());
+        for doc in docs {
+            match doc {
+                Ok(doc) => {
+                    bytes += doc.1.len();
+                    batch.push(doc);
+                }
+                Err(e) => {
+                    fed = Err(e);
+                    break;
+                }
+            }
+            if bytes >= batch_bytes {
+                // a full queue blocks here, which is what bounds memory
+                if send.send((n, std::mem::take(&mut batch))).is_err() {
+                    break; // every worker has stopped on an error, reported below
+                }
+                (n, bytes) = (n + 1, 0);
+            }
+        }
+        if !batch.is_empty() && send.send((n, batch)).is_ok() {
+            n += 1;
+        }
+        drop(send);
+        let done: io::Result<()> = workers.into_iter().try_for_each(|w| w.join().expect("workers don't panic"));
+        fed.and(done).map(|()| n)
+    })?;
+    let segs = (0..n).map(|i| Index::open(parts.join(format!("{i}.seg")))).collect::<io::Result<Vec<Index>>>()?;
+    match segs.len() {
+        0 => builder()?.finish().save(path),
+        _ => merge_to(&segs.iter().map(|s| (s, &[][..])).collect::<Vec<_>>(), parts, path),
+    }
 }
 
 #[derive(PartialEq)]
@@ -663,9 +764,29 @@ mod py {
         }
     }
 
+    /// Builds an index file at `path` from any iterable of str (row id = position), on `threads`
+    /// threads (0: one per core), in memory that doesn't grow with the corpus. Open it with
+    /// `Index.open`.
+    #[pyfunction]
+    #[pyo3(signature = (path, docs, analyzer = "whitespace", k1 = 1.2, b = 0.75, positions = true, threads = 0))]
+    fn build(path: PathBuf, docs: &Bound<'_, PyAny>, analyzer: &str, k1: f64, b: f64, positions: bool, threads: usize) -> PyResult<()> {
+        let analyzer = super::Analyzer::parse(analyzer)?;
+        let threads = if threads == 0 { std::thread::available_parallelism().map_or(1, |n| n.get()) } else { threads };
+        // Rows are pulled from Python on this thread (which holds the GIL); the workers never touch Python.
+        let mut failed = None;
+        let rows = docs.try_iter()?.enumerate().map_while(|(id, d)| {
+            let text = d.and_then(|d| Ok(d.cast::<pyo3::types::PyString>()?.to_str()?.to_owned()));
+            text.map_err(|e| failed = Some(e)).ok().map(|text| Ok((id as u64, text)))
+        });
+        let builder = || Ok(super::Builder::new(super::Params { k1, b }, analyzer.clone())?.positions(positions));
+        super::build_file(path, rows, builder, threads)?;
+        failed.map_or(Ok(()), Err)
+    }
+
     #[pymodule]
     fn bitbm25(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PyCollection>()?;
+        m.add_function(wrap_pyfunction!(build, m)?)?;
         m.add_class::<PyIndex>()
     }
 }
@@ -1148,6 +1269,30 @@ mod tests {
         assert!(idx.verify().unwrap_err().to_string().contains("section 6 is corrupt"));
         drop(idx); // unmap before the file is rewritten under it
         assert!(with(&|_| {}).unwrap().verify().is_ok());
+    }
+
+    #[test]
+    fn a_build_in_batches_is_the_build_in_one() {
+        // Small batches on several threads, merged to a file: the same bytes as one builder makes.
+        let docs = corpus(3_000, 31, 60);
+        let file = TempPath::new("batched");
+        for (order, positions) in [(Order::Length, true), (Order::Added, true), (Order::Length, false)] {
+            let builder = || Ok(Builder::new(Params::default(), Analyzer::whitespace())?.order(order).positions(positions));
+            let rows = docs.iter().enumerate().map(|(i, d)| Ok((i as u64, d.clone())));
+            build_batched(&file.0, rows, builder, 3, 4_000).unwrap();
+            let mut one = builder().unwrap();
+            docs.iter().enumerate().for_each(|(i, d)| one.add(i as u64, d).unwrap());
+            let mut want = Vec::new();
+            one.finish().write_to(&mut want).unwrap();
+            assert!(std::fs::read(&file.0).unwrap() == want, "{order:?} positions {positions}");
+            Index::open(&file.0).unwrap().verify().unwrap();
+        }
+        // no rows at all is an empty index, and a failing source is reported
+        build_batched(&file.0, std::iter::empty(), || Builder::new(Params::default(), Analyzer::whitespace()), 2, 100).unwrap();
+        assert_eq!(Index::open(&file.0).unwrap().rows(), 0);
+        let bad = [Ok((0, "a".to_string())), Err(bad_input("no more"))].into_iter();
+        assert!(build_batched(&file.0, bad, || Builder::new(Params::default(), Analyzer::whitespace()), 2, 100).is_err());
+        assert!(!file.0.with_extension("parts").exists(), "temporary segments are removed after a failure too");
     }
 
     #[test]
