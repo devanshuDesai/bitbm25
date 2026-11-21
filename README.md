@@ -1,26 +1,48 @@
 # bitbm25
 
-Experimental exact-BM25 search kernel, built to be hosted: by a Postgres extension, an analytics
+Exact-BM25 full-text search kernel, built to be hosted: by a Postgres extension, an analytics
 engine, or its own `Collection`. The core holds no files, locks or threads. It reads segments from
 bytes the host owns, takes the host's row ids, and returns matches in score order for as long as
-the host asks.
+the host asks. Results are exact: pruned top-k equals scoring every match, bit for bit, ties to
+the lower id.
 
-Rows are grouped into 64-row blocks keyed by row position:
-- **A term in one row of a block** stores just that row, its term frequency and a one-byte score
-  bound (6 bytes).
-- **A term in several rows of a block** stores a `u64` bitmap of them, one term-frequency byte per
-  row and a one-byte bound.
+## How it works
 
-Postings live in a few flat arrays shared by all terms, and terms are a sorted lexicon. Row lengths
-are stored exactly.
+A segment orders its rows by length and groups them into 64-row blocks, so the rows of a block are
+about equally long. A term's best possible score in a block then follows from the largest tf it
+has there and the block's shortest row; nothing about bounds is stored per posting.
 
-Scores are computed at query time from those inputs and the current collection statistics, so
-nothing stored goes stale when rows are added.
-- **Bounds:** a block's bound is its largest length-dependent score part, rounded up on a fixed
-  scale. Scaling it by how much the average length has grown keeps it safe as the statistics change.
-- **Top-k:** visits blocks in descending order of summed bounds and stops once no remaining block can
-  beat the current k-th score, so results are exact. Ties go to the lower id.
-- **Counts:** popcounts over the blocks' match bitmaps.
+- **Postings,** per term, in whichever of four forms is smallest for it, as long as decoding stays
+  fast: one or two rows inline in the lexicon; Elias-Fano over row numbers with a bucket per block;
+  a bitmap word per block; or, for terms with several rows a block, a byte of 8-row groups per block
+  and a byte of rows per group. Term frequencies are two-bit codes with nibble escapes, or bytes.
+- **Bounds:** terms in at least a quarter of the blocks keep one byte per block, the largest
+  length-dependent score part there, rounded up. Other Elias-Fano terms keep one such byte per
+  stretch of 64 of their buckets (about one per 64-128 postings).
+- **Positions** (optional) are a stream per term in chunks of 64 postings: a single position in as
+  many bits as the chunk's longest row needs, several as Elias-Fano. About 10 bits a token on
+  Wikipedia, 7.5 on MS MARCO.
+- **Ranked ORs** work through windows of 4,096 blocks (8 KB of state, whatever the collection's
+  size): sum each block's bounds eight at a time, score the most promising blocks first, then visit
+  only blocks whose bound can still beat the current k-th score. Within a block, 64 byte lanes add
+  terms heaviest first and drop the block as soon as no row can qualify; rows whose tf is too low to
+  make up the difference are dropped before scoring.
+- **Ranked ANDs and phrases** walk the rarest term's blocks, skipping whole stretches whose bounds
+  can't reach the threshold, and look the other terms up only where their bound bytes say they are
+  present and can still lift a row high enough; rows whose tfs can't make up the difference are
+  dropped before scoring, as in ORs. A phrase is an AND whose rows are then checked against
+  positions, rarest word first; ranked, a row is scored first and its positions read only if it
+  would enter the top k.
+- **Counts** are popcounts over row masks, a window at a time; they never read frequencies.
+- **Exactness:** bounds are rounded up and thresholds down wherever they are quantized, scores and
+  sums of bounds are added in f64, and ties on the k-th score are kept.
+
+Scores use the current statistics over every segment searched, so nothing stored goes stale when
+rows are added; a bound byte computed under an older average length is scaled by how much it grew
+(and capped at what any tf could score).
+
+How it compares with Tantivy 0.27 (called from Rust with its own pruning collectors, same queries,
+same machine) is in `open-search-bench/research/REPORT.md`, with what it does worse.
 
 ```bash
 cargo test                                # checks results against brute-force BM25
@@ -66,10 +88,16 @@ not stored in segments.
 
 `Query::parse` reads:
 - words, `AND`, `OR`, `NOT` (or `-word`, `-(...)`) and parentheses;
+- `"quoted words"`: a phrase, the words one after another (after the analyzer: a stopword it drops
+  takes no place, so `"bank of america"` under `stop=english` is `bank america`);
 - adjacent words are ORed;
 - NOT binds tighter than AND, and AND tighter than OR;
 - a negation among ORed parts excludes from all of them: `a b -c` means `(a OR b) AND NOT c`, as in
   Lucene and Postgres's `websearch_to_tsquery`.
+
+Nothing else is syntax. Other engines' constructs are read as words: `title:apple` (a field),
+`apple^2` (a boost), `"a b"~2` (slop), `a NEAR/3 b` and `AT LEAST 2 OF [...]` (TIN) search for the
+words they are made of. Fields, boosts, proximity and minimum-should-match don't exist yet.
 
 Words are split where the analyzer splits text: on ASCII whitespace for `whitespace`, on any Unicode
 space for `standard`. Each word then goes through the analyzer:
@@ -112,7 +140,8 @@ Rules for valid queries:
   256 characters.
 
 A row matches by ordinary boolean logic. It scores the sum of the BM25 scores of the query's
-positive terms (those not under a NOT) that it contains. `Query::matches(&terms)` checks one row's
+positive terms (those not under a NOT) that it contains; a phrase scores as the AND of its words,
+as in TIN (Lucene and Tantivy score the phrase's own frequency). `Query::matches(&terms)` checks one row's
 terms without an index, for hosts that re-check rows.
 
 A row matches a pattern if it holds any term the pattern matches, and scores as the OR of those
@@ -165,11 +194,12 @@ each of them. The markers don't count toward `max_bytes`.
 
 ```python
 idx = bitbm25.Index(docs)                 # any iterable of str; row id = position; analyzer="whitespace"
-idx = bitbm25.Index(docs, analyzer="standard stem=english", k1=0.9, b=0.4)
-idx.top_k(["new", "york"], k=10)          # terms as given; conjunctive=True for AND
-idx.top_k(query="new AND york AND -city") # query text, analyzed like the index
+idx = bitbm25.Index(docs, analyzer="standard stem=english", k1=0.9, b=0.4, positions=False)
+idx.top_k(["new", "york"], k=10)          # ids, best first; conjunctive=True for AND, phrase=True for a phrase
+idx.top_k(query='"new york" AND -city')   # query text, analyzed like the index
 idx.count(["new", "york"], conjunctive=True)
 idx.save("wiki.idx")                      # atomic: temp file, fsync, rename
+bitbm25.build("wiki.idx", docs, analyzer="standard", threads=8)  # straight to a file, in bounded memory
 idx = bitbm25.Index.open("wiki.idx", analyzer="standard stem=english")  # maps the file; instant
 idx.verify()                              # reads every byte and checks the checksums
 idx.top_k(terms, exhaustive=True)         # no early stopping: same answer, slowly, for checking
@@ -185,14 +215,21 @@ col.commit()                              # durable and visible; merges segments
 col.top_k(["new", "york"], k=10)          # terms only; whitespace analyzer, k1 = 1.2, b = 0.75
 ```
 
-Bad queries, analyzer settings or k1/b raise `OSError` with a message.
+Bad queries, analyzer settings or k1/b raise `OSError` with a message. Searches release the GIL.
+`top_k` returns ids without scores; the analyzer isn't stored in the file, so `Index.open` must be
+given the one the index was built with (a different one gives wrong results, not an error).
 
 ## File format
 
 A segment is the in-memory arrays as they are, after a header. The header holds:
-- a magic number and a format version;
-- the parameters the index was built with (k1, b, block size);
+- a magic number and a format version (6; a build reads only its own version);
+- the parameters the index was built with (k1, b, block size), the row order, whether positions are
+  stored, and the widths of the lengths and ids columns (as narrow as their values allow);
 - an offset, length and CRC32 per array, plus a CRC32 of the header itself.
+
+The arrays: the lexicon (front-coded in groups of 16 terms, each entry followed by its postings'
+form and offset) and its group heads, the postings, each row's exact length and id, a length class
+per block, and the positions. A segment holds at most 2^32 - 1 rows and a lexicon of up to 4 GiB.
 
 Opening a segment, from a file or from bytes, checks the header and that the arrays' sizes fit
 together. It refuses other versions or layouts. It reads nothing else, so a mapped file's only copy
@@ -210,23 +247,32 @@ deleted-rows bitset per segment, and a `MANIFEST` naming the current ones.
 
 **Commits.** `commit` writes buffered adds as a new segment, applies deletes, merges, and then
 atomically replaces the `MANIFEST`. That replacement is the commit point: a crash leaves the previous
-commit, and leftover files are removed on the next open. Queries see the last commit.
+commit, and leftover files are removed on the next open. A commit that returns an error has
+changed nothing visible, and keeps its adds and deletes for the next one; one that returns `Ok`
+is durable. Queries see the last commit.
+
+**Its directory.** A collection names its files `<n>.seg`, `<n>.del`, `MANIFEST` and `LOCK`, and
+removes only names of that kind it no longer uses. A directory that was never a collection but
+holds such a name is refused rather than taken over. One process opens a collection at a time.
 
 **Queries** score every segment with statistics over all of them and share one top-k heap, so later
 segments prune against the best hits so far. Ids increase and survive merges; an update is a delete
 plus an add.
 
-**Merges** rebuild segments from their postings. The newest adjacent pair whose older segment is no
-larger than the newer one is merged until live sizes strictly decrease. So there are at most
-log2(rows) segments, and each row is rewritten at most log2(rows) times.
+**Merges** rebuild segments from their postings, a term at a time into the new file. The newest
+adjacent pair whose older segment is no larger than the newer one is merged until live sizes
+strictly decrease. So there are at most log2(rows) segments, and each row is rewritten at most
+log2(rows) times.
 
 **Statistics.** Left-out rows count toward the statistics (n, df, average length) until a merge drops
 them, as in Lucene, Tantivy and ParadeDB. A segment more than a fifth deleted is rewritten at the
 next commit.
 
 Not yet:
-- **Positions:** no phrase or proximity queries.
+- **A Postgres host:** WAL, MVCC visibility, VACUUM and replicas are a host's; there is none yet.
+- **New rows before a commit:** rows become searchable a segment at a time, at `commit`.
 - **Background merging:** merges run inside `commit` and block adds, though not queries.
+- **Query language:** proximity and slop, fields, boosts, ranges, facets; TIN's dense-term elision.
 
 ## License
 
