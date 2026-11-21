@@ -77,15 +77,59 @@ space for `standard`. Each word then goes through the analyzer:
 - A word that yields several (`wi-fi`) becomes their AND.
 - Text with nothing left matches nothing.
 
+A word can instead be a pattern, which stands for every term it matches:
+- **Prefix,** `inter*`: terms that start with `inter`.
+- **Wildcard,** `c?l*r`: `?` is any one character and `*` any run of them, or none.
+- **Fuzzy,** `colour~` and `colour~2`: terms within one or two edits of `colour`. An edit inserts,
+  removes or replaces a character, or swaps two neighbours (`form`, `from`). Characters are counted,
+  not bytes. In code, `Query::Fuzzy` can also fix the first characters and count a swap as two edits.
+- **Regex,** `/colou?r/`: terms the expression matches whole, in the `regex` crate's syntax. It may
+  hold parentheses, but no space or double quote: write `\s` or `\x22`.
+
+A pattern is compared with whole terms, so its text is not analyzed like a word:
+- Only the ASCII `*`, `?`, `~` and `/` make one. Fullwidth `？`, `～` and `＊`, as Chinese and
+  Japanese text is typed, are punctuation, as in any other word.
+- It gets the analyzer's lowercasing and accent folding (none for `whitespace`), except for a regex's
+  escapes: `\D` stays `\D`. Folding adds no syntax: in `/ａ．ｂ/` the fullwidth `．` folds to a dot
+  to match, not to any character.
+- Lowercasing follows the text as typed, so a capital `Σ` that ends it or comes before a wildcard
+  becomes a final `ς`: `ΟΔΟΣ*` finds `οδος` but not `οδοσημανση`. `/οδο[σς].*/` finds both.
+- It is not split, dropped as a stopword or stemmed. With stemming on, `runn*` finds nothing if
+  `running` was indexed as `run`.
+- A quoted word is never a pattern: `"what?"` is the word. Unquoted, a final `?` makes a wildcard,
+  which needs one more character: `everest?` doesn't find `everest`. Text without spaces is one word,
+  so `東京はどこ?` is one wildcard, and matches nothing: `standard` splits such text into single
+  characters.
+- Slashes make a regex only when they enclose the word: `/usr/bin` is a word. `/usr/bin/` is a regex,
+  which no term of `standard` matches, since none holds a `/`.
+
 Rules for valid queries:
 - A NOT must sit in an AND that has a positive part, because a bare negation would match every other
   row. In text, `-a -b` is refused. In `Query` values built in code, so is an `Or` holding a `Not`:
   only the text syntax rewrites it. `Query::check` tests a value up front.
 - Nesting deeper than 64 is refused.
+- So are a fuzzy distance other than 1 or 2, a regex that doesn't compile and a wildcard longer than
+  256 characters.
 
 A row matches by ordinary boolean logic. It scores the sum of the BM25 scores of the query's
 positive terms (those not under a NOT) that it contains. `Query::matches(&terms)` checks one row's
 terms without an index, for hosts that re-check rows.
+
+A row matches a pattern if it holds any term the pattern matches, and scores as the OR of those
+terms: each one it holds adds its own BM25 score, with its own idf. Every matching term of the
+segments searched takes part, so matches and counts are exact.
+- **Cost:** terms are sorted, so a pattern that fixes how a term starts (`inter*`, `inter*al`,
+  `/colou?r.*/`) reads only the terms that start that way, and a fuzzy term skips those that start
+  too differently. A pattern that fixes no start (`*ation`) reads every term.
+- **Limits:** a query may hold 16 patterns, and they may stand for 8,192 terms in all; a term that
+  several patterns of one OR match counts once. Past either limit the query is refused
+  (`InvalidInput`), never answered in part. Under an AND or a NOT, each term is looked up in every
+  block of 64 rows that may match, so 8,192 terms there cost about two seconds per million rows. On
+  a million Wikipedia articles, `pro*` (6,976 terms) ranks its top 10 in 0.2 s and `apple AND pro*`
+  counts its rows in 1 s; `a*` (113,474 terms) is refused.
+- **Re-checking rows:** `Query::matches` builds each pattern on every call, and compiling a regex
+  takes tens of microseconds or more. `bitbm25::expand(&segs, &q)?` is `q` with its patterns replaced
+  by their terms in `segs`: each row of `segs` matches it as it matches `q`, by lookups alone.
 
 k1 (0 to 1000) and b (0 to 1) are chosen per index at build time. They are written in each segment and baked into its
 bounds, so segments with different values can't be searched or merged together.

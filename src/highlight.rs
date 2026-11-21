@@ -4,12 +4,13 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
-use crate::query::places;
+use crate::query::{places, Matcher};
 use crate::{Analyzer, Query};
 
 /// The byte ranges in `text`, ascending, of the words that make it match `q`: one range per word,
 /// none if the text doesn't match (`Query::matches`). In a text that matches:
-/// - a term highlights every word that analyzes to it;
+/// - a term highlights every word that analyzes to it, and a pattern (prefix, wildcard, fuzzy or
+///   regex) every word whose term it matches;
 /// - a phrase highlights the words of each place it occurs, and its words nowhere else;
 /// - an AND or an OR highlights what its parts do, whether or not each part matches by itself;
 /// - a NOT highlights nothing.
@@ -65,11 +66,14 @@ fn words(analyzer: &Analyzer, q: &Query, text: &str) -> (Vec<Range<usize>>, Vec<
         terms.push(term.to_string());
         spans.push(span);
     });
-    let (mut single, mut phrases) = (HashSet::new(), Vec::new());
+    let (mut single, mut phrases, mut patterns) = (HashSet::new(), Vec::new(), Vec::new());
     if q.matches(&terms) {
-        leaves(q, &mut single, &mut phrases); // `matches` has checked the nesting, so this can't run deep
+        leaves(q, &mut single, &mut phrases, &mut patterns); // `matches` has checked the nesting, so this can't run deep
     }
-    let mut lit: Vec<bool> = terms.iter().map(|term| single.contains(term.as_str())).collect();
+    // `matches` has built every pattern, so building them again succeeds
+    let mut matchers: Vec<Matcher> = patterns.iter().filter_map(|p| p.matcher().ok().flatten()).collect();
+    let mut lit: Vec<bool> =
+        terms.iter().map(|term| single.contains(term.as_str()) || matchers.iter_mut().any(|m| m.matches(term.as_bytes()))).collect();
     for phrase in phrases {
         // places can overlap: each word is lit once, from where the last place's words end
         let mut from = 0;
@@ -81,15 +85,16 @@ fn words(analyzer: &Analyzer, q: &Query, text: &str) -> (Vec<Range<usize>>, Vec<
     (spans, lit)
 }
 
-/// The terms and the phrases of `q` that are not under a NOT.
-fn leaves<'q>(q: &'q Query, terms: &mut HashSet<&'q str>, phrases: &mut Vec<&'q [String]>) {
+/// The terms, phrases and patterns of `q` that are not under a NOT.
+fn leaves<'q>(q: &'q Query, terms: &mut HashSet<&'q str>, phrases: &mut Vec<&'q [String]>, patterns: &mut Vec<&'q Query>) {
     match q {
         Query::Term(t) => {
             terms.insert(t);
         }
         Query::Phrase(ts) => phrases.push(ts),
-        Query::And(qs) | Query::Or(qs) => qs.iter().for_each(|q| leaves(q, terms, phrases)),
+        Query::And(qs) | Query::Or(qs) => qs.iter().for_each(|q| leaves(q, terms, phrases, patterns)),
         Query::Not(_) => {}
+        pattern => patterns.push(pattern),
     }
 }
 
@@ -110,6 +115,7 @@ mod tests {
                 Query::Phrase(p) => (0..p.len().min(i + 1)).any(|k| terms[i - k..].starts_with(p)),
                 Query::And(qs) | Query::Or(qs) => qs.iter().any(|q| lit(q, terms, i)),
                 Query::Not(_) => false,
+                pattern => pattern.matcher().unwrap().is_some_and(|mut m| m.matches(terms[i].as_bytes())),
             }
         }
         if !q.matches(terms) {
@@ -254,6 +260,18 @@ mod tests {
         for q in [none, Query::Or(vec![]), Query::Not(Box::new(t0))] {
             assert!(highlight(&ws, &q, "t0 t1").is_empty(), "{q:?}");
         }
+        // a pattern highlights every word whose term it matches, but not under a NOT
+        let lit = |q: &str, text: &'static str| hl(q, text).into_iter().map(|span| &text[span]).collect::<Vec<_>>();
+        let text = "inter internal intern extern interest";
+        assert_eq!(lit("inter*", text), ["inter", "internal", "intern", "interest"]);
+        assert_eq!(lit("i?ter?", text), ["intern"]);
+        assert_eq!(lit("extern~", text), ["extern"]);
+        assert_eq!(lit("extern~2", text), ["intern", "extern"]);
+        assert_eq!(lit("/int.r.*l/", text), ["internal"]);
+        assert_eq!(lit("extern OR /x+/", text), ["extern"]);
+        assert!(lit("extern AND -inter*", text).is_empty());
+        assert_eq!(lit("intern AND -/x.*/", "intern internal"), ["intern"]);
+        assert!(lit("intern AND -/x.*/", "intern xylophone internal").is_empty());
 
         // the standard analyzer: the words as they are written, whatever their case, accents or endings
         let words = |config: &str, q: &str, text: &'static str| {

@@ -7,6 +7,9 @@
 //!   lab terms <index> <words...>                      how each term is stored
 //!   lab bench <index> <queries.tsv> [reps]            time top-10 and count per query kind, check exactness
 //!   lab hot <index> <queries.tsv> <kind> <top10|count> <seconds>   one workload in a loop, to profile
+//!   lab expand <index> <locked> <query>...            time turning each query's patterns into terms;
+//!                                                     a fuzzy one locks its first <locked> characters
+//!   lab query <index> <query>...                      time one top-10 and one count of each query text
 //!
 //! `bench` with DUMP=<file> also appends each query's best time (kind, mode, query number, ms).
 //!
@@ -53,6 +56,34 @@ fn main() -> std::io::Result<()> {
                 }
             }
             println!("{:.1} qps", n as f64 / t0.elapsed().as_secs_f64());
+        }
+        Some("expand") => {
+            let (idx, locked) = (Index::open(&args[2])?, args[3].parse::<u8>().unwrap());
+            for text in &args[4..] {
+                let mut q = Query::parse(&Analyzer::whitespace(), text)?;
+                if let Query::Fuzzy { prefix, .. } = &mut q {
+                    *prefix = locked;
+                }
+                let (mut best, mut terms) = (f64::INFINITY, 0);
+                for _ in 0..3 {
+                    let (ms, n) = bitbm25::lab::expand(&idx, &q)?;
+                    (best, terms) = (best.min(ms), n);
+                }
+                println!("{best:>9.3} ms {terms:>8} terms  {q:?}");
+            }
+        }
+        Some("query") => {
+            let idx = Index::open(&args[2])?;
+            let segs = [(&idx, &[][..])];
+            for text in &args[3..] {
+                let q = Query::parse(&Analyzer::whitespace(), text)?;
+                let t0 = Instant::now();
+                std::hint::black_box(bitbm25::top_k(&segs, &q, 10)?);
+                let top10 = t0.elapsed().as_secs_f64() * 1e3;
+                let t0 = Instant::now();
+                let n = bitbm25::count(&segs, &q)?;
+                println!("top-10 {top10:>9.1} ms  count {:>9.1} ms {n:>9} rows  {text}", t0.elapsed().as_secs_f64() * 1e3);
+            }
         }
         Some("phases") => {
             // lab phases <index> <queries.tsv>: where ranked scans spend their time (build with --features prof)
