@@ -79,10 +79,18 @@ impl Query {
                 continue;
             }
             for chunk in part.split(space).filter(|c| !c.is_empty()) {
+                // A regex, `/.../` or `-/.../`, keeps its parentheses; other words end at one. It runs to
+                // the chunk's last `/`, after which only `)` may follow: found once, so a long chunk is
+                // split in linear time.
+                let close = chunk.rfind('/').filter(|&at| chunk[at + 1..].bytes().all(|b| b == b')'));
                 let mut rest = chunk;
                 while !rest.is_empty() {
-                    // a regex keeps its parentheses; other words end at one
-                    let end = regex_len(rest).unwrap_or_else(|| rest.find(['(', ')']).unwrap_or(rest.len()));
+                    let at = chunk.len() - rest.len();
+                    let open = at + rest.starts_with('-') as usize;
+                    let end = match close {
+                        Some(close) if close > open && chunk[open..].starts_with('/') => close + 1 - at,
+                        _ => rest.find(['(', ')']).unwrap_or(rest.len()),
+                    };
                     let (word, after) = if end == 0 { rest.split_at(1) } else { rest.split_at(end) };
                     toks.push(match word {
                         "(" => Tok::Open,
@@ -510,13 +518,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// If `word` starts with a regex, `/.../` or `-/.../`, with nothing but `)` after it: its length.
-fn regex_len(word: &str) -> Option<usize> {
-    let regex = word.strip_prefix('-').unwrap_or(word);
-    let close = regex.rfind('/').filter(|&at| at > 0 && regex.starts_with('/'))?;
-    regex[close + 1..].bytes().all(|b| b == b')').then_some(word.len() - regex.len() + close + 1)
-}
-
 /// None for no parts, the part itself for one, `kind` of them for more.
 fn join(mut kids: Vec<Query>, kind: fn(Vec<Query>) -> Query) -> Option<Query> {
     match kids.len() {
@@ -617,10 +618,10 @@ mod tests {
 
     #[test]
     fn long_words_split_in_linear_time() {
-        // a word of 600 KB without spaces splits into 300,000 tokens at its parentheses
-        let start = std::time::Instant::now();
-        for unit in ["(", "a)"] {
-            let text = unit.repeat(300_000);
+        // A word of 600 KB without spaces splits into 300,000 tokens at its parentheses. In the last
+        // two, many tokens start with a `/` as a regex would, and a megabyte without one follows.
+        let (start, tail) = (std::time::Instant::now(), "a".repeat(1_000_000));
+        for text in ["(".repeat(300_000), "a)".repeat(300_000), "/(".repeat(150_000) + &tail, "-/(".repeat(100_000) + &tail] {
             assert_eq!(Query::parse(&Analyzer::whitespace(), &text).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         }
         assert!(start.elapsed() < std::time::Duration::from_secs(1), "{:?}", start.elapsed());
