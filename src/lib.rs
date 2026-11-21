@@ -243,20 +243,15 @@ const MAX_TERMS: usize = 1 << 13;
 /// matches what this returns as it matches `q`: a host re-checking many rows calls `Query::matches`
 /// on this, which looks terms up, where on `q` it would build the patterns again for every row.
 pub fn expand<'q>(segs: &[SegView], q: &'q Query) -> io::Result<Cow<'q, Query>> {
-    /// What the query may still use: patterns, and terms they stand for.
-    struct Left {
-        patterns: usize,
-        terms: usize,
-    }
-    /// The OR of `qs`, its patterns replaced by the terms they match.
-    fn or(segs: &[SegView], qs: &[Query], left: &mut Left) -> io::Result<Query> {
+    /// The OR of `qs`, its patterns replaced by the terms they match; `left` is how many more terms
+    /// the query's patterns may stand for.
+    fn or(segs: &[SegView], qs: &[Query], left: &mut usize) -> io::Result<Query> {
         let (mut kids, mut found) = (Vec::new(), BTreeSet::new());
         for q in qs {
             let Some(mut pattern) = q.matcher()? else {
                 kids.push(walk(segs, q, left)?);
                 continue;
             };
-            left.patterns = left.patterns.checked_sub(1).ok_or_else(|| bad_input(format!("a query may hold at most {MAX_PATTERNS} patterns")))?;
             for (idx, _) in segs {
                 // the lexicon is sorted, so the terms starting with the pattern's prefix are a run of it
                 let mut terms = idx.terms_from(pattern.prefix());
@@ -266,7 +261,7 @@ pub fn expand<'q>(segs: &[SegView], q: &'q Query) -> io::Result<Cow<'q, Query>> 
                         if let Ok(term) = std::str::from_utf8(terms.term()) {
                             found.insert(term.to_string());
                         }
-                        if found.len() > left.terms {
+                        if found.len() > *left {
                             return Err(bad_input(format!("{q:?} takes the query's patterns past {MAX_TERMS} terms")));
                         }
                     } else if let Some(n) = pattern.dead() {
@@ -275,11 +270,11 @@ pub fn expand<'q>(segs: &[SegView], q: &'q Query) -> io::Result<Cow<'q, Query>> 
                 }
             }
         }
-        left.terms -= found.len();
+        *left -= found.len();
         kids.extend(found.into_iter().map(Query::Term));
         Ok(Query::Or(kids))
     }
-    fn walk(segs: &[SegView], q: &Query, left: &mut Left) -> io::Result<Query> {
+    fn walk(segs: &[SegView], q: &Query, left: &mut usize) -> io::Result<Query> {
         Ok(match q {
             Query::Term(_) | Query::Phrase(_) => q.clone(),
             Query::And(qs) => Query::And(qs.iter().map(|q| walk(segs, q, left)).collect::<io::Result<_>>()?),
@@ -288,21 +283,23 @@ pub fn expand<'q>(segs: &[SegView], q: &'q Query) -> io::Result<Cow<'q, Query>> 
             pattern => or(segs, std::slice::from_ref(pattern), left)?,
         })
     }
-    fn has_pattern(q: &Query) -> bool {
+    fn patterns(q: &Query) -> usize {
         match q {
-            Query::Term(_) | Query::Phrase(_) => false,
-            Query::And(qs) | Query::Or(qs) => qs.iter().any(has_pattern),
-            Query::Not(q) => has_pattern(q),
-            _ => true,
+            Query::Term(_) | Query::Phrase(_) => 0,
+            Query::And(qs) | Query::Or(qs) => qs.iter().map(patterns).sum(),
+            Query::Not(q) => patterns(q),
+            _ => 1,
         }
     }
     // The walks recurse, which is safe once the depth is known to be bounded; they build each
     // pattern, refusing a bad one, so it is compiled once.
     q.check_shape()?;
-    if !has_pattern(q) {
-        return Ok(Cow::Borrowed(q));
+    let mut left = MAX_TERMS;
+    match patterns(q) {
+        0 => Ok(Cow::Borrowed(q)),
+        n if n > MAX_PATTERNS => Err(bad_input(format!("a query may hold {MAX_PATTERNS} patterns, not {n}"))),
+        _ => Ok(Cow::Owned(walk(segs, q, &mut left)?)),
     }
-    Ok(Cow::Owned(walk(segs, q, &mut Left { patterns: MAX_PATTERNS, terms: MAX_TERMS })?))
 }
 
 fn search(segs: &[SegView], q: &Query, k: usize, prune: bool) -> io::Result<Vec<(u64, f32)>> {
