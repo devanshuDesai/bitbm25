@@ -759,6 +759,13 @@ impl<'a, 's> Scan<'a, 's> {
         if theta.is_some_and(|theta| need.iter().map(|&j| self.bound(j, term(j), b) as f64).sum::<f64>() * (1.0 + 1e-5) < theta as f64) {
             return;
         }
+        // Common words saturate their bounds in every block, so drop the rows whose tfs can't make
+        // up what the others leave short of the threshold before scoring any.
+        if let (Some(theta), true) = (theta, rows.count_ones() > 4) {
+            self.later.clear();
+            self.later.extend(need.iter().map(|&j| (j, 0)));
+            rows = self.enough_tf(b, rows, theta);
+        }
         if phrases.is_empty() {
             return self.push_rows(b, rows, top);
         }
