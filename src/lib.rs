@@ -28,6 +28,7 @@ use std::sync::Arc;
 mod analyzer;
 mod bits;
 mod collection;
+mod highlight;
 #[doc(hidden)]
 pub mod lab;
 mod query;
@@ -35,6 +36,7 @@ mod scan;
 mod seg;
 pub use analyzer::Analyzer;
 pub use collection::Collection;
+pub use highlight::{highlight, snippet};
 pub use query::Query;
 pub use seg::{Builder, Index, Order};
 
@@ -663,8 +665,30 @@ mod py {
         }
     }
 
+    /// The (start, end) byte offsets, in `text` as UTF-8, of the words that make it match `query`
+    /// (text in the query syntax); see `highlight`.
+    #[pyfunction]
+    #[pyo3(signature = (text, query, analyzer = "whitespace"))]
+    fn highlight(text: &str, query: &str, analyzer: &str) -> PyResult<Vec<(usize, usize)>> {
+        let analyzer = super::Analyzer::parse(analyzer)?;
+        let q = super::Query::parse(&analyzer, query)?;
+        Ok(super::highlight(&analyzer, &q, text).into_iter().map(|span| (span.start, span.end)).collect())
+    }
+
+    /// The part of `text` with the most words that make it match `query`, each between `before`
+    /// and `after`; see `snippet`.
+    #[pyfunction]
+    #[pyo3(signature = (text, query, max_bytes = 150, before = "<b>", after = "</b>", analyzer = "whitespace"))]
+    fn snippet(text: &str, query: &str, max_bytes: usize, before: &str, after: &str, analyzer: &str) -> PyResult<String> {
+        let analyzer = super::Analyzer::parse(analyzer)?;
+        let q = super::Query::parse(&analyzer, query)?;
+        Ok(super::snippet(&analyzer, &q, text, max_bytes, before, after))
+    }
+
     #[pymodule]
     fn bitbm25(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_function(wrap_pyfunction!(highlight, m)?)?;
+        m.add_function(wrap_pyfunction!(snippet, m)?)?;
         m.add_class::<PyCollection>()?;
         m.add_class::<PyIndex>()
     }
