@@ -616,6 +616,17 @@ mod tests {
     }
 
     #[test]
+    fn long_words_split_in_linear_time() {
+        // a word of 600 KB without spaces splits into 300,000 tokens at its parentheses
+        let start = std::time::Instant::now();
+        for unit in ["(", "a)"] {
+            let text = unit.repeat(300_000);
+            assert_eq!(Query::parse(&Analyzer::whitespace(), &text).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "{:?}", start.elapsed());
+    }
+
+    #[test]
     fn deep_nesting_is_refused() {
         let a = Analyzer::default();
         assert!(Query::parse(&a, &format!("{}a{}", "(".repeat(64), ")".repeat(64))).is_ok());
