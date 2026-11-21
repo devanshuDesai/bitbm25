@@ -84,12 +84,21 @@ A word can instead be a pattern, which stands for every term it matches:
   hold parentheses, but no space or double quote: write `\s` or `\x22`.
 
 A pattern is compared with whole terms, so its text is not analyzed like a word:
+- Only the ASCII `*`, `?`, `~` and `/` make one. Fullwidth `？`, `～` and `＊`, as Chinese and
+  Japanese text is typed, are punctuation, as in any other word.
 - It gets the analyzer's lowercasing and accent folding (none for `whitespace`), except for a regex's
-  escapes: `\D` stays `\D`.
+  escapes: `\D` stays `\D`. Folding adds no syntax: in `/ａ．ｂ/` the fullwidth `．` folds to a dot
+  to match, not to any character.
+- Lowercasing follows the text as typed, so a capital `Σ` that ends it or comes before a wildcard
+  becomes a final `ς`: `ΟΔΟΣ*` finds `οδος` but not `οδοσημανση`. `/οδο[σς].*/` finds both.
 - It is not split, dropped as a stopword or stemmed. With stemming on, `runn*` finds nothing if
   `running` was indexed as `run`.
-- A quoted word is never a pattern: `"what?"` is the word. Unquoted, a final `?` makes a wildcard.
-- Slashes make a regex only when they enclose the word: `/usr/bin` is a word.
+- A quoted word is never a pattern: `"what?"` is the word. Unquoted, a final `?` makes a wildcard,
+  which needs one more character: `everest?` doesn't find `everest`. Text without spaces is one word,
+  so `東京はどこ?` is one wildcard, and matches nothing: `standard` splits such text into single
+  characters.
+- Slashes make a regex only when they enclose the word: `/usr/bin` is a word. `/usr/bin/` is a regex,
+  which no term of `standard` matches, since none holds a `/`.
 
 Rules for valid queries:
 - A NOT must sit in an AND that has a positive part, because a bare negation would match every other

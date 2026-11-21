@@ -487,34 +487,67 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A word: a pattern if it is written as one, else its terms ANDed.
+    /// A word: a pattern if it is written as one, else its terms ANDed. Which pattern is read from
+    /// the word as typed; only then does its text get the analyzer's lowercasing and folding, which
+    /// must not add syntax: a fullwidth `？` (as Chinese and Japanese text is typed) folds to `?`.
     fn word(&self, w: &str) -> Option<Query> {
+        let a = self.analyzer;
         if let Some(mut regex) = w.strip_prefix('/').and_then(|w| w.strip_suffix('/')) {
-            // Normalized like the others, but for a backslash and the character after it, which are
-            // kept as typed: `\D` must not turn into `\d`.
+            // a backslash and the character after it are kept as typed: `\D` must not turn into `\d`
             let mut text = String::new();
             while let Some(at) = regex.find('\\') {
                 let end = at + 1 + regex[at + 1..].chars().next().map_or(0, char::len_utf8);
-                text += &self.analyzer.normalize(&regex[..at]);
+                text += &self.regex_text(&regex[..at]);
                 text += &regex[at..end];
                 regex = &regex[end..];
             }
-            return Some(Query::Regex(text + &self.analyzer.normalize(regex)));
+            return Some(Query::Regex(text + &self.regex_text(regex)));
         }
-        let text = self.analyzer.normalize(w);
-        if let Some(start) = text.strip_suffix('*').filter(|start| !start.contains(['*', '?'])) {
-            return Some(Query::Prefix(start.into()));
+        if let Some(start) = w.strip_suffix('*').filter(|start| !start.contains(['*', '?'])) {
+            return Some(Query::Prefix(a.normalize(start)));
         }
-        if text.contains(['*', '?']) {
-            return Some(Query::Wildcard(text));
+        if w.contains(['*', '?']) {
+            // Each run between wildcards normalized alone. One that would fold to a `*` or `?` holds a
+            // character no term has, as no term has those either: kept as typed, it still matches none.
+            let mut pattern = String::new();
+            for run in w.split_inclusive(['*', '?']) {
+                let text = run.trim_end_matches(['*', '?']);
+                let folded = a.normalize(text);
+                pattern += if folded.contains(['*', '?']) { text } else { &folded };
+                pattern += &run[text.len()..];
+            }
+            return Some(Query::Wildcard(pattern));
         }
         // "word~" and "word~2"; any other number is refused by `check`
-        let fuzzy = text.rsplit_once('~').filter(|(term, edits)| !term.is_empty() && edits.bytes().all(|b| b.is_ascii_digit()));
-        if let Some((term, edits)) = fuzzy {
+        let fuzzy = w.rsplit_once('~').filter(|(_, edits)| edits.bytes().all(|b| b.is_ascii_digit()));
+        if let Some((term, edits)) = fuzzy.map(|(term, edits)| (a.normalize(term), edits)).filter(|(term, _)| !term.is_empty()) {
             let distance = if edits.is_empty() { 1 } else { edits.parse().unwrap_or(u8::MAX) };
-            return Some(Query::Fuzzy { term: term.into(), distance, prefix: 0, transpositions: true });
+            return Some(Query::Fuzzy { term, distance, prefix: 0, transpositions: true });
         }
-        join(self.analyzer.terms(w).into_iter().map(Query::Term).collect(), Query::And)
+        join(a.terms(w).into_iter().map(Query::Term).collect(), Query::And)
+    }
+
+    /// Regex text normalized as the analyzer normalizes a term, except that what a character folds
+    /// to is escaped: in `/どこ？/` the `？` is a character to match, not the `?` it folds to.
+    fn regex_text(&self, text: &str) -> String {
+        if !self.analyzer.is_standard() {
+            return text.into();
+        }
+        let mut out = String::new();
+        // lowercased whole, as the analyzer lowercases a word: a final `Σ` becomes `ς`
+        for c in text.to_lowercase().chars() {
+            if c.is_ascii() {
+                out.push(c);
+                continue;
+            }
+            for f in self.analyzer.normalize(c.encode_utf8(&mut [0; 4])).chars() {
+                if regex_syntax::is_meta_character(f) || f == ' ' {
+                    out.push('\\'); // `\ ` is a space even where `(?x)` ignores spaces
+                }
+                out.push(f);
+            }
+        }
+        out
     }
 }
 
@@ -831,6 +864,10 @@ mod tests {
         // text is lowercased and its accents folded, as terms are; an escape in a regex is kept
         assert_eq!(p("CAFÉ* Ünïted~"), Or(vec![pre("cafe"), near("united", 1)]));
         assert_eq!(p(r"/caf[ÉE]\D+X\\D/"), re(r"caf[ee]\D+x\\d"));
+        // lowercased as typed, as the README says: a capital sigma at the end is a final one; and
+        // text without spaces ending in `?` is one wildcard
+        assert_eq!(Or(vec![p("ΟΔΟΣ*"), p("ΣΑΣ~"), p("/ΟΔΟΣ/")]), Or(vec![pre("οδος"), near("σας", 1), re("οδος")]));
+        assert_eq!(p("東京はどこ?"), wild("東京はとこ?"));
         // ...but not for the whitespace analyzer, whose terms are as typed
         let ws = |s: &str| Query::parse(&Analyzer::whitespace(), s).unwrap();
         assert_eq!(ws(r"CAFÉ* /[A-Z]\d/"), Or(vec![pre("CAFÉ"), re(r"[A-Z]\d")]));
@@ -862,6 +899,23 @@ mod tests {
             let terms: Vec<Query> = Analyzer::default().terms(text).into_iter().map(Term).collect();
             let want = if terms.len() == 1 { terms[0].clone() } else { And(terms) };
             assert_eq!(Query::parse(&Analyzer::default(), text).ok(), Some(want), "{text}");
+        }
+        // Inside a pattern they are characters to match, which no term holds: kept as typed in a
+        // wildcard, escaped in a regex once folded. A fullwidth `．` folds to a `.` that terms do hold.
+        let (row, re) = (Analyzer::default().terms("ａ．ｂ どこ ＡＢ"), |s: &str| Regex(s.into()));
+        assert_eq!(row, ["a.b", "と", "こ", "ab"]);
+        for (text, want, hit) in [
+            ("どこ？*", Prefix("とこ?".into()), false),
+            ("Ｄ*？", Wildcard("d*？".into()), false),
+            ("/どこ？/", re(r"とこ\?"), false),
+            ("/ａ．ｂ/", re(r"a\.b"), true),
+            ("/ａ．/", re(r"a\."), false),
+            ("/[Ａ－Ｃ]ｂ/", re(r"[a\-c]b"), true),
+            ("/(?x)a¨b/", re(r"(?x)a\ b"), false),
+            ("どこ？~", fuzzy("とこ?", 1, 0, true), false),
+        ] {
+            let q = Query::parse(&Analyzer::default(), text).unwrap();
+            assert_eq!((&q, q.matches(&row)), (&want, hit), "{text}");
         }
     }
 
