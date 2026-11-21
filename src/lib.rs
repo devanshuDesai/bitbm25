@@ -666,23 +666,32 @@ mod py {
     }
 
     /// The (start, end) byte offsets, in `text` as UTF-8, of the words that make it match `query`
-    /// (text in the query syntax); see `highlight`.
+    /// (text in the query syntax); see `highlight`. Like a search, it releases the GIL.
     #[pyfunction]
     #[pyo3(signature = (text, query, analyzer = "whitespace"))]
-    fn highlight(text: &str, query: &str, analyzer: &str) -> PyResult<Vec<(usize, usize)>> {
+    fn highlight(py: Python<'_>, text: &str, query: &str, analyzer: &str) -> PyResult<Vec<(usize, usize)>> {
         let analyzer = super::Analyzer::parse(analyzer)?;
         let q = super::Query::parse(&analyzer, query)?;
-        Ok(super::highlight(&analyzer, &q, text).into_iter().map(|span| (span.start, span.end)).collect())
+        let spans = py.detach(|| super::highlight(&analyzer, &q, text));
+        Ok(spans.into_iter().map(|span| (span.start, span.end)).collect())
     }
 
     /// The part of `text` with the most words that make it match `query`, each between `before`
-    /// and `after`; see `snippet`.
+    /// and `after`; see `snippet`. Like a search, it releases the GIL.
     #[pyfunction]
     #[pyo3(signature = (text, query, max_bytes = 150, before = "<b>", after = "</b>", analyzer = "whitespace"))]
-    fn snippet(text: &str, query: &str, max_bytes: usize, before: &str, after: &str, analyzer: &str) -> PyResult<String> {
+    fn snippet(
+        py: Python<'_>,
+        text: &str,
+        query: &str,
+        max_bytes: usize,
+        before: &str,
+        after: &str,
+        analyzer: &str,
+    ) -> PyResult<String> {
         let analyzer = super::Analyzer::parse(analyzer)?;
         let q = super::Query::parse(&analyzer, query)?;
-        Ok(super::snippet(&analyzer, &q, text, max_bytes, before, after))
+        Ok(py.detach(|| super::snippet(&analyzer, &q, text, max_bytes, before, after)))
     }
 
     #[pymodule]
