@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use crate::Index;
+use crate::{Index, Query};
 
 /// What the index is made of: sections, and postings by how they are stored.
 pub fn composition(idx: &Index) -> String {
@@ -42,6 +42,14 @@ pub fn composition(idx: &Index) -> String {
     by_tfs.iter().for_each(|(name, e)| line(&mut o, "tf", name, e));
     line(&mut o, "", "bounds", &summary);
     o
+}
+
+/// Replaces `q`'s patterns by the terms of `idx` they match, the first thing a search does: the
+/// milliseconds that took, and how many terms the query has then.
+pub fn expand(idx: &Index, q: &Query) -> std::io::Result<(f64, usize)> {
+    let t0 = std::time::Instant::now();
+    let expanded = crate::expand(&[(idx, &[])], q)?;
+    Ok((t0.elapsed().as_secs_f64() * 1e3, expanded.positive_terms().len()))
 }
 
 /// Ranked-scan phase timers and counters since the last call (zeros without the `prof` feature):
