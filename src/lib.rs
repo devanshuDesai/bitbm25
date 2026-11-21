@@ -1015,6 +1015,14 @@ mod tests {
         let hits = top_k(&[(&idx, &[])], &Query::words(&["cafe"], false), 10).unwrap();
         assert_eq!(hits.iter().map(|h| h.0).collect::<Vec<_>>(), [1, 2]);
         assert!(hits.iter().all(|h| h.1.is_finite() && h.1 > 0.0));
+        // patterns typed with capitals and accents find the terms, which have neither
+        for text in ["CAF*", "Café*", "c?fé", "CAFÉS~", "/Caf[ÉE]/", "ét* -🚀*"] {
+            let q = Query::parse(&Analyzer::default(), text).unwrap();
+            let mut ids = Vec::new();
+            for_each_match(&[(&idx, &[])], &q, |id| ids.push(id)).unwrap();
+            ids.sort_unstable();
+            assert_eq!(ids, if text.starts_with('é') { vec![2] } else { vec![1, 2] }, "{text}");
+        }
     }
 
     /// A random query over t0..t300 (skewed toward common terms, like `corpus`) that passes

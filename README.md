@@ -74,15 +74,42 @@ space for `standard`. Each word then goes through the analyzer:
 - A word that yields several (`wi-fi`) becomes their AND.
 - Text with nothing left matches nothing.
 
+A word can instead be a pattern, which stands for every term it matches:
+- **Prefix,** `inter*`: terms that start with `inter`.
+- **Wildcard,** `c?l*r`: `?` is any one character and `*` any run of them, or none.
+- **Fuzzy,** `colour~` and `colour~2`: terms within one or two edits of `colour`. An edit inserts,
+  removes or replaces a character, or swaps two neighbours (`form`, `from`). Characters are counted,
+  not bytes. In code, `Query::Fuzzy` can also fix the first characters and count a swap as two edits.
+- **Regex,** `/colou?r/`: terms the expression matches whole, in the `regex` crate's syntax. It may
+  hold parentheses, but no space or double quote: write `\s` or `\x22`.
+
+A pattern is compared with whole terms, so its text is not analyzed like a word:
+- It gets the analyzer's lowercasing and accent folding (none for `whitespace`), except for a regex's
+  escapes: `\D` stays `\D`.
+- It is not split, dropped as a stopword or stemmed. With stemming on, `runn*` finds nothing if
+  `running` was indexed as `run`.
+- A quoted word is never a pattern: `"what?"` is the word. Unquoted, a final `?` makes a wildcard.
+- Slashes make a regex only when they enclose the word: `/usr/bin` is a word.
+
 Rules for valid queries:
 - A NOT must sit in an AND that has a positive part, because a bare negation would match every other
   row. In text, `-a -b` is refused. In `Query` values built in code, so is an `Or` holding a `Not`:
   only the text syntax rewrites it. `Query::check` tests a value up front.
 - Nesting deeper than 64 is refused.
+- So are a fuzzy distance other than 1 or 2 and a regex that doesn't compile.
 
 A row matches by ordinary boolean logic. It scores the sum of the BM25 scores of the query's
 positive terms (those not under a NOT) that it contains. `Query::matches(&terms)` checks one row's
 terms without an index, for hosts that re-check rows.
+
+A row matches a pattern if it holds any term the pattern matches, and scores as the OR of those
+terms: each one it holds adds its own BM25 score, with its own idf. Every matching term of the
+segments searched takes part, however many there are, so matches and counts are exact.
+- **Cost:** terms are sorted, so a pattern that fixes how a term starts (`inter*`, `inter*al`,
+  `/colou?r.*/`) reads only the terms that start that way, and a fuzzy term skips those that start
+  too differently. A pattern that fixes no start (`*ation`) reads every term.
+- **Wide patterns:** a pattern that matches thousands of terms makes a query of thousands of terms.
+  Counting its rows stays quick, but ranking them costs what ranking a query of that many terms does.
 
 k1 (0 to 1000) and b (0 to 1) are chosen per index at build time. They are written in each segment and baked into its
 bounds, so segments with different values can't be searched or merged together.

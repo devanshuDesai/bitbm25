@@ -61,6 +61,12 @@ impl Query {
     /// from all of them: `a b -c` is `(a OR b) AND NOT c`. Each word goes through `analyzer`: one
     /// that yields no terms (a stopword, punctuation) is dropped, and one that yields several (`wi-fi`)
     /// becomes their AND. Text with no terms left matches nothing.
+    ///
+    /// A word may be a pattern instead: `inter*` (a prefix), `c?l*r` (a wildcard), `colour~` or
+    /// `colour~2` (fuzzy: within one or two edits, a swap of neighbours counting as one) and
+    /// `/colou?r/` (a regex; it may hold parentheses, but no space or double quote). A pattern is
+    /// matched against whole terms: its text gets the analyzer's lowercasing and accent folding but
+    /// is not split, stopped or stemmed. A quoted word is never a pattern.
     pub fn parse(analyzer: &Analyzer, text: &str) -> io::Result<Query> {
         let mut toks = Vec::new();
         // split words where the analyzer would, so a term the index holds can be typed back in
@@ -75,7 +81,8 @@ impl Query {
             for chunk in part.split(space).filter(|c| !c.is_empty()) {
                 let mut rest = chunk;
                 while !rest.is_empty() {
-                    let end = rest.find(['(', ')']).unwrap_or(rest.len());
+                    // a regex keeps its parentheses; other words end at one
+                    let end = regex_len(rest).unwrap_or_else(|| rest.find(['(', ')']).unwrap_or(rest.len()));
                     let (word, after) = if end == 0 { rest.split_at(1) } else { rest.split_at(end) };
                     toks.push(match word {
                         "(" => Tok::Open,
@@ -472,9 +479,42 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A word: a pattern if it is written as one, else its terms ANDed.
     fn word(&self, w: &str) -> Option<Query> {
+        if let Some(mut regex) = w.strip_prefix('/').and_then(|w| w.strip_suffix('/')) {
+            // Normalized like the others, but for a backslash and the character after it, which are
+            // kept as typed: `\D` must not turn into `\d`.
+            let mut text = String::new();
+            while let Some(at) = regex.find('\\') {
+                let end = at + 1 + regex[at + 1..].chars().next().map_or(0, char::len_utf8);
+                text += &self.analyzer.normalize(&regex[..at]);
+                text += &regex[at..end];
+                regex = &regex[end..];
+            }
+            return Some(Query::Regex(text + &self.analyzer.normalize(regex)));
+        }
+        let text = self.analyzer.normalize(w);
+        if let Some(start) = text.strip_suffix('*').filter(|start| !start.contains(['*', '?'])) {
+            return Some(Query::Prefix(start.into()));
+        }
+        if text.contains(['*', '?']) {
+            return Some(Query::Wildcard(text));
+        }
+        // "word~" and "word~2"; any other number is refused by `check`
+        let fuzzy = text.rsplit_once('~').filter(|(term, edits)| !term.is_empty() && edits.bytes().all(|b| b.is_ascii_digit()));
+        if let Some((term, edits)) = fuzzy {
+            let distance = if edits.is_empty() { 1 } else { edits.parse().unwrap_or(u8::MAX) };
+            return Some(Query::Fuzzy { term: term.into(), distance, prefix: 0, transpositions: true });
+        }
         join(self.analyzer.terms(w).into_iter().map(Query::Term).collect(), Query::And)
     }
+}
+
+/// If `word` starts with a regex, `/.../` or `-/.../`, with nothing but `)` after it: its length.
+fn regex_len(word: &str) -> Option<usize> {
+    let regex = word.strip_prefix('-').unwrap_or(word);
+    let close = regex.rfind('/').filter(|&at| at > 0 && regex.starts_with('/'))?;
+    regex[close + 1..].bytes().all(|b| b == b')').then_some(word.len() - regex.len() + close + 1)
 }
 
 /// None for no parts, the part itself for one, `kind` of them for more.
@@ -759,6 +799,44 @@ mod tests {
         assert_eq!((prefix("colou?r.*"), prefix("abc|abd")), (b"colo".to_vec(), b"ab".to_vec()));
         for none in ["ab.*|cd.*", "a?bc", ".*abc", "(?i)abc", "[a-c]x", ""] {
             assert_eq!(prefix(none), b"", "{none}");
+        }
+    }
+
+    #[test]
+    fn parses_patterns() {
+        let near = |term: &str, distance| fuzzy(term, distance, 0, true);
+        let (pre, wild, re) = (|s: &str| Prefix(s.into()), |s: &str| Wildcard(s.into()), |s: &str| Regex(s.into()));
+        assert_eq!(p("Inter*"), pre("inter"));
+        assert_eq!(p("*"), pre(""));
+        assert_eq!(p("c?l*r"), wild("c?l*r"));
+        assert_eq!(p("*ation"), wild("*ation"));
+        assert_eq!(p("in*al*"), wild("in*al*"));
+        assert_eq!(p("cat?"), wild("cat?"));
+        assert_eq!(p("Colour~"), near("colour", 1));
+        assert_eq!(p("colour~1 colour~2"), Or(vec![near("colour", 1), near("colour", 2)]));
+        assert_eq!(p("a~b~2"), near("a~b", 2));
+        assert_eq!(p("/Colou?r(s|ed)?/"), re("colou?r(s|ed)?"));
+        // text is lowercased and its accents folded, as terms are; an escape in a regex is kept
+        assert_eq!(p("CAFÉ* Ünïted~"), Or(vec![pre("cafe"), near("united", 1)]));
+        assert_eq!(p(r"/caf[ÉE]\D+X\\D/"), re(r"caf[ee]\D+x\\d"));
+        // ...but not for the whitespace analyzer, whose terms are as typed
+        let ws = |s: &str| Query::parse(&Analyzer::whitespace(), s).unwrap();
+        assert_eq!(ws(r"CAFÉ* /[A-Z]\d/"), Or(vec![pre("CAFÉ"), re(r"[A-Z]\d")]));
+        // a pattern is neither stemmed nor dropped as a stopword
+        let en = Analyzer::parse("standard stem=english stop=english").unwrap();
+        assert_eq!(Query::parse(&en, "running* the~ the").unwrap(), Or(vec![pre("running"), near("the", 1)]));
+        // patterns take part in the grammar like words
+        let not = |q| Not(Box::new(q));
+        assert_eq!(p("cat -do*"), And(vec![t("cat"), not(pre("do"))]));
+        assert_eq!(p("cat AND -/d(o|i)g/"), And(vec![t("cat"), not(re("d(o|i)g"))]));
+        assert_eq!(p("(/a(b|c)/ OR x~) AND y?"), And(vec![Or(vec![re("a(b|c)"), near("x", 1)]), wild("y?")]));
+        assert_eq!(p("(/ab/) // /a/b/"), Or(vec![re("ab"), re(""), re("a/b")]));
+        // a quoted word is taken as typed, and slashes that don't enclose a word make no regex
+        assert_eq!(p("\"inter*\" \"colour~\""), Or(vec![t("inter"), t("colour")]));
+        let plain = ["what?", "/usr/bin", "a/b/", "/", "~", "~2", "x~y"];
+        assert_eq!(ws("\"what?\" /usr/bin a/b/ / ~ ~2 x~y"), Query::words(&plain, false));
+        for bad in ["/(/", "/a)|(b/", "/a)/", "colour~0", "colour~3", "colour~300", "-inter*", "cat AND -/x/ AND"] {
+            assert_eq!(Query::parse(&Analyzer::default(), bad).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{bad}");
         }
     }
 

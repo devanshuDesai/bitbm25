@@ -93,6 +93,16 @@ impl Analyzer {
         self.standard
     }
 
+    /// `text` with its characters as terms have them: lowercased and accents folded for `standard`,
+    /// as they are for `whitespace`. Nothing is split, dropped or stemmed, so this suits a query
+    /// pattern, which names part of a term.
+    pub(crate) fn normalize(&self, text: &str) -> String {
+        match self.standard {
+            true => fold(&text.to_lowercase()).collect(),
+            false => text.to_string(),
+        }
+    }
+
     pub(crate) fn for_each_term(&self, text: &str, mut f: impl FnMut(&str)) {
         if !self.standard {
             return text.split_ascii_whitespace().for_each(f);
@@ -109,12 +119,17 @@ impl Analyzer {
                 None => lower.as_str().into(),
             };
             folded.clear();
-            folded.extend(stemmed.nfkd().filter(|c| !is_combining_mark(*c)));
+            folded.extend(fold(&stemmed));
             if !folded.is_empty() {
                 f(&folded);
             }
         }
     }
+}
+
+/// `text` without its accents: decomposed (NFKD), combining marks dropped.
+fn fold(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.nfkd().filter(|c| !is_combining_mark(*c))
 }
 
 impl Default for Analyzer {
