@@ -35,12 +35,16 @@ enum Tok<'a> {
 
 impl Query {
     /// Reads query text: words, `AND`, `OR`, `NOT` (or `-word`) and parentheses. Adjacent words are
-    /// ORed; NOT binds tighter than AND, AND tighter than OR. Each word goes through `analyzer`: one
+    /// ORed; NOT binds tighter than AND, AND tighter than OR. A negation among ORed parts excludes
+    /// from all of them: `a b -c` is `(a OR b) AND NOT c`. Each word goes through `analyzer`: one
     /// that yields no terms (a stopword, punctuation) is dropped, and one that yields several (`wi-fi`)
     /// becomes their AND. Text with no terms left matches nothing.
     pub fn parse(analyzer: &Analyzer, text: &str) -> io::Result<Query> {
         let mut toks = Vec::new();
-        for chunk in text.split_whitespace() {
+        // split words where the analyzer would, so a term the index holds can be typed back in
+        let std = analyzer.is_standard();
+        let space = |c: char| if std { c.is_whitespace() } else { c.is_ascii_whitespace() };
+        for chunk in text.split(space).filter(|c| !c.is_empty()) {
             let mut rest = chunk;
             while !rest.is_empty() {
                 let end = rest.find(['(', ')']).unwrap_or(rest.len());
@@ -89,8 +93,8 @@ impl Query {
     }
 
     /// Refuses nesting deeper than `MAX_DEPTH` and a NOT anywhere but under an AND with a positive
-    /// child.
-    pub(crate) fn check(&self) -> io::Result<()> {
+    /// child. The search functions call it too; hosts that build queries in code can call it first.
+    pub fn check(&self) -> io::Result<()> {
         self.check_at(1, false)
     }
 
@@ -112,15 +116,15 @@ impl Query {
 
     /// The distinct terms not under a NOT, in order of first appearance: the terms that score.
     pub(crate) fn positive_terms(&self) -> Vec<&str> {
-        fn walk<'a>(q: &'a Query, out: &mut Vec<&'a str>) {
+        fn walk<'a>(q: &'a Query, out: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
             match q {
-                Query::Term(t) if !out.contains(&t.as_str()) => out.push(t),
+                Query::Term(t) if seen.insert(t) => out.push(t),
                 Query::Term(_) | Query::Not(_) => {}
-                Query::And(qs) | Query::Or(qs) => qs.iter().for_each(|q| walk(q, out)),
+                Query::And(qs) | Query::Or(qs) => qs.iter().for_each(|q| walk(q, out, seen)),
             }
         }
         let mut out = Vec::new();
-        walk(self, &mut out);
+        walk(self, &mut out, &mut HashSet::new());
         out
     }
 }
@@ -158,7 +162,12 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(join(kids, Query::Or))
+        // "a b -c": a negation among ORed parts excludes from all of them (Lucene, websearch_to_tsquery)
+        let (nots, pos): (Vec<_>, Vec<_>) = kids.into_iter().partition(|q| matches!(q, Query::Not(_)));
+        if nots.is_empty() || pos.is_empty() {
+            return Ok(join(pos.into_iter().chain(nots).collect(), Query::Or));
+        }
+        Ok(join(join(pos, Query::Or).into_iter().chain(nots).collect(), Query::And))
     }
 
     /// and := unary ("AND" unary)*
@@ -251,8 +260,19 @@ mod tests {
         assert_eq!(p("a AND b c"), Or(vec![And(vec![t("a"), t("b")]), t("c")]));
         assert_eq!(p("a AND (b OR c) AND NOT d"), And(vec![t("a"), Or(vec![t("b"), t("c")]), Not(Box::new(t("d")))]));
         assert_eq!(p("a AND -b"), And(vec![t("a"), Not(Box::new(t("b")))]));
-        // "a -b" is an Or holding a Not: refused, since a bare negation would match every row
-        assert_eq!(Query::parse(&Analyzer::default(), "a -b").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        // negations among ORed parts exclude from all of them, as in Lucene and websearch_to_tsquery
+        let not = |s| Not(Box::new(t(s)));
+        assert_eq!(p("a -b"), And(vec![t("a"), not("b")]));
+        assert_eq!(p("-b a"), And(vec![t("a"), not("b")]));
+        assert_eq!(p("a b -c"), And(vec![Or(vec![t("a"), t("b")]), not("c")]));
+        assert_eq!(p("a OR NOT b"), And(vec![t("a"), not("b")]));
+        assert_eq!(p("x AND (a -b)"), And(vec![t("x"), And(vec![t("a"), not("b")])]));
+        assert_eq!(p("a AND b -c"), And(vec![And(vec![t("a"), t("b")]), not("c")]));
+        for bad in ["-a -b", "(-a) OR (-b)"] {
+            assert_eq!(Query::parse(&Analyzer::default(), bad).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{bad}");
+        }
+        // built in code, an Or holding a Not is still refused: only the text syntax rewrites it
+        assert!(Or(vec![t("a"), not("b")]).check().is_err());
         assert_eq!(p("Wi-Fi"), And(vec![t("wi"), t("fi")]));
         let excl = |kid| And(vec![t("cat"), Not(Box::new(kid))]);
         assert_eq!(p("cat AND -(dog OR fish)"), excl(Or(vec![t("dog"), t("fish")])));
@@ -274,6 +294,25 @@ mod tests {
         for bad in ["(a", "a)", "a AND", "OR a", "NOT cat", "-cat", "cat OR"] {
             assert_eq!(Query::parse(&en, bad).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{bad}");
         }
+    }
+
+    #[test]
+    fn query_words_split_like_the_analyzer() {
+        // the whitespace analyzer keeps a no-break space inside a term, so query text must too
+        let ws = Analyzer::whitespace();
+        assert_eq!(Query::parse(&ws, "foo\u{a0}bar baz").unwrap(), Or(vec![t("foo\u{a0}bar"), t("baz")]));
+        assert!(Query::parse(&ws, "foo\u{a0}bar").unwrap().matches(&ws.terms("foo\u{a0}bar")));
+        // the standard analyzer splits on any Unicode space, so query words do too (ideographic space)
+        assert_eq!(p("Tokyo\u{3000}Osaka"), Or(vec![t("tokyo"), t("osaka")]));
+    }
+
+    #[test]
+    fn huge_queries_take_linear_time() {
+        let words: Vec<String> = (0..100_000).map(|i| format!("w{i}")).collect();
+        let q = Or(words.iter().map(|w| t(w)).chain([And(vec![t("w1"), Not(Box::new(t("x")))])]).collect());
+        let start = std::time::Instant::now();
+        assert_eq!(q.positive_terms().len(), 100_000);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
     }
 
     #[test]

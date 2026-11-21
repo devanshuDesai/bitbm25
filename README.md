@@ -64,16 +64,20 @@ not stored in segments.
 `Query::parse` reads:
 - words, `AND`, `OR`, `NOT` (or `-word`, `-(...)`) and parentheses;
 - adjacent words are ORed;
-- NOT binds tighter than AND, and AND tighter than OR.
+- NOT binds tighter than AND, and AND tighter than OR;
+- a negation among ORed parts excludes from all of them: `a b -c` means `(a OR b) AND NOT c`, as in
+  Lucene and Postgres's `websearch_to_tsquery`.
 
-Each word goes through the analyzer:
+Words are split where the analyzer splits text: on ASCII whitespace for `whitespace`, on any Unicode
+space for `standard`. Each word then goes through the analyzer:
 - A word that yields no terms (a stopword, punctuation) is dropped.
 - A word that yields several (`wi-fi`) becomes their AND.
 - Text with nothing left matches nothing.
 
 Rules for valid queries:
-- A NOT must sit in an AND that has a positive part. `a -b` is refused, `a AND -b` is fine, because a
-  bare negation would match every other row.
+- A NOT must sit in an AND that has a positive part, because a bare negation would match every other
+  row. In text, `-a -b` is refused. In `Query` values built in code, so is an `Or` holding a `Not`:
+  only the text syntax rewrites it. `Query::check` tests a value up front.
 - Nesting deeper than 64 is refused.
 
 A row matches by ordinary boolean logic. It scores the sum of the BM25 scores of the query's

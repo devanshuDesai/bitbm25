@@ -88,6 +88,11 @@ impl Analyzer {
         out
     }
 
+    /// Whether this splits on Unicode words (`standard`) rather than ASCII whitespace.
+    pub(crate) fn is_standard(&self) -> bool {
+        self.standard
+    }
+
     pub(crate) fn for_each_term(&self, text: &str, mut f: impl FnMut(&str)) {
         if !self.standard {
             return text.split_ascii_whitespace().for_each(f);

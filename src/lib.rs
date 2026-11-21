@@ -828,15 +828,16 @@ enum Node {
 }
 
 impl Node {
-    fn new<'q>(q: &'q Query, terms: &mut Vec<&'q str>) -> Node {
+    /// `slot` maps each term already in `terms` to its index there.
+    fn new<'q>(q: &'q Query, terms: &mut Vec<&'q str>, slot: &mut HashMap<&'q str, usize>) -> Node {
         match q {
-            Query::Term(t) => Node::Term(terms.iter().position(|x| x == t).unwrap_or_else(|| {
+            Query::Term(t) => Node::Term(*slot.entry(t).or_insert_with(|| {
                 terms.push(t);
                 terms.len() - 1
             })),
-            Query::And(qs) => Node::And(qs.iter().map(|q| Node::new(q, terms)).collect()),
-            Query::Or(qs) => Node::Or(qs.iter().map(|q| Node::new(q, terms)).collect()),
-            Query::Not(q) => Node::Not(Box::new(Node::new(q, terms))),
+            Query::And(qs) => Node::And(qs.iter().map(|q| Node::new(q, terms, slot)).collect()),
+            Query::Or(qs) => Node::Or(qs.iter().map(|q| Node::new(q, terms, slot)).collect()),
+            Query::Not(q) => Node::Not(Box::new(Node::new(q, terms, slot))),
         }
     }
 
@@ -864,7 +865,10 @@ impl<'q> Plan<'q> {
             Query::Term(_) => Shape::Any,
             Query::Or(qs) if flat(qs) => Shape::Any,
             Query::And(qs) if flat(qs) => Shape::All,
-            q => Shape::Tree(Node::new(q, &mut terms)),
+            q => {
+                let mut slot = terms.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+                Shape::Tree(Node::new(q, &mut terms, &mut slot))
+            }
         };
         Plan { terms, n_pos, shape }
     }
@@ -1237,7 +1241,8 @@ mod py {
         match (terms, text) {
             (Some(t), None) => Ok(super::Query::words(&t.iter().map(String::as_str).collect::<Vec<_>>(), and)),
             (None, Some(text)) => Ok(super::Query::parse(analyzer, text)?),
-            _ => Err(pyo3::exceptions::PyValueError::new_err("pass either terms or query, not both")),
+            (None, None) => Err(pyo3::exceptions::PyValueError::new_err("pass terms or query")),
+            (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err("pass terms or query, not both")),
         }
     }
 
@@ -1736,6 +1741,17 @@ mod tests {
         assert!(top_k(&[(&a, &[])], &q, 0).unwrap().is_empty());
         let n = count(&[(&a, &[])], &q).unwrap() as usize;
         assert_eq!(top_k(&[(&a, &[])], &q, n + 100).unwrap().len(), n);
+    }
+
+    #[test]
+    fn huge_tree_queries_plan_in_linear_time() {
+        let a = Index::build(&corpus(500, 2, 20));
+        let mut kids: Vec<Query> = (0..100_000).map(|i| Query::Term(format!("w{i}"))).collect();
+        kids.push(Query::And(vec![Query::Term("w1".into()), Query::Not(Box::new(Query::Term("x".into())))]));
+        let q = Query::Or(kids);
+        let start = std::time::Instant::now();
+        count(&[(&a, &[])], &q).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
     }
 
     #[test]
