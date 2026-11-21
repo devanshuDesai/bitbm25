@@ -93,7 +93,8 @@ bounds, so segments with different values can't be searched or merged together.
 ## Highlights and snippets
 
 Both are worked out from a row's text alone, with the analyzer its index was built with. No index
-is read, so a host can call them on whatever rows it ends up showing.
+is read, so a host can call them on whatever rows it ends up showing. Each call goes through the
+whole text, holding about 100 bytes of memory per word while it runs.
 
 `highlight(&analyzer, &q, text)` returns the byte ranges of the words that make the text match, in
 order, one per word. It returns nothing if the text doesn't match. In a text that does:
