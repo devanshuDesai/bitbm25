@@ -1,7 +1,8 @@
 //! Lab tool for experiments on real corpora (see open-search-bench/lab/export.py for the inputs).
 //!
-//!   lab build <corpus.txt> <docs> <out.idx> [added]   index the first <docs> lines (whitespace analyzer);
-//!                                                     `added` keeps rows in the order added
+//!   lab build <corpus.txt> <docs> <out.idx> [added] [nopos]   index the first <docs> lines (whitespace
+//!                                                     analyzer); `added` keeps rows in the order added,
+//!                                                     `nopos` stores no positions
 //!   lab stats <index>                                 what the index is made of
 //!   lab bench <index> <queries.tsv> [reps]            time top-10 and count per query kind, check exactness
 //!   lab hot <index> <queries.tsv> <kind> <top10|count> <seconds>   one workload in a loop, to profile
@@ -18,8 +19,9 @@ fn main() -> std::io::Result<()> {
     match args.get(1).map(String::as_str) {
         Some("build") => {
             let (limit, t0) = (args[3].parse::<usize>().unwrap(), Instant::now());
-            let order = if args.get(5).map(String::as_str) == Some("added") { Order::Added } else { Order::Length };
-            let mut b = Builder::new(Params::default(), Analyzer::whitespace())?.order(order);
+            let opt = |o: &str| args[5..].iter().any(|a| a == o);
+            let order = if opt("added") { Order::Added } else { Order::Length };
+            let mut b = Builder::new(Params::default(), Analyzer::whitespace())?.order(order).positions(!opt("nopos"));
             let mut n = 0u64;
             for line in BufReader::with_capacity(1 << 20, std::fs::File::open(&args[2])?).lines().take(limit) {
                 b.add(n, &line?)?;
@@ -96,18 +98,22 @@ fn load(queries: &str) -> std::io::Result<Vec<(String, Vec<Query>)>> {
     for line in std::fs::read_to_string(queries)?.lines() {
         let (kind, terms) = line.split_once('\t').unwrap();
         let words: Vec<&str> = terms.split(' ').collect();
-        // Spans (consecutive words of a document) run as OR and as AND; phrases need positions.
-        let kinds: &[(&str, bool)] = match kind {
-            "or" => &[("or", false)],
-            "and" => &[("and", true)],
-            "span" => &[("span-or", false), ("span-and", true)],
+        // Spans (consecutive words of a document) run as OR, as AND and as a phrase.
+        let kinds: &[(&str, u8)] = match kind {
+            "or" => &[("or", 0)],
+            "and" => &[("and", 1)],
+            "phrase" => &[("phrase", 2)],
+            "span" => &[("span-or", 0), ("span-and", 1), ("span-phr", 2)],
             _ => &[],
         };
-        for &(name, and) in kinds {
+        for &(name, how) in kinds {
             let mut uniq = words.clone();
             uniq.sort_unstable();
             uniq.dedup();
-            let q = Query::words(&uniq, and);
+            let q = match how {
+                2 => Query::Phrase(words.iter().map(|w| w.to_string()).collect()),
+                how => Query::words(&uniq, how == 1),
+            };
             match sets.iter_mut().find(|(n, _)| n == name) {
                 Some((_, qs)) => qs.push(q),
                 None => sets.push((name.to_string(), vec![q])),

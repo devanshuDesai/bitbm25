@@ -1,7 +1,8 @@
-//! Queries: terms combined with AND, OR and NOT, nested, and a small text syntax for them.
+//! Queries: terms and phrases combined with AND, OR and NOT, nested, and a small text syntax for them.
 //!
 //! A row matches by ordinary boolean logic. Its score is the sum of the BM25 scores of the query's
-//! positive terms (those not under a NOT) that it contains, wherever they sit in the query.
+//! positive terms (those not under a NOT, a phrase's words included) that it contains, wherever
+//! they sit in the query. A phrase narrows which rows match; it does not change how they score.
 
 use std::collections::HashSet;
 use std::io;
@@ -14,6 +15,9 @@ const MAX_DEPTH: usize = 64;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Query {
     Term(String),
+    /// These terms one after another, with nothing between. Needs an index that stores positions.
+    /// A phrase of one term is that term; of none, it matches nothing.
+    Phrase(Vec<String>),
     /// Every child matches. `And([])` matches nothing.
     And(Vec<Query>),
     /// Any child matches. `Or([])` matches nothing.
@@ -31,11 +35,12 @@ enum Tok<'a> {
     Or,
     Not,
     Word(&'a str),
+    Phrase(&'a str), // the text between two double quotes
 }
 
 impl Query {
-    /// Reads query text: words, `AND`, `OR`, `NOT` (or `-word`) and parentheses. Adjacent words are
-    /// ORed; NOT binds tighter than AND, AND tighter than OR. A negation among ORed parts excludes
+    /// Reads query text: words, `"quoted phrases"`, `AND`, `OR`, `NOT` (or `-word`) and parentheses.
+    /// Adjacent words are ORed; NOT binds tighter than AND, AND tighter than OR. A negation among ORed parts excludes
     /// from all of them: `a b -c` is `(a OR b) AND NOT c`. Each word goes through `analyzer`: one
     /// that yields no terms (a stopword, punctuation) is dropped, and one that yields several (`wi-fi`)
     /// becomes their AND. Text with no terms left matches nothing.
@@ -44,20 +49,27 @@ impl Query {
         // split words where the analyzer would, so a term the index holds can be typed back in
         let std = analyzer.is_standard();
         let space = |c: char| if std { c.is_whitespace() } else { c.is_ascii_whitespace() };
-        for chunk in text.split(space).filter(|c| !c.is_empty()) {
-            let mut rest = chunk;
-            while !rest.is_empty() {
-                let end = rest.find(['(', ')']).unwrap_or(rest.len());
-                let (word, after) = if end == 0 { rest.split_at(1) } else { rest.split_at(end) };
-                toks.push(match word {
-                    "(" => Tok::Open,
-                    ")" => Tok::Close,
-                    "AND" => Tok::And,
-                    "OR" => Tok::Or,
-                    "NOT" => Tok::Not,
-                    w => Tok::Word(w),
-                });
-                rest = after;
+        // Odd parts of a split on double quotes are inside them; a quote left open runs to the end.
+        for (i, part) in text.split('"').enumerate() {
+            if i % 2 == 1 {
+                toks.push(Tok::Phrase(part));
+                continue;
+            }
+            for chunk in part.split(space).filter(|c| !c.is_empty()) {
+                let mut rest = chunk;
+                while !rest.is_empty() {
+                    let end = rest.find(['(', ')']).unwrap_or(rest.len());
+                    let (word, after) = if end == 0 { rest.split_at(1) } else { rest.split_at(end) };
+                    toks.push(match word {
+                        "(" => Tok::Open,
+                        ")" => Tok::Close,
+                        "AND" => Tok::And,
+                        "OR" => Tok::Or,
+                        "NOT" => Tok::Not,
+                        w => Tok::Word(w),
+                    });
+                    rest = after;
+                }
             }
         }
         let mut p = Parser { toks, pos: 0, analyzer, depth: 0 };
@@ -79,16 +91,18 @@ impl Query {
     /// Whether a row with these terms (from the same analyzer as the index) matches. A query that
     /// fails `check` matches nothing.
     pub fn matches(&self, terms: &[String]) -> bool {
-        let terms: HashSet<&str> = terms.iter().map(String::as_str).collect();
-        self.check().is_ok() && self.eval(&terms)
+        let set: HashSet<&str> = terms.iter().map(String::as_str).collect();
+        self.check().is_ok() && self.eval(&set, terms)
     }
 
-    fn eval(&self, terms: &HashSet<&str>) -> bool {
+    /// `row` is the row's terms in order, `set` the same as a set.
+    fn eval(&self, set: &HashSet<&str>, row: &[String]) -> bool {
         match self {
-            Query::Term(t) => terms.contains(t.as_str()),
-            Query::And(qs) => !qs.is_empty() && qs.iter().all(|q| q.eval(terms)),
-            Query::Or(qs) => qs.iter().any(|q| q.eval(terms)),
-            Query::Not(q) => !q.eval(terms),
+            Query::Term(t) => set.contains(t.as_str()),
+            Query::Phrase(ts) => !ts.is_empty() && row.windows(ts.len()).any(|w| w == &ts[..]),
+            Query::And(qs) => !qs.is_empty() && qs.iter().all(|q| q.eval(set, row)),
+            Query::Or(qs) => qs.iter().any(|q| q.eval(set, row)),
+            Query::Not(q) => !q.eval(set, row),
         }
     }
 
@@ -103,7 +117,7 @@ impl Query {
             return Err(bad_input(format!("query nested deeper than {MAX_DEPTH}")));
         }
         match self {
-            Query::Term(_) => Ok(()),
+            Query::Term(_) | Query::Phrase(_) => Ok(()),
             Query::Not(_) if !not_ok => Err(bad_input("NOT must sit in an AND with a positive term")),
             Query::Not(q) => q.check_at(depth + 1, false),
             Query::Or(qs) => qs.iter().try_for_each(|q| q.check_at(depth + 1, false)),
@@ -120,6 +134,7 @@ impl Query {
             match q {
                 Query::Term(t) if seen.insert(t) => out.push(t),
                 Query::Term(_) | Query::Not(_) => {}
+                Query::Phrase(ts) => ts.iter().filter(|t| seen.insert(t)).for_each(|t| out.push(t)),
                 Query::And(qs) | Query::Or(qs) => qs.iter().for_each(|q| walk(q, out, seen)),
             }
         }
@@ -206,7 +221,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// atom := "(" or ")" | word
+    /// atom := "(" or ")" | word | phrase
     fn atom(&mut self) -> io::Result<Option<Query>> {
         match self.peek() {
             Some(Tok::Open) => {
@@ -224,7 +239,16 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ok(self.word(w))
             }
-            _ => Err(bad_input("query expects a word or '(' here")),
+            Some(Tok::Phrase(text)) => {
+                self.pos += 1;
+                let mut terms = self.analyzer.terms(text);
+                Ok(match terms.len() {
+                    0 => None,
+                    1 => terms.pop().map(Query::Term),
+                    _ => Some(Query::Phrase(terms)),
+                })
+            }
+            _ => Err(bad_input("query expects a word, a phrase or '(' here")),
         }
     }
 
@@ -252,6 +276,22 @@ mod tests {
     }
     fn p(s: &str) -> Query {
         Query::parse(&Analyzer::default(), s).unwrap()
+    }
+
+    #[test]
+    fn parses_and_matches_phrases() {
+        let ph = |ws: &[&str]| Phrase(ws.iter().map(|w| w.to_string()).collect());
+        assert_eq!(p("\"new york\""), ph(&["new", "york"]));
+        assert_eq!(p("\"New  York!\" city"), Or(vec![ph(&["new", "york"]), t("city")]));
+        assert_eq!(p("a AND -\"b c\""), And(vec![t("a"), Not(Box::new(ph(&["b", "c"])))]));
+        assert_eq!(p("\"solo\""), t("solo"));
+        assert_eq!(p("\"\" a"), t("a"));
+        assert_eq!(p("\"open to the end"), ph(&["open", "to", "the", "end"]));
+        let row: Vec<String> = "to be or not to be".split(' ').map(String::from).collect();
+        for (q, want) in [("\"to be\"", true), ("\"not to be\"", true), ("\"be to\"", false), ("\"be or not to be that\"", false), ("\"or not\" AND -\"be be\"", true)] {
+            assert_eq!(Query::parse(&Analyzer::whitespace(), q).unwrap().matches(&row), want, "{q}");
+        }
+        assert!(!Phrase(vec![]).matches(&row));
     }
 
     #[test]

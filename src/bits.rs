@@ -42,6 +42,11 @@ impl<'a> Packer<'a> {
         Packer { out, start, len: 0 }
     }
 
+    /// Continues a run that started at word `start` of `out` and has `len` bits so far.
+    pub(crate) fn resume(out: &'a mut Vec<u64>, start: usize, len: usize) -> Self {
+        Packer { out, start, len }
+    }
+
     /// Appends the low `width` bits (at most 32) of `v`.
     #[inline]
     pub(crate) fn push(&mut self, v: u32, width: u32) {

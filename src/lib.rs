@@ -274,18 +274,22 @@ struct Plan<'q> {
     terms: Vec<&'q str>,
     n_pos: usize,
     shape: Shape,
+    positional: bool, // has a phrase, so needs positions
 }
 
-/// How a plan's terms combine. Flat ORs and ANDs of terms keep their own fast paths.
+/// How a plan's terms combine. Flat ORs and ANDs keep their own fast paths.
 enum Shape {
-    Any, // OR of the positive terms
-    All, // AND of the positive terms
+    /// OR of the positive terms.
+    Any,
+    /// AND of the positive terms, some of them also in these phrases (term indices in order).
+    All(Vec<Vec<usize>>),
     Tree(Node),
 }
 
 /// A query tree over a plan's term indices.
 enum Node {
     Term(usize),
+    Phrase(Vec<usize>), // in order; at least two, or none (matches nothing)
     And(Vec<Node>),
     Or(Vec<Node>),
     Not(Box<Node>),
@@ -294,11 +298,16 @@ enum Node {
 impl Node {
     /// `slot` maps each term already in `terms` to its index there.
     fn new<'q>(q: &'q Query, terms: &mut Vec<&'q str>, slot: &mut HashMap<&'q str, usize>) -> Node {
-        match q {
-            Query::Term(t) => Node::Term(*slot.entry(t).or_insert_with(|| {
+        let mut index = |t: &'q String| {
+            *slot.entry(t).or_insert_with(|| {
                 terms.push(t);
                 terms.len() - 1
-            })),
+            })
+        };
+        match q {
+            Query::Term(t) => Node::Term(index(t)),
+            Query::Phrase(ts) if ts.len() == 1 => Node::Term(index(&ts[0])),
+            Query::Phrase(ts) => Node::Phrase(ts.iter().map(index).collect()),
             Query::And(qs) => Node::And(qs.iter().map(|q| Node::new(q, terms, slot)).collect()),
             Query::Or(qs) => Node::Or(qs.iter().map(|q| Node::new(q, terms, slot)).collect()),
             Query::Not(q) => Node::Not(Box::new(Node::new(q, terms, slot))),
@@ -310,17 +319,39 @@ impl<'q> Plan<'q> {
     fn new(q: &'q Query) -> Plan<'q> {
         let mut terms = q.positive_terms();
         let n_pos = terms.len();
+        let mut slot: HashMap<&str, usize> = terms.iter().enumerate().map(|(i, &t)| (t, i)).collect();
         let flat = |qs: &[Query]| qs.iter().all(|q| matches!(q, Query::Term(_)));
+        // Terms and phrases (of at least one term) ANDed: one AND of every term, plus adjacency.
+        let leaves = |qs: &[Query]| qs.iter().all(|q| matches!(q, Query::Term(_)) || matches!(q, Query::Phrase(ts) if !ts.is_empty()));
+        let phrases = |qs: &[Query]| {
+            let longer = qs.iter().filter_map(|q| match q {
+                Query::Phrase(ts) if ts.len() > 1 => Some(ts.iter().map(|t| slot[t.as_str()]).collect()),
+                _ => None,
+            });
+            longer.collect::<Vec<Vec<usize>>>()
+        };
         let shape = match q {
             Query::Term(_) => Shape::Any,
             Query::Or(qs) if flat(qs) => Shape::Any,
-            Query::And(qs) if flat(qs) => Shape::All,
-            q => {
-                let mut slot = terms.iter().enumerate().map(|(i, &t)| (t, i)).collect();
-                Shape::Tree(Node::new(q, &mut terms, &mut slot))
-            }
+            Query::Phrase(ts) if ts.len() == 1 => Shape::Any,
+            Query::Phrase(ts) if !ts.is_empty() => Shape::All(phrases(std::slice::from_ref(q))),
+            Query::And(qs) if leaves(qs) => Shape::All(phrases(qs)),
+            q => Shape::Tree(Node::new(q, &mut terms, &mut slot)),
         };
-        Plan { terms, n_pos, shape }
+        fn positional(n: &Node) -> bool {
+            match n {
+                Node::Term(_) => false,
+                Node::Phrase(_) => true,
+                Node::And(kids) | Node::Or(kids) => kids.iter().any(positional),
+                Node::Not(kid) => positional(kid),
+            }
+        }
+        let positional = match &shape {
+            Shape::Any => false,
+            Shape::All(phrases) => !phrases.is_empty(),
+            Shape::Tree(node) => positional(node),
+        };
+        Plan { terms, n_pos, shape, positional }
     }
 }
 
@@ -343,9 +374,12 @@ fn prepare<'q, 'a>(segs: &'a [SegView<'a>], q: &'q Query) -> io::Result<Option<(
         return Err(bad_input("an excluded-rows bitset needs one bit per row: rows.div_ceil(64) words, or none"));
     }
     let plan = Plan::new(q);
+    if plan.positional && segs.iter().any(|(s, _)| !s.has_positions()) {
+        return Err(bad_input("phrase queries need an index that stores positions"));
+    }
     let metas: Vec<Vec<Option<seg::Meta>>> = segs.iter().map(|(s, _)| plan.terms.iter().map(|t| s.lookup(t.as_bytes())).collect()).collect();
     let df: Vec<usize> = (0..plan.n_pos).map(|j| metas.iter().map(|m| m[j].map_or(0, |m| m.df as usize)).sum()).collect();
-    let all_needed = matches!(plan.shape, Shape::All);
+    let all_needed = matches!(plan.shape, Shape::All(_));
     if df.iter().all(|&d| d == 0) || (all_needed && df.contains(&0)) {
         return Ok(None); // also when there are no positive terms
     }
@@ -391,23 +425,32 @@ pub fn merge(segs: &[SegView]) -> io::Result<Index> {
     let mut new_of: Vec<Vec<u32>> = segs.iter().map(|s| vec![GONE; s.0.rows()]).collect();
     rows.iter().enumerate().for_each(|(new, &(_, s, r))| new_of[s as usize][r as usize] = new as u32);
     let ids = rows.iter().map(|&(_, s, r)| segs[s as usize].0.ids[r as usize]).collect();
-    let mut asm = seg::Assembler::new(params, order, rows.iter().map(|r| r.0).collect(), ids);
+    let positions = segs.iter().all(|s| s.0.has_positions()); // kept only if every segment has them
+    let mut asm = seg::Assembler::new(params, order, positions, rows.iter().map(|r| r.0).collect(), ids);
 
     // Every term of every segment, in order: the segments' sorted lexicons, merged.
     let mut iters: Vec<seg::TermIter> = segs.iter().map(|s| s.0.terms()).collect();
     let mut heads: Vec<Option<seg::Meta>> = iters.iter_mut().map(|it| it.next()).collect();
-    let (mut name, mut pairs, mut term_rows, mut tfs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // One term's live postings as (new row, tf, where its positions start in `at`).
+    let (mut name, mut pairs, mut at, mut buf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut term_rows, mut tfs, mut sorted) = (Vec::new(), Vec::new(), Vec::new());
     loop {
         let smallest = (0..segs.len()).filter(|&s| heads[s].is_some()).min_by(|&a, &b| iters[a].term().cmp(iters[b].term()));
         let Some(first) = smallest else { break };
         name.clear();
         name.extend_from_slice(iters[first].term());
         pairs.clear();
+        at.clear();
         for s in 0..segs.len() {
             let Some(meta) = heads[s].filter(|_| iters[s].term() == &name[..]) else { continue };
-            segs[s].0.postings(&meta).for_each(segs[s].0.blocks(), |row, tf| {
+            let (p, mut cursor) = (segs[s].0.postings(&meta), seg::PosCursor::default());
+            p.for_each(segs[s].0.blocks(), |row, tf, i| {
                 if new_of[s][row as usize] != GONE {
-                    pairs.push((new_of[s][row as usize], tf));
+                    pairs.push((new_of[s][row as usize], tf, at.len()));
+                    if positions {
+                        p.positions(i, &mut cursor, &mut buf);
+                        at.extend_from_slice(&buf);
+                    }
                 }
             });
             heads[s] = iters[s].next();
@@ -420,9 +463,15 @@ pub fn merge(segs: &[SegView]) -> io::Result<Index> {
         }
         term_rows.clear();
         tfs.clear();
-        term_rows.extend(pairs.iter().map(|p| p.0));
-        tfs.extend(pairs.iter().map(|p| p.1));
-        asm.term(&name, &term_rows, &tfs);
+        sorted.clear();
+        for &(row, tf, start) in &pairs {
+            term_rows.push(row);
+            tfs.push(tf);
+            if positions {
+                sorted.extend_from_slice(&at[start..start + tf as usize]);
+            }
+        }
+        asm.term(&name, &term_rows, &tfs, &sorted);
     }
     Ok(asm.finish())
 }
@@ -450,6 +499,11 @@ impl TopK {
     fn threshold(&self) -> f32 {
         self.heap.peek().map_or(f32::NEG_INFINITY, |h| h.0)
     }
+    /// Whether `push` would keep this hit.
+    fn takes(&self, row: u64, score: f32) -> bool {
+        self.heap.len() < self.k || self.heap.peek().is_some_and(|worst| Hit(score, row) < *worst)
+    }
+
     /// Ties on score go to the lower row, so results don't depend on the order blocks are visited.
     fn push(&mut self, row: u64, score: f32) {
         let hit = Hit(score, row);
@@ -474,9 +528,11 @@ mod py {
     #[pyclass(name = "Index", frozen)]
     struct PyIndex(super::Index, super::Analyzer);
 
-    /// `terms` as given (a flat AND or OR), or `query` text parsed with `analyzer`: exactly one.
-    fn query(analyzer: &super::Analyzer, terms: Option<Vec<String>>, and: bool, text: Option<&str>) -> PyResult<super::Query> {
+    /// `terms` as given (a flat AND or OR, or a phrase), or `query` text parsed with `analyzer`:
+    /// exactly one.
+    fn query(analyzer: &super::Analyzer, terms: Option<Vec<String>>, and: bool, phrase: bool, text: Option<&str>) -> PyResult<super::Query> {
         match (terms, text) {
+            (Some(t), None) if phrase => Ok(super::Query::Phrase(t)),
             (Some(t), None) => Ok(super::Query::words(&t.iter().map(String::as_str).collect::<Vec<_>>(), and)),
             (None, Some(text)) => Ok(super::Query::parse(analyzer, text)?),
             (None, None) => Err(pyo3::exceptions::PyValueError::new_err("pass terms or query")),
@@ -489,10 +545,10 @@ mod py {
         // Takes any iterable of str and indexes it in one streaming pass, so the caller can stream a
         // corpus from disk; each string is borrowed only while it is being indexed. Row id = position.
         #[new]
-        #[pyo3(signature = (docs, analyzer = "whitespace", k1 = 1.2, b = 0.75))]
-        fn new(docs: &Bound<'_, PyAny>, analyzer: &str, k1: f64, b: f64) -> PyResult<Self> {
+        #[pyo3(signature = (docs, analyzer = "whitespace", k1 = 1.2, b = 0.75, positions = true))]
+        fn new(docs: &Bound<'_, PyAny>, analyzer: &str, k1: f64, b: f64, positions: bool) -> PyResult<Self> {
             let analyzer = super::Analyzer::parse(analyzer)?;
-            let mut builder = super::Builder::new(super::Params { k1, b }, analyzer.clone())?;
+            let mut builder = super::Builder::new(super::Params { k1, b }, analyzer.clone())?.positions(positions);
             for (id, d) in docs.try_iter()?.enumerate() {
                 builder.add(id as u64, d?.cast::<pyo3::types::PyString>()?.to_str()?)?;
             }
@@ -518,9 +574,11 @@ mod py {
         }
 
         // Searches release the GIL so concurrent Python threads run in parallel. `terms` are used
-        // as given; `query` is text in the query syntax, analyzed like the index. `exhaustive`
-        // scores every match instead of stopping early, for checking results; it is slow.
-        #[pyo3(signature = (terms = None, conjunctive = false, k = 10, exhaustive = false, query = None))]
+        // as given (ORed, ANDed with `conjunctive`, or one after another with `phrase`); `query` is
+        // text in the query syntax, analyzed like the index. `exhaustive` scores every match instead
+        // of stopping early, for checking results; it is slow.
+        #[pyo3(signature = (terms = None, conjunctive = false, k = 10, exhaustive = false, query = None, phrase = false))]
+        #[allow(clippy::too_many_arguments)]
         fn top_k(
             &self,
             py: Python<'_>,
@@ -529,8 +587,9 @@ mod py {
             k: usize,
             exhaustive: bool,
             query: Option<&str>,
+            phrase: bool,
         ) -> PyResult<Vec<u64>> {
-            let q = self::query(&self.1, terms, conjunctive, query)?;
+            let q = self::query(&self.1, terms, conjunctive, phrase, query)?;
             let segs = [(&self.0, &[][..])];
             py.detach(|| {
                 let hits = if exhaustive { super::top_k_exhaustive(&segs, &q, k) } else { super::top_k(&segs, &q, k) }?;
@@ -538,9 +597,9 @@ mod py {
             })
         }
 
-        #[pyo3(signature = (terms = None, conjunctive = false, query = None))]
-        fn count(&self, py: Python<'_>, terms: Option<Vec<String>>, conjunctive: bool, query: Option<&str>) -> PyResult<u64> {
-            let q = self::query(&self.1, terms, conjunctive, query)?;
+        #[pyo3(signature = (terms = None, conjunctive = false, query = None, phrase = false))]
+        fn count(&self, py: Python<'_>, terms: Option<Vec<String>>, conjunctive: bool, query: Option<&str>, phrase: bool) -> PyResult<u64> {
+            let q = self::query(&self.1, terms, conjunctive, phrase, query)?;
             Ok(py.detach(|| super::count(&[(&self.0, &[])], &q))?)
         }
 
@@ -747,6 +806,35 @@ mod tests {
                 }
             }
         }
+        let mut matched = 0;
+        for q in phrase_queries(docs) {
+            let want = brute(docs, &q);
+            matched += !want.is_empty() as u32;
+            for idx in [&built, &opened] {
+                check_query(&[(idx, &[])], &q, &want);
+            }
+        }
+        assert!(matched >= 6, "phrases taken from rows match: {matched}");
+    }
+
+    /// Runs of words of real rows as phrases (they match) and reversed (they mostly don't), alone and
+    /// combined with terms.
+    fn phrase_queries(docs: &[String]) -> Vec<Query> {
+        let mut qs = Vec::new();
+        for (d, skip, len) in [(0, 0, 2), (1, 1, 3), (docs.len() / 2, 0, 4), (docs.len() - 1, 2, 2), (7, 3, 3), (70, 5, 6)] {
+            let words: Vec<String> = docs[d].split(' ').skip(skip).take(len).map(String::from).collect();
+            if words.len() < 2 {
+                continue;
+            }
+            for phrase in [words.clone(), words.iter().rev().cloned().collect()] {
+                let p = || Query::Phrase(phrase.clone());
+                let t = |t: &str| Query::Term(t.into());
+                qs.extend([p(), Query::And(vec![p(), t("t1")]), Query::Or(vec![p(), t("t250")]), Query::And(vec![t("t0"), Query::Not(Box::new(p()))])]);
+            }
+        }
+        qs.push(Query::Phrase(vec!["t0".into(), "missing".into()]));
+        qs.push(Query::Phrase(vec![]));
+        qs
     }
 
     pub(crate) fn check_query(segs: &[SegView], q: &Query, want: &[(u64, f64)]) {
@@ -875,9 +963,16 @@ mod tests {
                 *s
             };
             let r = next();
-            if depth == 0 || r % 3 == 0 {
+            let mut term = || {
                 let x = (next() % 1000) as f64 / 1000.0;
-                return Query::Term(format!("t{}", (x * x * x * 300.0) as u32));
+                format!("t{}", (x * x * x * 300.0) as u32)
+            };
+            if depth == 0 || r % 3 == 0 {
+                // a term, or now and then a phrase of two or three (common ones do occur in a row)
+                return match r % 4 {
+                    0 => Query::Phrase((0..2 + r / 4 % 2).map(|_| term()).collect()),
+                    _ => Query::Term(term()),
+                };
             }
             let (n, negate, or) = (1 + next() % 3, next() % 2 == 0, r % 2 == 0);
             let mut kids: Vec<Query> = (0..n).map(|_| gen(s, depth - 1)).collect();
@@ -1050,7 +1145,7 @@ mod tests {
         assert!(err(with(&|b| b.truncate(b.len() - 100))).contains("out of bounds"));
         // A flipped bit in the postings opens (opening reads only the header) but fails verify.
         let idx = with(&|b| *b.last_mut().unwrap() ^= 1).unwrap();
-        assert!(idx.verify().unwrap_err().to_string().contains("section 5 is corrupt"));
+        assert!(idx.verify().unwrap_err().to_string().contains("section 6 is corrupt"));
         drop(idx); // unmap before the file is rewritten under it
         assert!(with(&|_| {}).unwrap().verify().is_ok());
     }

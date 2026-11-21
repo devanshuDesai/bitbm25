@@ -21,6 +21,11 @@
 //! Term frequencies are nothing (all ones), two bits with a nibble for 4..18, or a byte; larger
 //! values sit in a short sorted table.
 //!
+//! Positions (optional) are a stream per term, in posting order. A posting with one occurrence
+//! stores its position in as many bits as the longest row of its 64-posting chunk needs; one with
+//! more stores them as Elias-Fano over the same range. Both sizes follow from the tf and the chunk's
+//! width, so there are no per-posting headers, only a bit offset and a width per chunk.
+//!
 //! The lexicon is sorted and front-coded in groups of 16 terms, each entry followed by where its
 //! postings are.
 
@@ -96,6 +101,7 @@ pub(crate) struct Meta {
     n_esc: u32,             // TF_SMALL: postings with tf >= 4
     n_big: u32,             // postings whose tf is in the table
     inline: [(u32, u32); 2], // (row, tf) when df <= 2
+    pos: u64,               // first word of its positions in `pos`; when df <= 2, where each row's are in the lexicon
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -120,12 +126,23 @@ fn get_varint(bytes: &[u8], pos: &mut usize) -> u64 {
 }
 
 impl Meta {
-    fn write(&self, out: &mut Vec<u8>) {
+    /// `positions`: with them stored, each posting's (in posting order, back to back) for an inline
+    /// term; otherwise None.
+    fn write(&self, out: &mut Vec<u8>, positions: Option<&[u32]>) {
         put_varint(out, self.df as u64);
         if self.df <= 2 {
+            let mut at = 0;
             for &(row, tf) in &self.inline[..self.df as usize] {
                 put_varint(out, row as u64);
                 put_varint(out, tf as u64);
+                if let Some(p) = positions {
+                    let mut last = 0;
+                    for &x in &p[at..at + tf as usize] {
+                        put_varint(out, (x - last) as u64); // ascending: gaps
+                        last = x;
+                    }
+                    at += tf as usize;
+                }
             }
             return;
         }
@@ -135,13 +152,22 @@ impl Meta {
             put_varint(out, self.n_esc as u64);
             put_varint(out, self.n_big as u64);
         }
+        if positions.is_some() {
+            put_varint(out, self.pos);
+        }
     }
 
-    fn read(bytes: &[u8], pos: &mut usize) -> Meta {
+    fn read(bytes: &[u8], pos: &mut usize, positions: bool) -> Meta {
         let mut m = Meta { df: get_varint(bytes, pos) as u32, ..Default::default() };
         if m.df <= 2 {
             for i in 0..m.df as usize {
                 m.inline[i] = (get_varint(bytes, pos) as u32, get_varint(bytes, pos) as u32);
+                if positions {
+                    m.pos |= (*pos as u64) << (32 * i); // where this row's positions start
+                    for _ in 0..m.inline[i].1 {
+                        get_varint(bytes, pos);
+                    }
+                }
             }
             return m;
         }
@@ -152,8 +178,87 @@ impl Meta {
             m.n_esc = get_varint(bytes, pos) as u32;
             m.n_big = get_varint(bytes, pos) as u32;
         }
+        if positions {
+            m.pos = get_varint(bytes, pos);
+        }
         m
     }
+}
+
+/// Bits the positions of a posting take: `tf` of them, each below `2^width`.
+fn pos_bits(tf: u32, width: u32) -> usize {
+    match tf {
+        1 => width as usize,
+        // Elias-Fano with the top log2(tf) bits of each position in unary
+        tf => (tf * (width - tf.ilog2() + 1)) as usize + (1 << tf.ilog2()),
+    }
+}
+
+/// Appends one posting's positions (ascending, each below `2^width`).
+fn write_pos(p: &mut Packer, positions: &[u32], width: u32) {
+    let tf = positions.len() as u32;
+    if tf == 1 {
+        return p.push(positions[0], width);
+    }
+    let l = width - tf.ilog2();
+    if l > 0 {
+        positions.iter().for_each(|&x| p.push(x & ((1 << l) - 1), l));
+    }
+    let mut bucket = 0;
+    for &x in positions {
+        while bucket < x >> l {
+            p.push(0, 1);
+            bucket += 1;
+        }
+        p.push(1, 1);
+    }
+    (bucket..1 << (width - l)).for_each(|_| p.push(0, 1)); // every bucket ends with a zero
+}
+
+/// Reads a posting's `tf` positions, written by `write_pos` at bit `at` of `data`, onto `out`.
+fn read_pos(data: &[u64], at: usize, tf: u32, width: u32, out: &mut Vec<u32>) {
+    if tf == 1 {
+        return out.push(bits::get(data, at, width));
+    }
+    let l = width - tf.ilog2();
+    let high_at = at + (tf * l) as usize;
+    let (mut k, mut from) = (0, high_at);
+    while k < tf {
+        let mut w = bits::window(data, from);
+        while w != 0 && k < tf {
+            // the k-th one sits at (its high part) + k
+            let high = (from + w.trailing_zeros() as usize - high_at) as u32 - k;
+            let low = if l > 0 { bits::get(data, at + (k * l) as usize, l) } else { 0 };
+            out.push(high << l | low);
+            k += 1;
+            w &= w - 1;
+        }
+        from += 64;
+    }
+}
+
+/// A posting of a term and the bit where its positions start: see `Postings::positions`.
+#[derive(Clone, Copy)]
+pub(crate) struct PosCursor {
+    posting: usize,
+    bit: usize,
+}
+
+impl Default for PosCursor {
+    fn default() -> Self {
+        PosCursor { posting: usize::MAX, bit: 0 } // in no chunk
+    }
+}
+
+/// Where a term's positions are.
+#[derive(Clone, Copy)]
+enum Positions<'a> {
+    None,
+    /// Gap-coded varints in the lexicon; each row's start at `at`.
+    Inline { lex: &'a [u8], at: [usize; 2] },
+    /// `chunks`: for every 64 postings, the bit in `data` where their positions start (low 56 bits)
+    /// and their width.
+    Packed { chunks: &'a [u64], data: &'a [u64] },
 }
 
 /// A term's rows.
@@ -244,6 +349,7 @@ pub(crate) struct Postings<'a> {
     /// there has (under the segment's own average length), in 255ths of k1 + 1, rounded up; 0 where
     /// the term is absent.
     pub(crate) bounds: Option<&'a [u64]>,
+    positions: Positions<'a>,
 }
 
 impl<'a> Postings<'a> {
@@ -566,15 +672,45 @@ impl<'a> Postings<'a> {
         self.max_tf(if first == UNKNOWN { self.first(b) } else { first }, mask.count_ones() as usize)
     }
 
-    /// Calls `f(row, tf)` for every posting, in row order.
-    pub(crate) fn for_each(&self, blocks: u32, mut f: impl FnMut(u32, u32)) {
+    /// Calls `f(row, tf, index)` for every posting, in row order.
+    pub(crate) fn for_each(&self, blocks: u32, mut f: impl FnMut(u32, u32, usize)) {
         self.for_each_block(0..blocks, |b, mut m, mut i| {
             while m != 0 {
-                f(b << SHIFT | m.trailing_zeros(), self.tf(i));
+                f(b << SHIFT | m.trailing_zeros(), self.tf(i), i);
                 i += 1;
                 m &= m - 1;
             }
         });
+    }
+
+    /// Replaces `out` with posting `i`'s positions, ascending. Empty if none are stored. `at`
+    /// remembers where the last posting read was, so reading postings in ascending order doesn't
+    /// walk a chunk again for each.
+    pub(crate) fn positions(&self, i: usize, at: &mut PosCursor, out: &mut Vec<u32>) {
+        out.clear();
+        match self.positions {
+            Positions::None => {}
+            Positions::Inline { lex, at } => {
+                let (mut pos, mut last) = (at[i], 0);
+                for _ in 0..self.tf(i) {
+                    last += get_varint(lex, &mut pos) as u32;
+                    out.push(last);
+                }
+            }
+            Positions::Packed { chunks, data } => {
+                let width = (chunks[i >> 6] >> 56) as u32;
+                // A posting's bits start where the previous one's end: walk from the chunk's start,
+                // or from the last posting read if that is in this chunk and not past this one.
+                if at.posting >> 6 != i >> 6 || at.posting > i {
+                    *at = PosCursor { posting: i & !63, bit: (chunks[i >> 6] & (!0 >> 8)) as usize };
+                }
+                for j in at.posting..i {
+                    at.bit += pos_bits(self.tf(j), width);
+                }
+                at.posting = i;
+                read_pos(data, at.bit, self.tf(i), width, out);
+            }
+        }
     }
 }
 
@@ -708,6 +844,28 @@ fn write_term(rows: &[u32], tfs: &[u32], dl: &[u32], avgdl: f64, params: Params,
     m
 }
 
+/// Appends a term's positions (each posting's, back to back, in posting order) to `out`.
+fn write_positions(rows: &[u32], tfs: &[u32], positions: &[u32], dl: &[u32], out: &mut Vec<u64>) {
+    let chunks = out.len();
+    out.resize(chunks + rows.len().div_ceil(64), 0);
+    let (data, mut bits, mut at) = (out.len(), 0usize, 0usize); // first data word; bits written; positions consumed
+    for (c, (rows, tfs)) in rows.chunks(64).zip(tfs.chunks(64)).enumerate() {
+        // wide enough for any position in the chunk's longest row
+        let longest = rows.iter().map(|&r| dl[r as usize]).max().expect("chunks are not empty");
+        let width = (32 - (longest.max(2) - 1).leading_zeros()).max(1);
+        out[chunks + c] = bits as u64 | (width as u64) << 56;
+        for &tf in tfs {
+            // each posting starts where the last ended, so pack them one after another
+            out.truncate(data + bits.div_ceil(64));
+            let mut p = Packer::resume(out, data, bits);
+            write_pos(&mut p, &positions[at..at + tf as usize], width);
+            bits += pos_bits(tf, width);
+            at += tf as usize;
+        }
+    }
+    out.resize(data + bits.div_ceil(64), 0);
+}
+
 /// Elias-Fano's sample interval (as a shift): every 8th bucket when buckets are blocks and the term
 /// is in most of them, else every 64th.
 fn ef_samples(summary: bool, l: u32) -> u32 {
@@ -728,7 +886,7 @@ struct LexWriter {
 }
 
 impl LexWriter {
-    fn push(&mut self, term: &[u8], meta: &Meta) {
+    fn push(&mut self, term: &[u8], meta: &Meta, positions: Option<&[u32]>) {
         let shared = if self.n.is_multiple_of(LEX_GROUP) {
             self.heads.push(self.bytes.len() as u32);
             0
@@ -738,7 +896,7 @@ impl LexWriter {
         put_varint(&mut self.bytes, shared as u64);
         put_varint(&mut self.bytes, (term.len() - shared) as u64);
         self.bytes.extend_from_slice(&term[shared..]);
-        meta.write(&mut self.bytes);
+        meta.write(&mut self.bytes, positions);
         self.prev.clear();
         self.prev.extend_from_slice(term);
         self.n += 1;
@@ -752,6 +910,7 @@ pub struct Index {
     pub(crate) dl: Arr<u32>,  // exact length of each row
     pub(crate) ids: Arr<u64>, // each row's id
     pub(crate) blen: Arr<u8>, // per block, the length class of its shortest row
+    pos: Option<Arr<u64>>,    // positions, if stored
     n_terms: usize,
     order: Order,
     pub(crate) stats: Stats,
@@ -761,9 +920,9 @@ pub struct Index {
 
 const MAGIC: &[u8; 8] = b"BITBM25\0";
 const VERSION: u32 = 3;
-const SECTIONS: usize = 6;
-// Header: magic, version u32, section count u32, k1 f64, b f64, block shift u32, row order u32,
-// rows u64, total length u64, terms u64, then per section (offset u64, bytes u64, crc32 u32,
+const SECTIONS: usize = 7;
+// Header: magic, version u32, section count u32, k1 f64, b f64, block shift u32, flags u32 (bit 0:
+// rows as added; bit 1: positions), rows u64, total length u64, terms u64, then per section (offset u64, bytes u64, crc32 u32,
 // zero u32), then a crc32 of all of that. Sections follow, each 8-byte aligned.
 pub(crate) const TABLE_AT: usize = 64;
 const HEADER_CRC_AT: usize = TABLE_AT + 24 * SECTIONS;
@@ -813,6 +972,11 @@ impl Index {
         self.order
     }
 
+    /// Whether positions are stored, which phrase queries need.
+    pub fn has_positions(&self) -> bool {
+        self.pos.is_some()
+    }
+
     /// Where `term`'s postings are, if the segment has it.
     pub(crate) fn lookup(&self, term: &[u8]) -> Option<Meta> {
         // The last group whose first term is <= `term`, then its entries in order. `matched` is how
@@ -838,7 +1002,7 @@ impl Index {
             let len = get_varint(&self.lex, &mut pos) as usize;
             let suffix = &self.lex[pos..pos + len];
             pos += len;
-            let meta = Meta::read(&self.lex, &mut pos);
+            let meta = Meta::read(&self.lex, &mut pos, self.pos.is_some());
             if shared < matched {
                 return None; // this entry already differs from `term` where the last one agreed
             }
@@ -871,7 +1035,11 @@ impl Index {
         let df = m.df as usize;
         if df <= 2 {
             let (rows, tfs) = ([m.inline[0].0, m.inline[1].0], [m.inline[0].1, m.inline[1].1]);
-            return (Postings { df, rows: Rows::Inline(rows), tfs: Tfs::Inline(tfs), bounds: None }, [0; 3]);
+            let positions = match &self.pos {
+                Some(_) => Positions::Inline { lex: &self.lex, at: [m.pos as u32 as usize, (m.pos >> 32) as usize] },
+                None => Positions::None,
+            };
+            return (Postings { df, rows: Rows::Inline(rows), tfs: Tfs::Inline(tfs), bounds: None, positions }, [0; 3]);
         }
         let (n_rows, blocks) = (self.rows(), self.rows().div_ceil(64));
         let w = &mut &self.post[m.off as usize..];
@@ -902,7 +1070,14 @@ impl Index {
         };
         let after_tfs = w.len();
         let bounds = (m.kind & BOUNDS != 0).then(|| take(w, blocks.div_ceil(8)));
-        (Postings { df, rows, tfs, bounds }, [start - after_rows, after_rows - after_tfs, after_tfs - w.len()])
+        let positions = match &self.pos {
+            Some(pos) => {
+                let (chunks, data) = pos[m.pos as usize..].split_at(df.div_ceil(64));
+                Positions::Packed { chunks, data }
+            }
+            None => Positions::None,
+        };
+        (Postings { df, rows, tfs, bounds, positions }, [start - after_rows, after_rows - after_tfs, after_tfs - w.len()])
     }
 
     /// Size of the index's arrays, which is also its file size less a few hundred bytes of header.
@@ -912,7 +1087,8 @@ impl Index {
 
     /// Every array as bytes, in file order.
     pub(crate) fn sections(&self) -> [&[u8]; SECTIONS] {
-        [as_bytes(&self.lex_heads), as_bytes(&self.lex), as_bytes(&self.post), as_bytes(&self.dl), as_bytes(&self.ids), as_bytes(&self.blen)]
+        let pos = self.pos.as_deref().unwrap_or(&[]);
+        [as_bytes(&self.lex_heads), as_bytes(&self.lex), as_bytes(&self.post), as_bytes(&self.dl), as_bytes(&self.ids), as_bytes(&self.blen), as_bytes(pos)]
     }
 
     /// Writes the index to `path`, atomically: it goes to `path.tmp`, is synced, then renamed, so a
@@ -931,7 +1107,7 @@ impl Index {
         h.extend_from_slice(&self.stats.params.k1.to_le_bytes());
         h.extend_from_slice(&self.stats.params.b.to_le_bytes());
         h.extend_from_slice(&SHIFT.to_le_bytes());
-        h.extend_from_slice(&(self.order as u32).to_le_bytes());
+        h.extend_from_slice(&(self.order as u32 | (self.pos.is_some() as u32) << 1).to_le_bytes());
         h.extend_from_slice(&(self.dl.len() as u64).to_le_bytes());
         h.extend_from_slice(&self.stats.total_len.to_le_bytes());
         h.extend_from_slice(&(self.n_terms as u64).to_le_bytes());
@@ -988,9 +1164,9 @@ impl Index {
             return Err(invalid("index header is corrupt (checksum mismatch)"));
         }
         let params = Params { k1: f64::from_bits(u64_at(16)), b: f64::from_bits(u64_at(24)) };
-        let (shift, order) = (u32_at(32), u32_at(36));
-        if u32_at(12) as usize != SECTIONS || shift != SHIFT || order > 1 || !params.valid() {
-            return Err(invalid(format!("index built with {params:?}, block shift {shift}, row order {order}")));
+        let (shift, flags) = (u32_at(32), u32_at(36));
+        if u32_at(12) as usize != SECTIONS || shift != SHIFT || flags > 3 || !params.valid() {
+            return Err(invalid(format!("index built with {params:?}, block shift {shift}, flags {flags}")));
         }
         let (rows, total_len, n_terms) = (u64_at(40), u64_at(48), u64_at(56) as usize);
         let sec = |i: usize| (u64_at(TABLE_AT + 24 * i), u64_at(TABLE_AT + 24 * i + 8));
@@ -1008,8 +1184,9 @@ impl Index {
             dl: arr!(3),
             ids: arr!(4),
             blen: arr!(5),
+            pos: (flags & 2 != 0).then_some(arr!(6)),
             n_terms,
-            order: if order == 0 { Order::Length } else { Order::Added },
+            order: if flags & 1 == 0 { Order::Length } else { Order::Added },
             stats: Stats::new(rows as usize, total_len, params),
             crcs: Some(crcs),
             by_id: Default::default(),
@@ -1062,7 +1239,7 @@ impl TermIter<'_> {
         self.term.truncate(shared);
         self.term.extend_from_slice(&lex[self.pos..self.pos + len]);
         self.pos += len;
-        Some(Meta::read(lex, &mut self.pos))
+        Some(Meta::read(lex, &mut self.pos, self.idx.pos.is_some()))
     }
 
     pub(crate) fn term(&self) -> &[u8] {
@@ -1079,19 +1256,25 @@ pub(crate) struct Assembler {
     dl: Vec<u32>,
     ids: Vec<u64>,
     post: Vec<u64>,
+    pos: Option<Vec<u64>>, // positions, if the segment stores them
     lex: LexWriter,
 }
 
 impl Assembler {
-    pub(crate) fn new(params: Params, order: Order, dl: Vec<u32>, ids: Vec<u64>) -> Self {
+    pub(crate) fn new(params: Params, order: Order, positions: bool, dl: Vec<u32>, ids: Vec<u64>) -> Self {
         let avgdl = Stats::new(dl.len(), dl.iter().map(|&d| d as u64).sum(), params).avgdl;
-        Assembler { params, order, avgdl, dl, ids, post: Vec::new(), lex: LexWriter::default() }
+        Assembler { params, order, avgdl, dl, ids, post: Vec::new(), pos: positions.then(Vec::new), lex: LexWriter::default() }
     }
 
-    /// Adds a term: its rows ascending, a tf for each. Terms must be added in ascending order.
-    pub(crate) fn term(&mut self, name: &[u8], rows: &[u32], tfs: &[u32]) {
-        let meta = write_term(rows, tfs, &self.dl, self.avgdl, self.params, &mut self.post);
-        self.lex.push(name, &meta);
+    /// Adds a term: its rows ascending, a tf for each and, if the segment stores positions, each
+    /// row's positions ascending, back to back. Terms must be added in ascending order.
+    pub(crate) fn term(&mut self, name: &[u8], rows: &[u32], tfs: &[u32], positions: &[u32]) {
+        let mut meta = write_term(rows, tfs, &self.dl, self.avgdl, self.params, &mut self.post);
+        if let Some(pos) = self.pos.as_mut().filter(|_| rows.len() > 2) {
+            meta.pos = pos.len() as u64;
+            write_positions(rows, tfs, positions, &self.dl, pos);
+        }
+        self.lex.push(name, &meta, self.pos.as_ref().map(|_| positions));
     }
 
     pub(crate) fn finish(self) -> Index {
@@ -1105,6 +1288,7 @@ impl Assembler {
             dl: self.dl.into(),
             ids: self.ids.into(),
             blen: blen.into(),
+            pos: self.pos.map(Into::into),
             n_terms: self.lex.n,
             order: self.order,
             crcs: None,
@@ -1113,8 +1297,8 @@ impl Assembler {
     }
 }
 
-/// Per-term state while building: (row delta, tf) pairs as LEB128 varints, which is far smaller than
-/// the final arrays' growth slack would be.
+/// Per-term state while building: per row, (row delta, tf, then the gaps between its positions if
+/// they are kept) as LEB128 varints, which is far smaller than the final arrays' growth slack would be.
 struct BuildTerm {
     bytes: Vec<u8>,
     last: u32, // last row added, or NONE
@@ -1125,9 +1309,11 @@ struct BuildTerm {
 pub struct Builder {
     params: Params,
     order: Order,
+    positions: bool,
     analyzer: Analyzer,
     text: String,                       // one doc's terms, back to back, reused
-    spans: Vec<std::ops::Range<usize>>, // each term's place in `text`
+    spans: Vec<std::ops::Range<usize>>, // each term's place in `text`, in order of position
+    by_text: Vec<u32>,                  // positions, sorted by their term
     terms: std::collections::HashMap<Vec<u8>, u32>,
     postings: Vec<BuildTerm>,
     dl: Vec<u32>,
@@ -1143,9 +1329,11 @@ impl Builder {
         Ok(Builder {
             params,
             order: Order::default(),
+            positions: true,
             analyzer,
             text: String::new(),
             spans: Vec::new(),
+            by_text: Vec::new(),
             terms: Default::default(),
             postings: Vec::new(),
             dl: Vec::new(),
@@ -1156,6 +1344,13 @@ impl Builder {
     /// How the segment will number its rows (`Order::Length` unless set).
     pub fn order(mut self, order: Order) -> Builder {
         self.order = order;
+        self
+    }
+
+    /// Whether to store positions (they are unless turned off). Without them the index is about
+    /// half the size and phrase queries are refused.
+    pub fn positions(mut self, positions: bool) -> Builder {
+        self.positions = positions;
         self
     }
 
@@ -1173,19 +1368,22 @@ impl Builder {
             spans.push(buf.len() - t.len()..buf.len());
         });
         let len = u32::try_from(spans.len()).map_err(|_| bad_input("a row holds at most 2^32 - 1 terms"))?;
-        let buf = &self.text;
-        spans.sort_unstable_by(|a, b| buf[a.clone()].cmp(&buf[b.clone()]));
-        let runs = || spans.chunk_by(|a, b| buf[a.clone()] == buf[b.clone()]);
-        let new_terms = runs().filter(|r| !self.terms.contains_key(buf[r[0].clone()].as_bytes())).count();
+        let (buf, spans) = (&self.text, &self.spans);
+        // positions grouped by term, ascending within each
+        let by_text = &mut self.by_text;
+        by_text.clear();
+        by_text.extend(0..len);
+        by_text.sort_unstable_by(|&a, &b| buf[spans[a as usize].clone()].cmp(&buf[spans[b as usize].clone()]).then(a.cmp(&b)));
+        let same = |a: &u32, b: &u32| buf[spans[*a as usize].clone()] == buf[spans[*b as usize].clone()];
+        let new_terms = by_text.chunk_by(same).filter(|r| !self.terms.contains_key(buf[spans[r[0] as usize].clone()].as_bytes())).count();
         if self.postings.len() + new_terms > NONE as usize {
             return Err(bad_input("a segment holds at most 2^32 - 1 distinct terms"));
         }
         let row = self.dl.len() as u32;
         self.dl.push(len);
         self.ids.push(id);
-        let (text, spans) = (std::mem::take(&mut self.text), std::mem::take(&mut self.spans));
-        for run in spans.chunk_by(|a, b| text[a.clone()] == text[b.clone()]) {
-            let name = text[run[0].clone()].as_bytes();
+        for run in by_text.chunk_by(same) {
+            let name = buf[spans[run[0] as usize].clone()].as_bytes();
             let term = match self.terms.get(name) {
                 Some(&t) => t,
                 None => {
@@ -1197,9 +1395,15 @@ impl Builder {
             let p = &mut self.postings[term as usize];
             put_varint(&mut p.bytes, if p.last == NONE { row } else { row - p.last } as u64);
             put_varint(&mut p.bytes, run.len() as u64);
+            if self.positions {
+                let mut last = 0;
+                for &at in run {
+                    put_varint(&mut p.bytes, (at - last) as u64);
+                    last = at;
+                }
+            }
             p.last = row;
         }
-        (self.text, self.spans) = (text, spans);
         Ok(())
     }
 
@@ -1209,7 +1413,7 @@ impl Builder {
     }
 
     pub fn finish(self) -> Index {
-        let Builder { params, order, terms, mut postings, dl, ids, .. } = self;
+        let Builder { params, order, positions, terms, mut postings, dl, ids, .. } = self;
         // Final row of each added row: by length (ties in the order added), or as added.
         let mut by_new: Vec<u32> = (0..dl.len() as u32).collect();
         if order == Order::Length {
@@ -1220,28 +1424,46 @@ impl Builder {
         let mut asm = Assembler::new(
             params,
             order,
+            positions,
             by_new.iter().map(|&r| dl[r as usize]).collect(),
             by_new.iter().map(|&r| ids[r as usize]).collect(),
         );
         let mut names: Vec<(Vec<u8>, u32)> = terms.into_iter().collect();
         names.sort_unstable();
-        let (mut pairs, mut rows, mut tfs) = (Vec::new(), Vec::new(), Vec::new());
+        // One term's postings as (new row, tf, where its positions start in `at`), then in row order.
+        let (mut entries, mut at) = (Vec::new(), Vec::new());
+        let (mut rows, mut tfs, mut sorted) = (Vec::new(), Vec::new(), Vec::new());
         for (name, t) in names {
             let bytes = std::mem::take(&mut postings[t as usize].bytes); // freed after this term
             let (mut pos, mut row) = (0, 0u32);
-            pairs.clear();
+            entries.clear();
+            at.clear();
             while pos < bytes.len() {
                 row += get_varint(&bytes, &mut pos) as u32;
-                pairs.push((new_of[row as usize], get_varint(&bytes, &mut pos) as u32));
+                let tf = get_varint(&bytes, &mut pos) as u32;
+                entries.push((new_of[row as usize], tf, at.len()));
+                if positions {
+                    let mut last = 0;
+                    for _ in 0..tf {
+                        last += get_varint(&bytes, &mut pos) as u32;
+                        at.push(last);
+                    }
+                }
             }
             if order == Order::Length {
-                pairs.sort_unstable();
+                entries.sort_unstable();
             }
             rows.clear();
             tfs.clear();
-            rows.extend(pairs.iter().map(|p| p.0));
-            tfs.extend(pairs.iter().map(|p| p.1));
-            asm.term(&name, &rows, &tfs);
+            sorted.clear();
+            for &(row, tf, start) in &entries {
+                rows.push(row);
+                tfs.push(tf);
+                if positions {
+                    sorted.extend_from_slice(&at[start..start + tf as usize]);
+                }
+            }
+            asm.term(&name, &rows, &tfs, &sorted);
         }
         asm.finish()
     }
@@ -1279,9 +1501,25 @@ mod tests {
             }
             cases.push((vec![0], vec![7]));
             cases.push((vec![n_rows as u32 - 1], vec![1]));
-            let mut asm = Assembler::new(Params::default(), Order::Added, vec![1; n_rows], (0..n_rows as u64).collect());
+            // rows of every length, and for each posting `tf` ascending positions below its row's length
+            let dl: Vec<u32> = (0..n_rows).map(|r| 400 + (r as u32 * 7919) % 3000).collect();
+            let positions: Vec<Vec<u32>> = cases
+                .iter()
+                .map(|(rows, tfs)| {
+                    let mut out = Vec::new();
+                    for (&row, &tf) in rows.iter().zip(tfs) {
+                        let (len, mut at) = (dl[row as usize], next() as u32 % 3);
+                        for k in 0..tf {
+                            out.push(at.min(len - tf + k)); // room is left for the rest
+                            at = out[out.len() - 1] + 1 + next() as u32 % (len / tf).max(1);
+                        }
+                    }
+                    out
+                })
+                .collect();
+            let mut asm = Assembler::new(Params::default(), Order::Added, true, dl, (0..n_rows as u64).collect());
             for (i, (rows, tfs)) in cases.iter().enumerate() {
-                asm.term(format!("term{i:03}").as_bytes(), rows, tfs);
+                asm.term(format!("term{i:03}").as_bytes(), rows, tfs, &positions[i]);
             }
             let idx = asm.finish();
             let blocks = idx.blocks();
@@ -1296,10 +1534,22 @@ mod tests {
                 let meta = idx.lookup(format!("term{i:03}").as_bytes()).unwrap_or_else(|| panic!("term {i} of {n_rows} rows"));
                 let p = idx.postings(&meta);
                 assert_eq!(p.df, rows.len());
-                let mut got = Vec::new();
-                p.for_each(blocks, |row, tf| got.push((row, tf)));
+                let (mut got, mut got_pos, mut buf, mut cursor) = (Vec::new(), Vec::new(), Vec::new(), PosCursor::default());
+                p.for_each(blocks, |row, tf, at| {
+                    got.push((row, tf));
+                    p.positions(at, &mut cursor, &mut buf);
+                    got_pos.extend_from_slice(&buf);
+                });
+                // in any order too: every 7th posting, backwards
+                let mut start = 0;
+                let starts: Vec<usize> = tfs.iter().map(|&tf| (start, start += tf as usize).0).collect();
+                for at in (0..rows.len()).rev().step_by(7) {
+                    p.positions(at, &mut cursor, &mut buf);
+                    assert_eq!(buf, positions[i][starts[at]..starts[at] + tfs[at] as usize], "posting {at} of term {i}");
+                }
                 let want: Vec<(u32, u32)> = rows.iter().copied().zip(tfs.iter().copied()).collect();
                 assert_eq!(got, want, "term {i} of {n_rows} rows");
+                assert_eq!(got_pos, positions[i], "positions of term {i} of {n_rows} rows");
                 for b in 0..blocks {
                     let in_block: Vec<usize> = (0..rows.len()).filter(|&j| rows[j] >> SHIFT == b).collect();
                     let mask = in_block.iter().fold(0u64, |m, &j| m | 1 << (rows[j] & 63));

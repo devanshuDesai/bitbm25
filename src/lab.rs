@@ -27,8 +27,12 @@ pub fn composition(idx: &Index) -> String {
     }
     writeln!(o, "rows {rows}  blocks {}  terms {n_terms}  postings {postings}  tokens {}", idx.blocks(), idx.stats.total_len).unwrap();
     writeln!(o, "index {:.1} MB = {:.2} bytes/posting, {:.1} bytes/row", total as f64 / 1e6, total as f64 / postings as f64, total as f64 / rows as f64).unwrap();
-    for (name, s) in ["lexicon groups", "lexicon", "postings", "lengths", "ids", "block lengths"].iter().zip(idx.sections()) {
+    for (name, s) in ["lexicon groups", "lexicon", "postings", "lengths", "ids", "block lengths", "positions"].iter().zip(idx.sections()) {
         writeln!(o, "  {name:<14} {:>9.1} MB {:>5.1}%", s.len() as f64 / 1e6, 100.0 * s.len() as f64 / total as f64).unwrap();
+    }
+    if idx.has_positions() {
+        let pos = idx.sections()[6].len() as f64;
+        writeln!(o, "  positions: {:.2} bits per token (inline terms' are in the lexicon)", pos * 8.0 / idx.stats.total_len as f64).unwrap();
     }
     let line = |o: &mut String, what: &str, name: &str, e: &[u64; 3]| {
         writeln!(o, "  {what:<5} {name:<11} {:>8} terms {:>11} postings ({:>4.1}%) {:>8.1} MB {:>6.2} bits/posting", e[0], e[1],

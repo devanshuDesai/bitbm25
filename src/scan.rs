@@ -11,12 +11,14 @@
 //!      for all 64 rows at once, and only rows that can still qualify are scored exactly.
 //!
 //! ANDs walk the rarest term's blocks and look the others up there. Counts and unscored visits
-//! combine row masks and never look at frequencies.
+//! combine row masks and never look at frequencies. Phrases are ANDs whose rows are then checked
+//! against positions; ranked, a row is scored first and its positions read only if it would enter
+//! the top k.
 //!
 //! Bounds are rounded up and thresholds down wherever they are quantized, and ties on the k-th
 //! score are kept, so results equal exhaustive scoring exactly.
 
-use crate::seg::{Index, Postings, EDGES, SHIFT, UNKNOWN};
+use crate::seg::{Index, PosCursor, Postings, EDGES, SHIFT, UNKNOWN};
 use crate::{Node, Shape, Stats, TopK};
 
 const WINDOW: u32 = 4096; // blocks per window: 8 KB of accumulators
@@ -208,7 +210,7 @@ fn next_reaching(acc: &[u16], from: usize, min: u16) -> Option<usize> {
 pub(crate) fn run(seg: &Seg, shape: &Shape, sink: &mut Sink) {
     let mut s = Scan::new(seg, shape);
     match (shape, sink) {
-        (Shape::All, sink) => s.all(sink),
+        (Shape::All(phrases), sink) => s.all(phrases, sink),
         (_, Sink::Top { top, prune }) => s.ranked(top, *prune),
         (_, sink) => s.matches(sink),
     }
@@ -230,6 +232,8 @@ struct Scan<'a, 's> {
     lists: Vec<Option<Vec<Listed>>>,
     read: Vec<usize>, // how far into each list
     tf: Vec<u32>,     // each term's largest tf in the block at hand, when its list gave it
+    // scratch: each plan term's positions in the row being checked, and where its last ones were read
+    positions: std::cell::RefCell<Vec<(Vec<u32>, PosCursor)>>,
 }
 
 impl<'a, 's> Scan<'a, 's> {
@@ -242,7 +246,7 @@ impl<'a, 's> Scan<'a, 's> {
         let unit = (st.params.k1 + 1.0) / 255.0 * (st.avgdl / seg.idx.stats.avgdl).max(1.0) * (1.0 + 1e-6);
         let n = seg.terms.len();
         let lists = (0..n).map(|_| None).collect();
-        Scan { seg, shape, norm, unit: unit as f32, cur: vec![None; n], masks: vec![0; n], later: Vec::with_capacity(n), lists, read: vec![0; n], tf: vec![0; n] }
+        Scan { seg, shape, norm, unit: unit as f32, cur: vec![None; n], masks: vec![0; n], later: Vec::with_capacity(n), lists, read: vec![0; n], tf: vec![0; n], positions: vec![Default::default(); n].into() }
     }
 
     /// The scoring terms this segment has, with their place in the plan.
@@ -281,10 +285,35 @@ impl<'a, 's> Scan<'a, 's> {
             }
         }
         let matched = match self.shape {
-            Shape::Tree(node) => node.eval(&self.masks),
+            Shape::Tree(node) => node.eval(&self.masks, &|phrase, rows| self.adjacent(b, rows, phrase)),
             _ => any,
         };
         matched & !self.excluded(b)
+    }
+
+    /// The rows among `rows` of block `b` (whose terms `cur` holds) where the terms of `phrase`
+    /// follow one another.
+    fn adjacent(&self, b: u32, mut rows: u64, phrase: &[usize]) -> u64 {
+        let (mut out, mut pos) = (0, self.positions.borrow_mut());
+        while rows != 0 {
+            let r = rows.trailing_zeros();
+            rows &= rows - 1;
+            for (k, &j) in phrase.iter().enumerate().filter(|&(k, j)| !phrase[..k].contains(j)) {
+                let _ = k;
+                let t = self.seg.terms[j].as_ref().expect("a phrase's terms are all in a matching row");
+                let (m, first) = self.cur[j].expect("and in its block");
+                let first = if first == UNKNOWN { t.p.first(b) } else { first };
+                let (out, cursor) = &mut pos[j];
+                t.p.positions(first + (m & ((1u64 << r) - 1)).count_ones() as usize, cursor, out);
+            }
+            // Some start p has phrase[k] at p + k for every k: try the starts the rarest word allows.
+            let lead = (0..phrase.len()).min_by_key(|&k| pos[phrase[k]].0.len()).expect("a phrase has words");
+            let follows = |p: u32| phrase.iter().enumerate().all(|(k, &j)| pos[j].0.binary_search(&(p + k as u32)).is_ok());
+            if pos[phrase[lead]].0.iter().any(|&p| p >= lead as u32 && follows(p - lead as u32)) {
+                out |= 1 << r;
+            }
+        }
+        out
     }
 
     /// Exact score of `row` (in block `b`, whose terms `cur` holds): its scoring terms in plan order.
@@ -537,8 +566,9 @@ impl<'a, 's> Scan<'a, 's> {
         }
     }
 
-    /// AND of all the plan's terms: walk the rarest one's blocks and look the others up there.
-    fn all(&mut self, sink: &mut Sink) {
+    /// AND of all the plan's terms, those of each of `phrases` adjacent: walk the rarest term's
+    /// blocks and look the others up there.
+    fn all(&mut self, phrases: &[Vec<usize>], sink: &mut Sink) {
         let idx = self.seg.idx;
         let ts: Vec<(usize, &QTerm)> = self.scoring().collect();
         let (driver, lead) = *ts.iter().min_by_key(|(_, t)| t.p.df).expect("a segment that can match has terms");
@@ -559,7 +589,10 @@ impl<'a, 's> Scan<'a, 's> {
             if rows == 0 {
                 return;
             }
-            let Sink::Top { top, prune } = &mut *sink else { return emit(idx, b, rows, sink) };
+            let Sink::Top { top, prune } = &mut *sink else {
+                let rows = phrases.iter().fold(rows, |rows, p| self.adjacent(b, rows, p));
+                return emit(idx, b, rows, sink);
+            };
             if *prune && top.heap.len() == top.k {
                 // Every match holds every term, so the block's bound is each term's, summed.
                 let bound: f32 = ts.iter().map(|&(j, t)| self.bound(j, t, b)).sum();
@@ -567,7 +600,18 @@ impl<'a, 's> Scan<'a, 's> {
                     return;
                 }
             }
-            self.push_rows(b, rows, top);
+            if phrases.is_empty() {
+                return self.push_rows(b, rows, top);
+            }
+            // Score first: positions are read only for rows that would enter the top k.
+            while rows != 0 {
+                let r = rows.trailing_zeros();
+                rows &= rows - 1;
+                let (id, score) = (idx.ids[(b << SHIFT | r) as usize], self.score(b, r));
+                if top.takes(id, score) && phrases.iter().all(|p| self.adjacent(b, 1 << r, p) != 0) {
+                    top.push(id, score);
+                }
+            }
         });
     }
 }
@@ -589,16 +633,21 @@ fn emit(idx: &Index, b: u32, mut rows: u64, sink: &mut Sink) {
 }
 
 impl Node {
-    /// Rows of one block matching this node, from each term's row mask in that block.
-    pub(crate) fn eval(&self, masks: &[u64]) -> u64 {
+    /// Rows of one block matching this node, from each term's row mask in that block; `adjacent`
+    /// narrows the rows holding all of a phrase's terms to those where they follow one another.
+    pub(crate) fn eval(&self, masks: &[u64], adjacent: &dyn Fn(&[usize], u64) -> u64) -> u64 {
         match self {
             Node::Term(i) => masks[*i],
+            Node::Phrase(terms) => match terms.iter().map(|&i| masks[i]).reduce(|a, b| a & b) {
+                Some(rows) if rows != 0 => adjacent(terms, rows),
+                _ => 0, // some term is missing, or the phrase has none
+            },
             Node::And(kids) if kids.is_empty() => 0,
             Node::And(kids) => kids.iter().fold(u64::MAX, |m, k| match k {
-                Node::Not(k) => m & !k.eval(masks),
-                k => m & k.eval(masks),
+                Node::Not(k) => m & !k.eval(masks, adjacent),
+                k => m & k.eval(masks, adjacent),
             }),
-            Node::Or(kids) => kids.iter().fold(0, |m, k| m | k.eval(masks)),
+            Node::Or(kids) => kids.iter().fold(0, |m, k| m | k.eval(masks, adjacent)),
             Node::Not(_) => 0, // only valid under And, handled there (Query::check)
         }
     }

@@ -281,6 +281,7 @@ mod tests {
         };
         let queries: &[&[&str]] = &[&["t0"], &["t1", "t3"], &["t2", "t150", "t299"], &["t5", "t40", "t80", "t200"], &["t0", "missing"]];
         let mut next = 0;
+        let mut phrase_hits = 0;
         for round in 0..14 {
             // Batches of very different sizes, so the merge policy has work to do.
             let mut added = Vec::new();
@@ -323,7 +324,15 @@ mod tests {
                     check_query(&views(&segs), &q, &brute_rows(&rows, &q, Params::default(), &Analyzer::whitespace()));
                 }
             }
+            // positions survive merges: phrases of common words, which occur in a row
+            for phrase in [&["t0", "t0"][..], &["t1", "t0"], &["t0", "t2", "t0"]] {
+                let q = Query::Phrase(phrase.iter().map(|t| t.to_string()).collect());
+                let want = brute_rows(&rows, &q, Params::default(), &Analyzer::whitespace());
+                phrase_hits += want.len();
+                check_query(&views(&segs), &q, &want);
+            }
         }
+        assert!(phrase_hits > 100, "the phrases match: {phrase_hits}");
         let files: HashSet<String> = fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         let used = c.snapshot().iter().flat_map(|s| [Some(s.file.clone()), s.del_file.clone()]).flatten().count();
         assert_eq!(files.len(), used + 2, "only live files, MANIFEST and LOCK remain: {files:?}");
