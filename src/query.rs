@@ -17,6 +17,11 @@ use crate::{bad_input, Analyzer};
 /// Deepest nesting a query may have: deeper ones are refused rather than risk the stack.
 const MAX_DEPTH: usize = 64;
 
+/// Longest wildcard pattern, in characters. Matching one against a term can take as many steps as
+/// the two lengths multiplied, and a term can be long (a base64 blob): 256 times a megabyte is
+/// about 0.2 seconds.
+const MAX_WILDCARD: usize = 256;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Query {
     Term(String),
@@ -142,8 +147,9 @@ impl Query {
     }
 
     /// Refuses nesting deeper than `MAX_DEPTH`, a NOT anywhere but under an AND with a positive
-    /// child, a fuzzy distance other than 1 or 2 and a regex that doesn't compile. The search
-    /// functions call it too; hosts that build queries in code can call it first.
+    /// child, a fuzzy distance other than 1 or 2, a regex that doesn't compile and a wildcard longer
+    /// than `MAX_WILDCARD`. The search functions call it too; hosts that build queries in code can
+    /// call it first.
     pub fn check(&self) -> io::Result<()> {
         self.check_at(1, false, true)
     }
@@ -190,11 +196,15 @@ impl Query {
     }
 
     /// For a prefix, wildcard, fuzzy or regex node, what tests a term against it; None for the
-    /// other kinds. Fails on a fuzzy distance other than 1 or 2 and on a regex that doesn't compile.
+    /// other kinds. Fails on a fuzzy distance other than 1 or 2, a regex that doesn't compile and a
+    /// wildcard longer than `MAX_WILDCARD`.
     pub(crate) fn matcher(&self) -> io::Result<Option<Matcher>> {
         let (prefix, kind) = match self {
             Query::Prefix(start) => (start.as_str(), Kind::Prefix),
             Query::Wildcard(pattern) => {
+                if pattern.chars().count() > MAX_WILDCARD {
+                    return Err(bad_input(format!("a wildcard may be {MAX_WILDCARD} characters long")));
+                }
                 // the text before the first wildcard, what lies from there to the last one, the text after
                 let (start, rest) = pattern.split_at(pattern.find(['*', '?']).unwrap_or(pattern.len()));
                 let (middle, end) = rest.split_at(rest.rfind(['*', '?']).map_or(0, |last| last + 1));
@@ -761,6 +771,14 @@ mod tests {
         for (pattern, start) in [("inter*al", "inter"), ("in?er*", "in"), ("*ation", ""), ("abc", "abc")] {
             assert_eq!(Wildcard(pattern.into()).matcher().unwrap().unwrap().prefix(), start.as_bytes(), "{pattern}");
         }
+        // Matching can take the pattern's length times the term's: so a long pattern is refused, and
+        // the longest allowed is quick enough on a long term (a megabyte, as a base64 blob makes).
+        let (long, start) = ("a".repeat(1_000_000), std::time::Instant::now());
+        let many = |end: &str| Wildcard(format!("*{}{end}", "?".repeat(MAX_WILDCARD - 3)));
+        assert!(!hits(&many("b*"), &long) && hits(&many("a"), &long) && !hits(&many("*b"), &long));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+        assert!(Wildcard("é".repeat(MAX_WILDCARD)).check().is_ok());
+        assert_eq!(Wildcard("é".repeat(MAX_WILDCARD + 1)).check().unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

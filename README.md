@@ -105,7 +105,8 @@ Rules for valid queries:
   row. In text, `-a -b` is refused. In `Query` values built in code, so is an `Or` holding a `Not`:
   only the text syntax rewrites it. `Query::check` tests a value up front.
 - Nesting deeper than 64 is refused.
-- So are a fuzzy distance other than 1 or 2 and a regex that doesn't compile.
+- So are a fuzzy distance other than 1 or 2, a regex that doesn't compile and a wildcard longer than
+  256 characters.
 
 A row matches by ordinary boolean logic. It scores the sum of the BM25 scores of the query's
 positive terms (those not under a NOT) that it contains. `Query::matches(&terms)` checks one row's
