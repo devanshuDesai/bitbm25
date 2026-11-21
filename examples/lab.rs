@@ -7,6 +7,8 @@
 //!   lab bench <index> <queries.tsv> [reps]            time top-10 and count per query kind, check exactness
 //!   lab hot <index> <queries.tsv> <kind> <top10|count> <seconds>   one workload in a loop, to profile
 //!
+//! `bench` with DUMP=<file> also appends each query's best time (kind, mode, query number, ms).
+//!
 //! Timings are per query, best of `reps` passes, so a noisy machine inflates them less.
 
 use std::io::{BufRead, BufReader};
@@ -168,6 +170,11 @@ fn bench(index: &str, queries: &str, reps: usize) -> std::io::Result<()> {
             // Exactness: pruned top-k equals the exhaustive one (first 50 queries; it is slow).
             let exact = mode == "count"
                 || qs.iter().take(50).all(|q| bitbm25::top_k(&segs, q, k).unwrap() == bitbm25::top_k_exhaustive(&segs, q, k).unwrap());
+            if let Ok(path) = std::env::var("DUMP") {
+                // per-query best times, to compare engines query by query
+                let lines: String = best.iter().enumerate().map(|(i, ms)| format!("{name}\t{mode}\t{i}\t{ms:.4}\n")).collect();
+                std::io::Write::write_all(&mut std::fs::OpenOptions::new().create(true).append(true).open(path)?, lines.as_bytes())?;
+            }
             let (total, n) = (best.iter().sum::<f64>(), qs.len() as f64);
             best.sort_by(f64::total_cmp);
             let pct = |p: f64| best[((best.len() - 1) as f64 * p) as usize];

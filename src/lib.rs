@@ -183,7 +183,9 @@ impl<T: Plain> Arr<T> {
 }
 
 /// A segment as a query sees it: its index, and the rows to leave out as one bit per row (empty
-/// if none). The host decides what is left out: deleted rows, or any filter of its own.
+/// if none). The host decides what is left out: deleted rows, or any filter of its own. Bit `r` is
+/// the index's row `r`, which is not the `r`-th row added (rows are kept in order of length unless
+/// built with `Order::Added`): find a row with `Index::row_of(id)`.
 pub type SegView<'a> = (&'a Index, &'a [u64]);
 
 /// Exact BM25 top-k over `segs` as (id, score), best first; ties on score go to the lower id.
@@ -237,7 +239,8 @@ fn search(segs: &[SegView], q: &Query, k: usize, prune: bool) -> io::Result<Vec<
 /// Matches best first, for as long as the caller asks: for a host that drops some rows after the
 /// index (Postgres re-checks each row's visibility) and so can't know k up front. When its hits run
 /// out it reruns top-k with k doubled; ties break on the lower id, so the first k of top-2k are
-/// top-k and the stream never repeats or skips a row. Total work is about twice the final top-k.
+/// top-k and the stream never repeats or skips a row. Reading n hits costs a top-k for each k up to
+/// about 2n: two to four times one top-n, measured (a top-k gets slower as k grows).
 pub struct Cursor<'a> {
     segs: &'a [SegView<'a>],
     q: &'a Query,
@@ -402,7 +405,8 @@ fn prepare<'q, 'a>(segs: &'a [SegView<'a>], q: &'q Query) -> io::Result<Option<(
 }
 
 /// The live rows of `segs` as one new segment, ids kept, in the first segment's row order (by
-/// length, or segment by segment). The segments must share params.
+/// length, or segment by segment). The segments must share params, and either all keep positions
+/// or none do.
 pub fn merge(segs: &[SegView]) -> io::Result<Index> {
     Ok(merged(segs, None)?.finish())
 }
@@ -435,7 +439,10 @@ fn merged(segs: &[SegView], spill: Option<&Path>) -> io::Result<seg::Assembler> 
     let mut new_of: Vec<Vec<u32>> = segs.iter().map(|s| vec![GONE; s.0.rows()]).collect();
     rows.iter().enumerate().for_each(|(new, &(_, s, r))| new_of[s as usize][r as usize] = new as u32);
     let ids = rows.iter().map(|&(_, s, r)| segs[s as usize].0.ids[r as usize]).collect();
-    let positions = segs.iter().all(|s| s.0.has_positions()); // kept only if every segment has them
+    let positions = segs.iter().any(|s| s.0.has_positions());
+    if segs.iter().any(|s| s.0.has_positions() != positions) {
+        return Err(bad_input("segments with and without positions can't be merged: phrases would stop working"));
+    }
     let mut asm = seg::Assembler::new(params, order, positions, rows.iter().map(|r| r.0).collect(), ids);
     if let Some(dir) = spill {
         asm = asm.spill(dir)?;
@@ -529,15 +536,25 @@ fn build_in(
 ) -> io::Result<()> {
     let (send, recv) = std::sync::mpsc::sync_channel::<(usize, Vec<(u64, String)>)>(threads.max(1));
     let recv = std::sync::Mutex::new(recv);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let index = |i: usize, batch: Vec<(u64, String)>| -> io::Result<()> {
+        let mut b = builder()?;
+        for (id, text) in batch {
+            b.add(id, &text)?;
+        }
+        b.finish().save(parts.join(format!("{i}.seg")))
+    };
     let work = || -> io::Result<()> {
+        let mut result = Ok(());
         loop {
             let next = recv.lock().expect("no worker panics holding it").recv();
-            let Ok((i, batch)) = next else { return Ok(()) }; // the sender is done
-            let mut b = builder()?;
-            for (id, text) in batch {
-                b.add(id, &text)?;
+            let Ok((i, batch)) = next else { return result }; // the sender is done
+            // After a failure, keep taking batches (and dropping them): the feeder must never wait
+            // on a queue nobody empties. It stops at its next row.
+            if result.is_ok() {
+                result = index(i, batch);
+                failed.fetch_or(result.is_err(), std::sync::atomic::Ordering::Relaxed);
             }
-            b.finish().save(parts.join(format!("{i}.seg")))?;
         }
     };
     let n = std::thread::scope(|scope| {
@@ -545,6 +562,9 @@ fn build_in(
         let (mut n, mut batch, mut bytes) = (0, Vec::new(), 0);
         let mut fed = Ok(());
         for doc in docs {
+            if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                break; // reported below
+            }
             match doc {
                 Ok(doc) => {
                     bytes += doc.1.len();
@@ -557,13 +577,12 @@ fn build_in(
             }
             if bytes >= batch_bytes {
                 // a full queue blocks here, which is what bounds memory
-                if send.send((n, std::mem::take(&mut batch))).is_err() {
-                    break; // every worker has stopped on an error, reported below
-                }
+                send.send((n, std::mem::take(&mut batch))).expect("workers take batches until the sender is dropped");
                 (n, bytes) = (n + 1, 0);
             }
         }
-        if !batch.is_empty() && send.send((n, batch)).is_ok() {
+        if !batch.is_empty() {
+            send.send((n, batch)).expect("workers take batches until the sender is dropped");
             n += 1;
         }
         drop(send);
@@ -1163,6 +1182,11 @@ mod tests {
         assert_eq!(top_k(&[(&a, &[])], &not, 10).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(count(&[(&a, &[])], &not).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(top_k(&[], &q, 10).unwrap().is_empty());
+        // a merge would drop the positions of the segments that have them
+        let mut c = Builder::new(Params::default(), Analyzer::whitespace()).unwrap().positions(false);
+        c.add(2, "t0").unwrap();
+        let c = c.finish();
+        assert_eq!(merge(&[(&a, &[]), (&c, &[])]).err().map(|e| e.kind()), Some(io::ErrorKind::InvalidInput));
     }
 
     #[test]
@@ -1293,6 +1317,10 @@ mod tests {
         let bad = [Ok((0, "a".to_string())), Err(bad_input("no more"))].into_iter();
         assert!(build_batched(&file.0, bad, || Builder::new(Params::default(), Analyzer::whitespace()), 2, 100).is_err());
         assert!(!file.0.with_extension("parts").exists(), "temporary segments are removed after a failure too");
+        // Workers that all fail end the build with their error; the feeder used to wait forever on
+        // the full queue they no longer emptied.
+        let rows = docs.iter().enumerate().map(|(i, d)| Ok((i as u64, d.clone())));
+        assert!(build_batched(&file.0, rows, || Err(bad_input("no builder")), 2, 100).is_err());
     }
 
     #[test]
@@ -1360,6 +1388,30 @@ mod tests {
             let rows = top_k(&[(&idx, &[])], &Query::words(&["a", "b"], and), 10).unwrap();
             let rows: Vec<u64> = rows.into_iter().map(|(r, _)| r).collect();
             assert_eq!(rows, (0..10).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn ties_survive_rounding_over_thousands_of_terms() {
+        // Every row holds the same 3,000 terms once (k1 = 14, b = 0: each term's bound byte is exact,
+        // so the margins are all the slack there is), and every row ties. Summed in f32, the score
+        // drifts above the summed bounds by more than the margins and the blocks holding the lowest
+        // ids (the last ones) were skipped. Empty rows elsewhere vary the idf.
+        let p = Params { k1: 14.0, b: 0.0 };
+        let text = (0..3000).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let mut b = Builder::new(p, Analyzer::whitespace()).unwrap().positions(false);
+        (0..640u64).for_each(|row| b.add(640 - row, &text).unwrap()); // the lowest ids in the last block
+        let a = b.finish();
+        let words: Vec<String> = (0..3000).map(|i| format!("w{i}")).collect();
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        for fillers in [10, 25, 26, 90] {
+            let mut b = Builder::new(p, Analyzer::whitespace()).unwrap().positions(false);
+            (0..fillers).for_each(|i| b.add(1_000_000 + i, "").unwrap());
+            let f = b.finish();
+            for and in [false, true] {
+                let hits = top_k(&[(&a, &[]), (&f, &[])], &Query::words(&words, and), 5).unwrap();
+                assert_eq!(hits.iter().map(|h| h.0).collect::<Vec<_>>(), [1, 2, 3, 4, 5], "{fillers} empty rows, and: {and}");
+            }
         }
     }
 }

@@ -17,7 +17,8 @@
 //! the top k.
 //!
 //! Bounds are rounded up and thresholds down wherever they are quantized, and ties on the k-th
-//! score are kept, so results equal exhaustive scoring exactly.
+//! score are kept, so results equal exhaustive scoring exactly. Scores and sums of bounds are added
+//! up in f64, so their rounding stays far inside those margins however many terms a query has.
 
 use crate::seg::{Index, PosCursor, Postings, EDGES, SHIFT, UNKNOWN};
 use crate::{Node, Shape, Stats, TopK};
@@ -347,23 +348,24 @@ impl<'a, 's> Scan<'a, 's> {
         out
     }
 
-    /// Exact score of `row` (in block `b`, whose terms `cur` holds): its scoring terms in plan order.
+    /// Exact score of `row` (in block `b`, whose terms `cur` holds): its scoring terms in plan order,
+    /// each in f32, summed in f64 and rounded once.
     #[cfg_attr(feature = "prof", inline(never))]
     #[cfg_attr(not(feature = "prof"), inline)]
     fn score(&self, b: u32, r: u32) -> f32 {
         let (st, row) = (self.seg.st, (b << SHIFT | r) as usize);
         let norm = st.c0 + st.c1 * self.seg.idx.dl[row] as f32;
-        let mut score = 0f32;
+        let mut score = 0f64;
         for (j, t) in self.scoring() {
             if let Some((m, first)) = self.cur[j] {
                 if m >> r & 1 == 1 {
                     let first = if first == UNKNOWN { t.p.first(b) } else { first };
                     let tf = t.p.tf(first + (m & ((1u64 << r) - 1)).count_ones() as usize) as f32;
-                    score += t.idf * tf * st.k1p1 / (tf + norm);
+                    score += (t.idf * tf * st.k1p1 / (tf + norm)) as f64;
                 }
             }
         }
-        score
+        score as f32
     }
 
     /// Scores `rows` of block `b` into `top`.
@@ -572,11 +574,12 @@ impl<'a, 's> Scan<'a, 's> {
     fn enough_tf(&self, b: u32, mut rows: u64, theta: f32) -> u64 {
         let (st, norm) = (self.seg.st, self.norm[self.seg.idx.blen[b as usize] as usize]);
         let term = |j: usize| self.seg.terms[j].as_ref().expect("a scoring term of this segment");
-        let total: f32 = self.later.iter().map(|&(j, _)| self.bound(j, term(j), b)).sum();
+        let total: f64 = self.later.iter().map(|&(j, _)| self.bound(j, term(j), b) as f64).sum();
         for &(j, _) in &self.later {
             let t = term(j);
             // what the term must score, as a share of the most any tf could: tf / (tf + norm) >= share
-            let share = (theta / (1.0 + 1e-5) - (total - self.bound(j, t, b)) * (1.0 + 1e-5)) / (t.idf * st.k1p1);
+            let others = total - self.bound(j, t, b) as f64;
+            let share = ((theta as f64 / (1.0 + 1e-5) - others * (1.0 + 1e-5)) / (t.idf * st.k1p1) as f64) as f32;
             let least = (share * norm / (1.0 - share) * (1.0 - 1e-4)).ceil();
             if share <= 0.0 || share >= 1.0 || least < 2.0 {
                 continue; // no row is ruled out (a share of 1 or more is left to exact scoring)
@@ -651,7 +654,7 @@ impl<'a, 's> Scan<'a, 's> {
         need.sort_by_key(|&j| term(j).p.df); // rarest first
         let driver = need[0];
         // the most the other terms can add to the driver's own bound, in any block
-        let rest: f32 = need[1..].iter().map(|&j| self.top_bound(term(j))).sum();
+        let rest: f64 = need[1..].iter().map(|&j| self.top_bound(term(j)) as f64).sum();
         let blocks = idx.blocks();
 
         if (term(driver).p.df as u64) * 8 < blocks as u64 {
@@ -660,7 +663,7 @@ impl<'a, 's> Scan<'a, 's> {
                 let mut rows = m & !self.excluded(b);
                 self.cur[driver] = Some((m, first));
                 // Before any lookup: can a row here qualify even if every other term scored its most?
-                if theta(sink).is_some_and(|theta| (self.bound(driver, term(driver), b) + rest) * (1.0 + 1e-5) < theta) {
+                if theta(sink).is_some_and(|theta| (self.bound(driver, term(driver), b) as f64 + rest) * (1.0 + 1e-5) < theta as f64) {
                     return;
                 }
                 for &j in &need[1..] {
@@ -715,7 +718,7 @@ impl<'a, 's> Scan<'a, 's> {
             return emit(idx, b, rows, sink);
         };
         // Every match holds every term, so the block's bound is each term's, summed.
-        if theta.is_some_and(|theta| need.iter().map(|&j| self.bound(j, term(j), b)).sum::<f32>() * (1.0 + 1e-5) < theta) {
+        if theta.is_some_and(|theta| need.iter().map(|&j| self.bound(j, term(j), b) as f64).sum::<f64>() * (1.0 + 1e-5) < theta as f64) {
             return;
         }
         if phrases.is_empty() {

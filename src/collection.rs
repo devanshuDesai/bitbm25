@@ -4,7 +4,8 @@
 //! Adds go to an in-memory builder and deletes to a pending list; `commit` writes the builder out as
 //! a new segment, applies the deletes, merges segments, and then replaces the MANIFEST, which is the
 //! commit point: a crash before it leaves the previous commit, and unreferenced files are removed on
-//! the next open or commit. Queries see the last commit and never wait for one.
+//! the next open or commit. A commit that fails keeps its adds and deletes for the next one. Queries
+//! see the last commit and never wait for one.
 //!
 //! Each row has an id, assigned in increasing order and kept through merges. Segments hold disjoint,
 //! increasing ranges of ids; a segment finds an id's row with `Index::row_of`.
@@ -41,6 +42,10 @@ impl Seg {
 
 struct Writer {
     buf: Builder,
+    // Rows a commit took from `buf` and then failed to commit, oldest first: saved as segment files,
+    // then (if saving failed) one still in memory. The next commit starts from them.
+    staged: Vec<Seg>,
+    unsaved: Option<Index>,
     pending: Vec<u64>, // ids to delete at the next commit
     next_id: u64,
     next_file: u64,
@@ -59,6 +64,7 @@ impl Collection {
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+        let ours = dir.join("LOCK").exists(); // opened as a collection before: its leftovers are ours to remove
         let lock = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("LOCK"))?;
         lock.try_lock().map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "collection is open elsewhere"))?;
         let (mut next_id, mut next_file, mut segs) = (0, 0, Vec::new());
@@ -87,12 +93,14 @@ impl Collection {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        remove_unreferenced(&dir, &segs)?;
+        if ours {
+            remove_unreferenced(&dir, &segs)?;
+        }
         Ok(Collection {
             dir,
             _lock: lock,
             snap: RwLock::new(Arc::new(segs)),
-            w: Mutex::new(Writer { buf: new_builder(), pending: Vec::new(), next_id, next_file }),
+            w: Mutex::new(Writer { buf: new_builder(), staged: Vec::new(), unsaved: None, pending: Vec::new(), next_id, next_file }),
         })
     }
 
@@ -106,20 +114,35 @@ impl Collection {
         Ok(id)
     }
 
-    /// Deletes the row with this id at the next `commit`; ids that don't exist are ignored.
+    /// Deletes the row with this id at the next `commit`; ids that don't exist are ignored, including
+    /// ones not assigned yet (a later `add` gets them).
     pub fn delete(&self, id: u64) {
-        self.w.lock().unwrap().pending.push(id);
+        let mut w = self.w.lock().unwrap();
+        if id < w.next_id {
+            w.pending.push(id);
+        }
     }
 
     /// Makes adds and deletes since the last commit durable and visible, and merges segments.
     pub fn commit(&self) -> io::Result<()> {
-        let mut w = self.w.lock().unwrap();
-        let mut segs: Vec<Seg> = self.snapshot().as_ref().clone();
-        if w.buf.rows() > 0 {
-            let idx = std::mem::replace(&mut w.buf, new_builder()).finish();
-            segs.push(self.write_segment(&mut w.next_file, idx)?);
+        let mut guard = self.w.lock().unwrap();
+        let w = &mut *guard;
+        // Nothing below changes `w` but file numbers until the MANIFEST is written: a commit that
+        // fails leaves its rows staged and its deletes pending, and the next one does it all again.
+        loop {
+            if w.unsaved.is_none() {
+                if w.buf.rows() == 0 {
+                    break;
+                }
+                w.unsaved = Some(std::mem::replace(&mut w.buf, new_builder()).finish());
+            }
+            let seg = self.write_segment(&mut w.next_file, w.unsaved.as_ref().expect("set above"))?;
+            w.staged.push(seg);
+            w.unsaved = None; // the mapped file serves the rows now, so the heap copy goes
         }
-        for id in std::mem::take(&mut w.pending) {
+        let mut segs: Vec<Seg> = self.snapshot().as_ref().clone();
+        segs.extend(w.staged.iter().cloned());
+        for &id in &w.pending {
             let Some((s, row)) = segs.iter_mut().find_map(|s| s.idx.row_of(id).map(|row| (s, row))) else { continue };
             if s.del.is_empty() {
                 s.del = vec![0; s.idx.rows().div_ceil(64)];
@@ -162,22 +185,23 @@ impl Collection {
             manifest += &format!("{} {}\n", s.file, s.del_file.as_deref().unwrap_or("-"));
         }
         replace_file(&self.dir.join("MANIFEST"), |f| f.write_all(manifest.as_bytes()))?;
-        remove_unreferenced(&self.dir, &segs)?; // open snapshots keep their files mapped
-        *self.snap.write().unwrap() = Arc::new(segs);
-        Ok(())
+        (w.staged, w.pending) = (Vec::new(), Vec::new()); // committed
+        *self.snap.write().unwrap() = Arc::new(segs.clone());
+        // Open snapshots keep their files mapped. Files left here are removed by the next commit or open.
+        remove_unreferenced(&self.dir, &segs)
     }
 
-    fn write_segment(&self, next_file: &mut u64, idx: Index) -> io::Result<Seg> {
+    /// Saves `idx` as the next segment file and maps it.
+    fn write_segment(&self, next_file: &mut u64, idx: &Index) -> io::Result<Seg> {
         let file = format!("{next_file}.seg");
         *next_file += 1;
         idx.save(self.dir.join(&file))?;
-        drop(idx); // serve the mapped file instead, so the heap copy is freed
         let idx = Arc::new(Index::open(self.dir.join(&file))?);
         Ok(Seg { file, idx, del: Vec::new(), deleted: 0, del_file: None })
     }
 
     fn merged(&self, next_file: &mut u64, segs: &[Seg]) -> io::Result<Seg> {
-        self.write_segment(next_file, merge(&views(segs))?)
+        self.write_segment(next_file, &merge(&views(segs))?)
     }
 
     fn snapshot(&self) -> Arc<Vec<Seg>> {
@@ -239,14 +263,19 @@ fn read_del(path: &Path, rows: usize) -> io::Result<Vec<u64>> {
 }
 
 /// Removes segment, deleted-rows and temporary files that `segs` doesn't use: left by merges, or by
-/// a commit that crashed before writing its MANIFEST.
+/// a commit that failed or crashed before writing its MANIFEST. Only names a collection gives its
+/// files are touched: `<n>.seg`, `<n>.del`, those with `.tmp` added, and `MANIFEST.tmp`.
 fn remove_unreferenced(dir: &Path, segs: &[Seg]) -> io::Result<()> {
     let keep: HashSet<&str> = segs.iter().flat_map(|s| [Some(s.file.as_str()), s.del_file.as_deref()]).flatten().collect();
+    let named = |name: &str| {
+        let name = name.strip_suffix(".tmp").unwrap_or(name);
+        let num = name.strip_suffix(".seg").or_else(|| name.strip_suffix(".del"));
+        name == "MANIFEST" || num.is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+    };
     for entry in fs::read_dir(dir)? {
         let name = entry?.file_name();
         let Some(name) = name.to_str() else { continue };
-        let ours = [".seg", ".del", ".tmp"].iter().any(|ext| name.ends_with(ext));
-        if ours && !keep.contains(name) {
+        if named(name) && name != "MANIFEST" && !keep.contains(name) {
             fs::remove_file(dir.join(name))?;
         }
     }
@@ -336,6 +365,51 @@ mod tests {
         let files: HashSet<String> = fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         let used = c.snapshot().iter().flat_map(|s| [Some(s.file.clone()), s.del_file.clone()]).flatten().count();
         assert_eq!(files.len(), used + 2, "only live files, MANIFEST and LOCK remain: {files:?}");
+    }
+
+    #[test]
+    fn a_failed_commit_keeps_its_adds_and_deletes() {
+        let dir = TempPath::new("late-fail");
+        let c = Collection::open(&dir.0).unwrap();
+        let keep = c.add("alpha beta").unwrap();
+        c.commit().unwrap();
+        c.add("gamma delta").unwrap();
+        c.delete(keep);
+        let count = |c: &Collection, w: &str| c.count(&Query::words(&[w], false)).unwrap();
+        // The MANIFEST can't be replaced (its temp file can't be created over a directory), and a
+        // segment can't be saved either (its temp name is taken the same way): two kinds of failure.
+        for blocked in ["MANIFEST.tmp", "2.seg.tmp"] {
+            fs::create_dir(dir.0.join(blocked)).unwrap();
+            assert!(c.commit().is_err());
+            fs::remove_dir(dir.0.join(blocked)).unwrap();
+            assert_eq!((count(&c, "gamma"), count(&c, "alpha")), (0, 1), "a failed commit changes nothing visible");
+            c.add("epsilon").unwrap(); // rows added after a failed commit come after its rows
+        }
+        c.commit().unwrap();
+        let check = |c: &Collection| {
+            assert_eq!((count(c, "gamma"), count(c, "alpha"), count(c, "epsilon")), (1, 0, 2), "the retry committed what failed");
+            assert_eq!(c.len(), 3);
+        };
+        check(&c);
+        drop(c);
+        check(&Collection::open(&dir.0).unwrap());
+    }
+
+    #[test]
+    fn deletes_touch_only_assigned_ids_and_open_only_its_own_files() {
+        let dir = TempPath::new("foreign");
+        fs::create_dir_all(&dir.0).unwrap();
+        let theirs = ["wiki.seg", "download.tmp", "rows.del", "7.seg"];
+        theirs.iter().for_each(|f| fs::write(dir.0.join(f), b"someone else's file").unwrap());
+        let c = Collection::open(&dir.0).unwrap();
+        c.delete(0); // nothing has id 0 yet: ignored, not left to delete the row that gets it
+        c.add("alpha").unwrap();
+        c.commit().unwrap();
+        assert_eq!(c.count(&Query::words(&["alpha"], false)).unwrap(), 1);
+        drop(c);
+        drop(Collection::open(&dir.0).unwrap());
+        assert!(theirs[..3].iter().all(|f| dir.0.join(f).exists()), "files a collection never names are left alone");
+        assert!(!dir.0.join("7.seg").exists(), "a segment name in a directory opened as a collection is the collection's");
     }
 
     #[test]
