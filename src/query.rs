@@ -121,32 +121,39 @@ impl Query {
     }
 
     /// Whether a row with these terms (from the same analyzer as the index) matches. A query that
-    /// fails `check` matches nothing.
+    /// fails `check` matches nothing. Each pattern is built on every call, a regex compiled: to
+    /// re-check many rows, call this on what `expand` makes of the query instead.
     pub fn matches(&self, terms: &[String]) -> bool {
         let set: HashSet<&str> = terms.iter().map(String::as_str).collect();
-        self.check().is_ok() && self.eval(&set, terms)
+        self.check_shape().is_ok() && self.eval(&set, terms).unwrap_or(false)
     }
 
-    /// `row` is the row's terms in order, `set` the same as a set.
-    fn eval(&self, set: &HashSet<&str>, row: &[String]) -> bool {
-        match self {
+    /// `row` is the row's terms in order, `set` the same as a set. Reads every part, so that a
+    /// pattern that fails to build fails the query wherever it sits, and builds each pattern once.
+    fn eval(&self, set: &HashSet<&str>, row: &[String]) -> io::Result<bool> {
+        Ok(match self {
             Query::Term(t) => set.contains(t.as_str()),
             Query::Phrase(ts) => !ts.is_empty() && row.windows(ts.len()).any(|w| w == &ts[..]),
-            Query::And(qs) => !qs.is_empty() && qs.iter().all(|q| q.eval(set, row)),
-            Query::Or(qs) => qs.iter().any(|q| q.eval(set, row)),
-            Query::Not(q) => !q.eval(set, row),
-            pattern => pattern.matcher().ok().flatten().is_some_and(|mut m| set.iter().any(|t| m.matches(t.as_bytes()))),
-        }
+            Query::And(qs) => qs.iter().try_fold(!qs.is_empty(), |all, q| q.eval(set, row).map(|m| all & m))?,
+            Query::Or(qs) => qs.iter().try_fold(false, |any, q| q.eval(set, row).map(|m| any | m))?,
+            Query::Not(q) => !q.eval(set, row)?,
+            pattern => pattern.matcher()?.is_some_and(|mut m| set.iter().any(|t| m.matches(t.as_bytes()))),
+        })
     }
 
     /// Refuses nesting deeper than `MAX_DEPTH`, a NOT anywhere but under an AND with a positive
     /// child, a fuzzy distance other than 1 or 2 and a regex that doesn't compile. The search
     /// functions call it too; hosts that build queries in code can call it first.
     pub fn check(&self) -> io::Result<()> {
-        self.check_at(1, false)
+        self.check_at(1, false, true)
     }
 
-    fn check_at(&self, depth: usize, not_ok: bool) -> io::Result<()> {
+    /// `check` but for building the patterns, the costly part: for a caller that builds them next.
+    pub(crate) fn check_shape(&self) -> io::Result<()> {
+        self.check_at(1, false, false)
+    }
+
+    fn check_at(&self, depth: usize, not_ok: bool, build: bool) -> io::Result<()> {
         // a pattern becomes an OR of terms, which are one level deeper
         let pattern = matches!(self, Query::Prefix(_) | Query::Wildcard(_) | Query::Fuzzy { .. } | Query::Regex(_));
         if depth + pattern as usize > MAX_DEPTH {
@@ -155,13 +162,14 @@ impl Query {
         match self {
             Query::Term(_) | Query::Phrase(_) => Ok(()),
             Query::Not(_) if !not_ok => Err(bad_input("NOT must sit in an AND with a positive term")),
-            Query::Not(q) => q.check_at(depth + 1, false),
-            Query::Or(qs) => qs.iter().try_for_each(|q| q.check_at(depth + 1, false)),
+            Query::Not(q) => q.check_at(depth + 1, false, build),
+            Query::Or(qs) => qs.iter().try_for_each(|q| q.check_at(depth + 1, false, build)),
             Query::And(qs) => {
                 let positive = qs.iter().any(|q| !matches!(q, Query::Not(_)));
-                qs.iter().try_for_each(|q| q.check_at(depth + 1, positive))
+                qs.iter().try_for_each(|q| q.check_at(depth + 1, positive, build))
             }
-            pattern => pattern.matcher().map(drop),
+            pattern if build => pattern.matcher().map(drop),
+            _ => Ok(()),
         }
     }
 

@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::{self, BufWriter};
 use std::ops::Deref;
@@ -190,7 +190,7 @@ pub type SegView<'a> = (&'a Index, &'a [u64]);
 /// Exact BM25 top-k over `segs` as (id, score), best first; ties on score go to the lower id.
 /// Statistics (row count, document frequencies, average length) cover every row of every segment,
 /// left-out rows included. Fails on a query that fails `Query::check` (as `parse`'s output never
-/// does) or segments built with different k1/b.
+/// does) or whose patterns are past `expand`'s limits, and on segments built with different k1/b.
 pub fn top_k(segs: &[SegView], q: &Query, k: usize) -> io::Result<Vec<(u64, f32)>> {
     search(segs, &*expand(segs, q)?, k, true)
 }
@@ -224,52 +224,68 @@ pub fn for_each_match(segs: &[SegView], q: &Query, mut f: impl FnMut(u64)) -> io
     Ok(())
 }
 
-/// `q` with each pattern (prefix, wildcard, fuzzy, regex) replaced by the OR of the terms it
-/// matches among those of `segs`, in order, each once: none, if nothing matches. A pattern right
-/// under an OR joins it, so that `a b*` stays a flat OR. Everything after this sees only terms.
-/// Borrows `q` if it holds no pattern; fails if it fails `Query::check`.
-fn expand<'q>(segs: &[SegView], q: &'q Query) -> io::Result<Cow<'q, Query>> {
-    /// The terms `q` matches if it is a pattern, None if it isn't one.
-    fn matching(segs: &[SegView], q: &Query) -> io::Result<Option<Vec<Query>>> {
-        let Some(mut pattern) = q.matcher()? else { return Ok(None) };
-        let mut found: Vec<String> = Vec::new();
-        for (idx, _) in segs {
-            // the lexicon is sorted, so the terms starting with the pattern's prefix are a run of it
-            let mut terms = idx.terms_from(pattern.prefix());
-            while terms.next().is_some() && terms.term().starts_with(pattern.prefix()) {
-                if pattern.matches(terms.term()) {
-                    // a term is UTF-8 unless the file is corrupt
-                    if let Ok(term) = std::str::from_utf8(terms.term()) {
-                        found.push(term.into());
-                    }
-                } else if let Some(n) = pattern.dead() {
-                    terms.skip_groups(n);
-                }
-            }
-        }
-        found.sort_unstable();
-        found.dedup();
-        Ok(Some(found.into_iter().map(Query::Term).collect()))
+/// Most patterns a query may hold: each may read a whole lexicon (one that fixes no start does),
+/// and a regex can take tens of milliseconds to compile.
+const MAX_PATTERNS: usize = 16;
+
+/// Most terms a query's patterns may stand for in all. A search looks every term under an AND or a
+/// NOT up in each block of rows, so this many there cost about two seconds per million rows; a
+/// query past it is refused, rather than left to run for minutes or to fill memory.
+const MAX_TERMS: usize = 1 << 13;
+
+/// `q` with each pattern (prefix, wildcard, fuzzy, regex) replaced by the OR of the terms of `segs`
+/// it matches, in order: none, if nothing matches. The searches run this. The patterns right under
+/// an OR join it as one set of terms, so that `a b* c*` stays a flat OR and holds each term once.
+/// Borrows `q` if it holds no pattern.
+///
+/// Fails if `q` fails `Query::check`, holds more than 16 patterns, or its patterns stand for more
+/// than 8,192 terms (a term that several patterns of one OR match counts once). Each row of `segs`
+/// matches what this returns as it matches `q`: a host re-checking many rows calls `Query::matches`
+/// on this, which looks terms up, where on `q` it would build the patterns again for every row.
+pub fn expand<'q>(segs: &[SegView], q: &'q Query) -> io::Result<Cow<'q, Query>> {
+    /// What the query may still use: patterns, and terms they stand for.
+    struct Left {
+        patterns: usize,
+        terms: usize,
     }
-    fn walk(segs: &[SegView], q: &Query) -> io::Result<Query> {
-        if let Some(terms) = matching(segs, q)? {
-            return Ok(Query::Or(terms));
-        }
-        let all = |qs: &[Query]| qs.iter().map(|q| walk(segs, q)).collect::<io::Result<Vec<Query>>>();
-        Ok(match q {
-            Query::And(qs) => Query::And(all(qs)?),
-            Query::Or(qs) => {
-                let mut kids = Vec::with_capacity(qs.len());
-                for q in qs {
-                    match matching(segs, q)? {
-                        Some(terms) => kids.extend(terms),
-                        None => kids.push(walk(segs, q)?),
+    /// The OR of `qs`, its patterns replaced by the terms they match.
+    fn or(segs: &[SegView], qs: &[Query], left: &mut Left) -> io::Result<Query> {
+        let (mut kids, mut found) = (Vec::new(), BTreeSet::new());
+        for q in qs {
+            let Some(mut pattern) = q.matcher()? else {
+                kids.push(walk(segs, q, left)?);
+                continue;
+            };
+            left.patterns = left.patterns.checked_sub(1).ok_or_else(|| bad_input(format!("a query may hold at most {MAX_PATTERNS} patterns")))?;
+            for (idx, _) in segs {
+                // the lexicon is sorted, so the terms starting with the pattern's prefix are a run of it
+                let mut terms = idx.terms_from(pattern.prefix());
+                while terms.next().is_some() && terms.term().starts_with(pattern.prefix()) {
+                    if pattern.matches(terms.term()) {
+                        // a term is UTF-8 unless the file is corrupt
+                        if let Ok(term) = std::str::from_utf8(terms.term()) {
+                            found.insert(term.to_string());
+                        }
+                        if found.len() > left.terms {
+                            return Err(bad_input(format!("{q:?} takes the query's patterns past {MAX_TERMS} terms")));
+                        }
+                    } else if let Some(n) = pattern.dead() {
+                        terms.skip_groups(n);
                     }
                 }
-                Query::Or(kids)
             }
-            Query::Not(q) => Query::Not(Box::new(walk(segs, q)?)),
-            leaf => leaf.clone(),
+        }
+        left.terms -= found.len();
+        kids.extend(found.into_iter().map(Query::Term));
+        Ok(Query::Or(kids))
+    }
+    fn walk(segs: &[SegView], q: &Query, left: &mut Left) -> io::Result<Query> {
+        Ok(match q {
+            Query::Term(_) | Query::Phrase(_) => q.clone(),
+            Query::And(qs) => Query::And(qs.iter().map(|q| walk(segs, q, left)).collect::<io::Result<_>>()?),
+            Query::Or(qs) => or(segs, qs, left)?,
+            Query::Not(q) => Query::Not(Box::new(walk(segs, q, left)?)),
+            pattern => or(segs, std::slice::from_ref(pattern), left)?,
         })
     }
     fn has_pattern(q: &Query) -> bool {
@@ -280,8 +296,13 @@ fn expand<'q>(segs: &[SegView], q: &'q Query) -> io::Result<Cow<'q, Query>> {
             _ => true,
         }
     }
-    q.check()?; // the walks below recurse, which is safe once the depth is known to be bounded
-    Ok(if has_pattern(q) { Cow::Owned(walk(segs, q)?) } else { Cow::Borrowed(q) })
+    // The walks recurse, which is safe once the depth is known to be bounded; they build each
+    // pattern, refusing a bad one, so it is compiled once.
+    q.check_shape()?;
+    if !has_pattern(q) {
+        return Ok(Cow::Borrowed(q));
+    }
+    Ok(Cow::Owned(walk(segs, q, &mut Left { patterns: MAX_PATTERNS, terms: MAX_TERMS })?))
 }
 
 fn search(segs: &[SegView], q: &Query, k: usize, prune: bool) -> io::Result<Vec<(u64, f32)>> {
@@ -1203,10 +1224,13 @@ mod tests {
                 // alone, a pattern becomes its terms in order, each once though several segments hold it
                 assert_eq!(*expand(&views, q).unwrap(), by_hand, "{q:?}");
             }
-            // a host re-checking a row gets the same answer from the row's terms alone
+            // a host re-checking a row gets the same answer from the row's terms alone, with the query
+            // or with what `expand` makes of it
+            let expanded = expand(&views, q).unwrap();
             for d in docs.iter().step_by(docs.len() / 20 + 1) {
                 let terms = analyzer.terms(d);
                 assert_eq!(q.matches(&terms), by_hand.matches(&terms), "{q:?} on {d:?}");
+                assert_eq!(expanded.matches(&terms), by_hand.matches(&terms), "{q:?} on {d:?}");
             }
         }
         matched
@@ -1314,9 +1338,16 @@ mod tests {
         for q in &patterns {
             check_query(&[(&whole, &[])], q, &brute(&docs, &expanded_by_hand(q, &vocab)));
         }
-        // a pattern right under an OR joins it, so the query stays a flat OR
-        let q = Query::Or(vec![Query::Term("form".into()), Query::Prefix("caf".into()), Query::Term("act".into())]);
-        assert_eq!(*expand(&[(&whole, &[])], &q).unwrap(), Query::words(&["form", "cafe", "cafes", "caffè", "café", "act"], false));
+        // The patterns right under an OR join it, after its other parts, as one set of terms: the query
+        // stays a flat OR, and a term two patterns match is in it once.
+        let whole_views = [(&whole, &[][..])];
+        let (t, pre) = (|s: &str| Query::Term(s.into()), |s: &str| Query::Prefix(s.into()));
+        let q = Query::Or(vec![t("form"), pre("caf"), t("act"), Query::Regex("caf+[eè]".into())]);
+        assert_eq!(*expand(&whole_views, &q).unwrap(), Query::words(&["form", "act", "cafe", "cafes", "caffè", "café"], false));
+        for p in &patterns {
+            let twice = Query::Or(vec![p.clone(), p.clone()]);
+            assert_eq!(expand(&whole_views, &twice).unwrap(), expand(&whole_views, p).unwrap(), "{p:?}");
+        }
         // the fuzzy and wildcard ones match several words each
         let several = |q: &&Query| matches!(&*expand(&[(&whole, &[])], q).unwrap(), Query::Or(terms) if terms.len() >= 3);
         let fuzzy_or_wild = |q: &&Query| matches!(q, Query::Fuzzy { .. } | Query::Wildcard(_));
@@ -1349,6 +1380,43 @@ mod tests {
             assert!(errors.iter().all(|e| e.as_ref().is_some_and(|e| e.kind() == io::ErrorKind::InvalidInput)), "{q:?}");
         }
         assert_eq!(count(&[], &Query::Prefix("t".into())).unwrap(), 0);
+    }
+
+    /// A query's patterns may stand for `MAX_TERMS` terms, an OR's counted once, and a query may hold
+    /// `MAX_PATTERNS` of them; past that every way in refuses it, and at the limit a search is quick.
+    #[test]
+    fn pattern_limits() {
+        // MAX_TERMS terms w0000, w0001...; each in 8 rows with x, so that there are 1,024 blocks
+        let mut docs: Vec<String> = (0..8 * MAX_TERMS).map(|i| format!("w{:04} x", i % MAX_TERMS)).collect();
+        docs.push("v y".into());
+        let idx = Index::build(&docs);
+        let views = [(&idx, &[][..])];
+        let (t, pre, not) = (|s: &str| Query::Term(s.into()), |s: &str| Query::Prefix(s.into()), |q| Query::Not(Box::new(q)));
+        // at the limit, nested under an AND or a NOT: exact, and quick though each block looks up every term
+        let start = std::time::Instant::now();
+        assert_eq!(count(&views, &Query::And(vec![t("x"), pre("w")])).unwrap(), 8 * MAX_TERMS as u64);
+        assert_eq!(count(&views, &Query::And(vec![Query::Or(vec![t("x"), t("y")]), not(pre("w"))])).unwrap(), 1);
+        assert_eq!(top_k(&views, &Query::And(vec![t("x"), pre("w0001")]), 100).unwrap().len(), 8);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+        // an OR's patterns are one set of terms however many of them match each term
+        let many = Query::Or(vec![pre("w"), pre("w0"), Query::Wildcard("w*1".into()), pre("w")]);
+        assert_eq!(expand(&views, &many).unwrap(), expand(&views, &pre("w")).unwrap());
+        // One term more, the query's patterns counted together, or one pattern more is refused.
+        let mut fewer: Vec<Query> = (0..MAX_PATTERNS).map(|i| pre(&format!("w{i:04}"))).collect();
+        assert_eq!(count(&views, &Query::Or(fewer.clone())).unwrap(), 8 * MAX_PATTERNS as u64);
+        fewer.push(pre("w9"));
+        let past = [pre(""), Query::And(vec![pre("w"), pre("v")]), Query::And(vec![pre("w"), not(pre("x"))]), Query::Or(fewer)];
+        for q in &past {
+            let errors = [
+                expand(&views, q).err(),
+                top_k(&views, q, 10).err(),
+                top_k_exhaustive(&views, q, 10).err(),
+                count(&views, q).err(),
+                for_each_match(&views, q, |_| ()).err(),
+                Cursor::new(&views, q).err(),
+            ];
+            assert!(errors.iter().all(|e| e.as_ref().is_some_and(|e| e.kind() == io::ErrorKind::InvalidInput)), "{q:?}");
+        }
     }
 
     #[test]
