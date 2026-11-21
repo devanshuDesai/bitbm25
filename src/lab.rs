@@ -54,12 +54,12 @@ pub fn work() -> [u64; 5] {
 }
 
 /// Sets the ranked scan's experiment knobs (`prof` builds): seed blocks per window (0: default),
-/// and whether every window seeds.
-pub fn knobs(seed: u64, always: bool) {
+/// and a mode (1: every window seeds).
+pub fn knobs(seed: u64, mode: u64) {
     #[cfg(feature = "prof")]
     {
         crate::scan::KNOBS[0].store(seed, std::sync::atomic::Ordering::Relaxed);
-        crate::scan::KNOBS[1].store(always as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::scan::KNOBS[1].store(mode, std::sync::atomic::Ordering::Relaxed);
     }
-    let _ = (seed, always);
+    let _ = (seed, mode);
 }

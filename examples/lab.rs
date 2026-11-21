@@ -57,7 +57,7 @@ fn main() -> std::io::Result<()> {
             let idx = Index::open(&args[2])?;
             let segs = [(&idx, &[][..])];
             let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            bitbm25::lab::knobs(env("SEED"), env("SEED_ALWAYS") == 1);
+            bitbm25::lab::knobs(env("SEED"), env("MODE"));
             println!("{:<10} {:>8} {:>8} {:>8} {:>8} | {:>8} {:>8}   (ms and counts per query)", "kind", "total", "setup", "bounds", "blocks", "blocks", "rows");
             for (name, qs) in load(&args[3])? {
                 let mut best = [f64::INFINITY; 4];

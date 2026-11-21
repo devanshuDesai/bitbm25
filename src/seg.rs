@@ -97,6 +97,7 @@ pub(crate) struct Meta {
     pub(crate) df: u32,
     kind: u8,
     l: u8,                  // Elias-Fano low bits
+    top: u8,                // the largest bound byte any of its rows has (see `Postings::top`)
     off: u64,               // first word in `post`
     n_esc: u32,             // TF_SMALL: postings with tf >= 4
     n_big: u32,             // postings whose tf is in the table
@@ -146,7 +147,7 @@ impl Meta {
             }
             return;
         }
-        out.extend_from_slice(&[self.kind, self.l]);
+        out.extend_from_slice(&[self.kind, self.l, self.top]);
         put_varint(out, self.off);
         if self.kind & TF_MASK != 0 {
             put_varint(out, self.n_esc as u64);
@@ -171,8 +172,8 @@ impl Meta {
             }
             return m;
         }
-        (m.kind, m.l) = (bytes[*pos], bytes[*pos + 1]);
-        *pos += 2;
+        (m.kind, m.l, m.top) = (bytes[*pos], bytes[*pos + 1], bytes[*pos + 2]);
+        *pos += 3;
         m.off = get_varint(bytes, pos);
         if m.kind & TF_MASK != 0 {
             m.n_esc = get_varint(bytes, pos) as u32;
@@ -349,6 +350,8 @@ pub(crate) struct Postings<'a> {
     /// there has (under the segment's own average length), in 255ths of k1 + 1, rounded up; 0 where
     /// the term is absent.
     pub(crate) bounds: Option<&'a [u64]>,
+    /// The largest such byte over all the term's rows: the most it can score anywhere.
+    pub(crate) top: u8,
     positions: Positions<'a>,
 }
 
@@ -830,15 +833,19 @@ fn write_term(rows: &[u32], tfs: &[u32], dl: &[u32], avgdl: f64, params: Params,
         post.extend(tfs.iter().enumerate().filter(|(_, &tf)| tf >= cap).map(|(i, &tf)| (i as u64) << 32 | tf as u64));
     }
 
-    // Bounds: per block, the largest tf_part of the term's rows there.
+    // Bounds: the largest tf_part of the term's rows, over all of them and, for terms in at least
+    // half the blocks, per block.
+    let at = post.len();
     if summary {
         m.kind |= BOUNDS;
-        let at = post.len();
         post.resize(at + blocks.div_ceil(8), 0);
-        for (&r, &tf) in rows.iter().zip(tfs) {
+    }
+    for (&r, &tf) in rows.iter().zip(tfs) {
+        let byte = bound_byte(tf, dl[r as usize], avgdl, params);
+        m.top = m.top.max(byte);
+        if summary {
             let (w, o) = (at + (r >> SHIFT) as usize / 8, 8 * ((r >> SHIFT) % 8));
-            let byte = (post[w] >> o & 255).max(bound_byte(tf, dl[r as usize], avgdl, params) as u64);
-            post[w] = post[w] & !(255 << o) | byte << o;
+            post[w] = post[w] & !(255 << o) | (post[w] >> o & 255).max(byte as u64) << o;
         }
     }
     m
@@ -1039,7 +1046,9 @@ impl Index {
                 Some(_) => Positions::Inline { lex: &self.lex, at: [m.pos as u32 as usize, (m.pos >> 32) as usize] },
                 None => Positions::None,
             };
-            return (Postings { df, rows: Rows::Inline(rows), tfs: Tfs::Inline(tfs), bounds: None, positions }, [0; 3]);
+            let byte = |&(row, tf): &(u32, u32)| bound_byte(tf, self.dl[row as usize], self.stats.avgdl, self.stats.params);
+            let top = m.inline[..df].iter().map(byte).max().unwrap_or(0);
+            return (Postings { df, rows: Rows::Inline(rows), tfs: Tfs::Inline(tfs), bounds: None, top, positions }, [0; 3]);
         }
         let (n_rows, blocks) = (self.rows(), self.rows().div_ceil(64));
         let w = &mut &self.post[m.off as usize..];
@@ -1077,7 +1086,7 @@ impl Index {
             }
             None => Positions::None,
         };
-        (Postings { df, rows, tfs, bounds, positions }, [start - after_rows, after_rows - after_tfs, after_tfs - w.len()])
+        (Postings { df, rows, tfs, bounds, top: m.top, positions }, [start - after_rows, after_rows - after_tfs, after_tfs - w.len()])
     }
 
     /// Size of the index's arrays, which is also its file size less a few hundred bytes of header.

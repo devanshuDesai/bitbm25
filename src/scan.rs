@@ -10,7 +10,8 @@
 //!   3. in a block that can, each row's own bound (the sum over the terms that row holds) is formed
 //!      for all 64 rows at once, and only rows that can still qualify are scored exactly.
 //!
-//! ANDs walk the rarest term's blocks and look the others up there. Counts and unscored visits
+//! ANDs walk the rarest term's blocks and look the others up there, skipping a block before any
+//! lookup when its bound plus the most the others could add can't reach the threshold. Counts and unscored visits
 //! combine row masks and never look at frequencies. Phrases are ANDs whose rows are then checked
 //! against positions; ranked, a row is scored first and its positions read only if it would enter
 //! the top k.
@@ -209,8 +210,9 @@ fn next_reaching(acc: &[u16], from: usize, min: u16) -> Option<usize> {
 /// present, and for `Shape::All` every term present.
 pub(crate) fn run(seg: &Seg, shape: &Shape, sink: &mut Sink) {
     let mut s = Scan::new(seg, shape);
+    let present: Vec<usize> = s.scoring().map(|(j, _)| j).collect();
     match (shape, sink) {
-        (Shape::All(phrases), sink) => s.all(phrases, sink),
+        (Shape::All(phrases), sink) => s.all(&present, phrases, sink),
         (_, Sink::Top { top, prune }) => s.ranked(top, *prune),
         (_, sink) => s.matches(sink),
     }
@@ -566,53 +568,113 @@ impl<'a, 's> Scan<'a, 's> {
         }
     }
 
-    /// AND of all the plan's terms, those of each of `phrases` adjacent: walk the rarest term's
-    /// blocks and look the others up there.
-    fn all(&mut self, phrases: &[Vec<usize>], sink: &mut Sink) {
-        let idx = self.seg.idx;
-        let ts: Vec<(usize, &QTerm)> = self.scoring().collect();
-        let (driver, lead) = *ts.iter().min_by_key(|(_, t)| t.p.df).expect("a segment that can match has terms");
-        let lead_p = lead.p;
-        lead_p.for_each_block(0..idx.blocks(), |b, m, first| {
-            let mut rows = m & !self.excluded(b);
-            self.cur[driver] = Some((m, first));
-            for &(j, t) in &ts {
-                if j == driver {
-                    continue;
-                }
-                if rows == 0 {
+    /// The most term `t` can score in any row of this segment.
+    fn top_bound(&self, t: &QTerm) -> f32 {
+        t.idf * t.p.top as f32 * self.unit
+    }
+
+    /// Rows holding every term of `need` (the plan's scoring terms), those of each of `phrases`
+    /// adjacent.
+    ///
+    /// If the rarest term is in few blocks, its blocks are walked and the others looked up
+    /// there. Otherwise each window's row masks are ANDed whole, which costs about a nanosecond a
+    /// block per term where a lookup costs ten.
+    fn all(&mut self, need: &[usize], phrases: &[Vec<usize>], sink: &mut Sink) {
+        let (idx, seg) = (self.seg.idx, self.seg);
+        let term = |j: usize| seg.terms[j].as_ref().expect("a term of this segment");
+        self.lists.iter_mut().for_each(|l| *l = None); // bounds come from the postings here, not from window lists
+        let mut need = need.to_vec();
+        need.sort_by_key(|&j| term(j).p.df); // rarest first
+        let driver = need[0];
+        // the most the other terms can add to the driver's own bound, in any block
+        let rest: f32 = need[1..].iter().map(|&j| self.top_bound(term(j))).sum();
+        let blocks = idx.blocks();
+
+        if (term(driver).p.df as u64) * 8 < blocks as u64 {
+            let lead = term(driver).p;
+            return lead.for_each_block(0..blocks, |b, m, first| {
+                let mut rows = m & !self.excluded(b);
+                self.cur[driver] = Some((m, first));
+                // Before any lookup: can a row here qualify even if every other term scored its most?
+                if theta(sink).is_some_and(|theta| (self.bound(driver, term(driver), b) + rest) * (1.0 + 1e-5) < theta) {
                     return;
                 }
-                self.cur[j] = t.p.block(b);
-                rows &= self.cur[j].map_or(0, |c| c.0);
-            }
-            if rows == 0 {
-                return;
-            }
-            let Sink::Top { top, prune } = &mut *sink else {
-                let rows = phrases.iter().fold(rows, |rows, p| self.adjacent(b, rows, p));
-                return emit(idx, b, rows, sink);
-            };
-            if *prune && top.heap.len() == top.k {
-                // Every match holds every term, so the block's bound is each term's, summed.
-                let bound: f32 = ts.iter().map(|&(j, t)| self.bound(j, t, b)).sum();
-                if bound * (1.0 + 1e-5) < top.threshold() {
-                    return;
+                for &j in &need[1..] {
+                    if rows == 0 {
+                        return;
+                    }
+                    self.cur[j] = term(j).p.block(b);
+                    rows &= self.cur[j].map_or(0, |c| c.0);
                 }
-            }
-            if phrases.is_empty() {
-                return self.push_rows(b, rows, top);
-            }
-            // Score first: positions are read only for rows that would enter the top k.
-            while rows != 0 {
-                let r = rows.trailing_zeros();
-                rows &= rows - 1;
-                let (id, score) = (idx.ids[(b << SHIFT | r) as usize], self.score(b, r));
-                if top.takes(id, score) && phrases.iter().all(|p| self.adjacent(b, 1 << r, p) != 0) {
-                    top.push(id, score);
+                if rows != 0 {
+                    self.all_block(b, rows, &need, phrases, sink);
                 }
+            });
+        }
+
+        let (mut rows, mut other) = ([0u64; WINDOW as usize], [0u64; WINDOW as usize]);
+        for b0 in (0..blocks).step_by(WINDOW as usize) {
+            let n = ((b0 + WINDOW).min(blocks) - b0) as usize;
+            let (rows, other) = (&mut rows[..n], &mut other[..n]);
+            rows.fill(0);
+            term(driver).p.or_into(b0, rows);
+            for &j in &need[1..] {
+                if rows.iter().all(|&r| r == 0) {
+                    break;
+                }
+                other.fill(0);
+                term(j).p.or_into(b0, other);
+                rows.iter_mut().zip(other.iter()).for_each(|(r, o)| *r &= o);
             }
-        });
+            if let Some(del) = seg.del.get(b0 as usize..b0 as usize + n) {
+                rows.iter_mut().zip(del).for_each(|(r, d)| *r &= !d);
+            }
+            if let (Sink::Count(count), true) = (&mut *sink, phrases.is_empty()) {
+                **count += rows.iter().map(|r| r.count_ones() as u64).sum::<u64>();
+                continue;
+            }
+            for (b, &rows) in (b0..).zip(rows.iter()).filter(|(_, &rows)| rows != 0) {
+                need.iter().for_each(|&j| self.cur[j] = term(j).p.block(b));
+                self.all_block(b, rows, &need, phrases, sink);
+            }
+        }
+    }
+
+    /// `all` for one block: `rows` hold every needed term, and `cur` has those terms there.
+    #[inline]
+    fn all_block(&mut self, b: u32, mut rows: u64, need: &[usize], phrases: &[Vec<usize>], sink: &mut Sink) {
+        let (idx, seg) = (self.seg.idx, self.seg);
+        let term = |j: usize| seg.terms[j].as_ref().expect("a term of this segment");
+        let theta = theta(sink);
+        let Sink::Top { top, .. } = &mut *sink else {
+            let rows = phrases.iter().fold(rows, |rows, p| self.adjacent(b, rows, p));
+            return emit(idx, b, rows, sink);
+        };
+        // Every match holds every term, so the block's bound is each term's, summed.
+        if theta.is_some_and(|theta| need.iter().map(|&j| self.bound(j, term(j), b)).sum::<f32>() * (1.0 + 1e-5) < theta) {
+            return;
+        }
+        if phrases.is_empty() {
+            return self.push_rows(b, rows, top);
+        }
+        // Score first: positions are read only for rows that would enter the top k.
+        while rows != 0 {
+            let r = rows.trailing_zeros();
+            rows &= rows - 1;
+            let (id, score) = (idx.ids[(b << SHIFT | r) as usize], self.score(b, r));
+            if top.takes(id, score) && phrases.iter().all(|p| self.adjacent(b, 1 << r, p) != 0) {
+                top.push(id, score);
+            }
+        }
+    }
+}
+
+/// The score a row must reach to matter to `sink`, if it prunes and has one yet.
+#[inline]
+fn theta(sink: &Sink) -> Option<f32> {
+    match sink {
+        Sink::Top { top, prune: true } if top.heap.len() == top.k => Some(top.threshold()),
+        _ => None,
     }
 }
 
