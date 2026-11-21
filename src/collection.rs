@@ -340,12 +340,13 @@ mod tests {
             let segs = c.snapshot();
             let rows: Vec<(u64, &str, bool)> = segs
                 .iter()
-                .flat_map(|s| s.idx.ids.iter().map(|id| (*id, text[id].as_str(), live.contains_key(id))))
+                .flat_map(|s| (0..s.idx.rows()).map(|r| s.idx.id(r)).map(|id| (id, text[&id].as_str(), live.contains_key(&id))))
                 .collect();
             assert_eq!(rows.iter().filter(|r| r.2).count(), live.len(), "every live row is stored");
             assert!(segs.len() as f64 <= (live.len().max(1) as f64).log2() + 2.0, "{} segments", segs.len());
             for w in segs.windows(2) {
-                assert!(w[0].live() > w[1].live() && w[0].idx.ids().iter().max() < w[1].idx.ids().iter().min());
+                let ids = |s: &Seg| (0..s.idx.rows()).map(|r| s.idx.id(r)).collect::<Vec<_>>();
+                assert!(w[0].live() > w[1].live() && ids(&w[0]).iter().max() < ids(&w[1]).iter().min());
             }
             for q in queries {
                 for and in [false, true] {

@@ -1034,8 +1034,8 @@ pub struct Index {
     lex_heads: Arr<u32>,
     lex: Arr<u8>,
     post: Arr<u64>,
-    pub(crate) dl: Arr<u32>,  // exact length of each row
-    pub(crate) ids: Arr<u64>, // each row's id
+    dl: Column,               // exact length of each row
+    ids: Column,              // each row's id
     pub(crate) blen: Arr<u8>, // per block, the length class of its shortest row
     pos: Option<Arr<u64>>,    // positions, if stored
     n_terms: usize,
@@ -1045,8 +1045,61 @@ pub struct Index {
     by_id: std::sync::OnceLock<Vec<u32>>, // rows sorted by id, built when a host first asks for a row
 }
 
+/// Per-row numbers (lengths, ids), as narrow as the largest of them allows; a file's sections say
+/// the width themselves (their bytes over the rows).
+enum Column {
+    U16(Arr<u16>),
+    U32(Arr<u32>),
+    U64(Arr<u64>),
+}
+
+impl Column {
+    /// `values` in the narrowest of 2, 4 or 8 bytes each, at least `min`, that holds them all.
+    fn new(values: impl Iterator<Item = u64> + Clone, min: usize) -> Column {
+        match values.clone().max().map_or(0, |m| (64 - m.leading_zeros()).div_ceil(8) as usize).max(min) {
+            0..=2 => Column::U16(values.map(|v| v as u16).collect::<Vec<_>>().into()),
+            3 | 4 => Column::U32(values.map(|v| v as u32).collect::<Vec<_>>().into()),
+            _ => Column::U64(values.collect::<Vec<_>>().into()),
+        }
+    }
+
+    fn mapped(map: &Buf, (off, bytes): (u64, u64), rows: u64) -> io::Result<Column> {
+        Ok(match bytes.checked_div(rows) {
+            Some(2) => Column::U16(Arr::mapped(map, off, bytes)?),
+            Some(4) | None => Column::U32(Arr::mapped(map, off, bytes)?),
+            Some(8) => Column::U64(Arr::mapped(map, off, bytes)?),
+            _ => return Err(invalid("a per-row section is not 2, 4 or 8 bytes a row")),
+        })
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> u64 {
+        match self {
+            Column::U16(a) => a[i] as u64,
+            Column::U32(a) => a[i] as u64,
+            Column::U64(a) => a[i],
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Column::U16(a) => a.len(),
+            Column::U32(a) => a.len(),
+            Column::U64(a) => a.len(),
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Column::U16(a) => as_bytes(a),
+            Column::U32(a) => as_bytes(a),
+            Column::U64(a) => as_bytes(a),
+        }
+    }
+}
+
 const MAGIC: &[u8; 8] = b"BITBM25\0";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const SECTIONS: usize = 7;
 // Header: magic, version u32, section count u32, k1 f64, b f64, block shift u32, flags u32 (bit 0:
 // rows as added; bit 1: positions), rows u64, total length u64, terms u64, then per section (offset u64, bytes u64, crc32 u32,
@@ -1075,20 +1128,27 @@ impl Index {
         self.dl.len().div_ceil(64) as u32
     }
 
-    /// Each row's id, by row: how a host maps its own ids to rows (to build an excluded-rows bitset).
-    pub fn ids(&self) -> &[u64] {
-        &self.ids
+    /// Row `row`'s id: how a host maps rows back to its own ids.
+    #[inline]
+    pub fn id(&self, row: usize) -> u64 {
+        self.ids.get(row)
+    }
+
+    /// Row `row`'s exact length.
+    #[inline]
+    pub(crate) fn dl(&self, row: usize) -> u32 {
+        self.dl.get(row) as u32
     }
 
     /// The row holding `id`, if any. The first call sorts the rows by id (4 bytes a row, kept).
     pub fn row_of(&self, id: u64) -> Option<usize> {
         let by_id = self.by_id.get_or_init(|| {
             let mut rows: Vec<u32> = (0..self.rows() as u32).collect();
-            rows.sort_unstable_by_key(|&r| self.ids[r as usize]);
+            rows.sort_unstable_by_key(|&r| self.id(r as usize));
             rows
         });
-        let at = by_id.partition_point(|&r| self.ids[r as usize] < id);
-        by_id.get(at).map(|&r| r as usize).filter(|&r| self.ids[r] == id)
+        let at = by_id.partition_point(|&r| self.id(r as usize) < id);
+        by_id.get(at).map(|&r| r as usize).filter(|&r| self.id(r) == id)
     }
 
     pub fn params(&self) -> Params {
@@ -1166,7 +1226,7 @@ impl Index {
                 Some(_) => Positions::Inline { lex: &self.lex, at: [m.pos as u32 as usize, (m.pos >> 32) as usize] },
                 None => Positions::None,
             };
-            let byte = |&(row, tf): &(u32, u32)| bound_byte(tf, self.dl[row as usize], self.stats.avgdl, self.stats.params);
+            let byte = |&(row, tf): &(u32, u32)| bound_byte(tf, self.dl(row as usize), self.stats.avgdl, self.stats.params);
             let top = m.inline[..df].iter().map(byte).max().unwrap_or(0);
             return (Postings { df, rows: Rows::Inline(rows), tfs: Tfs::Inline(tfs), bounds: None, top, segs: None, positions }, [0; 3]);
         }
@@ -1219,7 +1279,7 @@ impl Index {
     /// Every array as bytes, in file order.
     pub(crate) fn sections(&self) -> [&[u8]; SECTIONS] {
         let pos = self.pos.as_deref().unwrap_or(&[]);
-        [as_bytes(&self.lex_heads), as_bytes(&self.lex), as_bytes(&self.post), as_bytes(&self.dl), as_bytes(&self.ids), as_bytes(&self.blen), as_bytes(pos)]
+        [as_bytes(&self.lex_heads), as_bytes(&self.lex), as_bytes(&self.post), self.dl.bytes(), self.ids.bytes(), as_bytes(&self.blen), as_bytes(pos)]
     }
 
     /// Writes the index to `path`, atomically: it goes to `path.tmp`, is synced, then renamed, so a
@@ -1286,8 +1346,8 @@ impl Index {
             lex_heads: arr!(0),
             lex: arr!(1),
             post: arr!(2),
-            dl: arr!(3),
-            ids: arr!(4),
+            dl: Column::mapped(&map, sec(3), rows)?,
+            ids: Column::mapped(&map, sec(4), rows)?,
             blen: arr!(5),
             pos: (flags & 2 != 0).then_some(arr!(6)),
             n_terms,
@@ -1502,8 +1562,8 @@ impl Assembler {
             lex: self.lex.bytes.into(),
             post: words(self.post).into(),
             stats: Stats::new(self.dl.len(), total_len, self.params),
-            dl: self.dl.into(),
-            ids: self.ids.into(),
+            dl: Column::new(self.dl.iter().map(|&d| d as u64), 2),
+            ids: Column::new(self.ids.iter().copied(), 4),
             blen: blen.into(),
             pos: self.pos.map(|p| words(p).into()),
             n_terms: self.lex.n,
@@ -1534,13 +1594,14 @@ impl Assembler {
                 (None, mem) => Part::Bytes(as_bytes(mem)),
             }
         }
+        let (dl, ids) = (Column::new(self.dl.iter().map(|&d| d as u64), 2), Column::new(self.ids.iter().copied(), 4));
         replace_file(path, |w| {
             let parts = [
                 Part::Bytes(as_bytes(&self.lex.heads)),
                 Part::Bytes(&self.lex.bytes),
                 part(&post),
-                Part::Bytes(as_bytes(&self.dl)),
-                Part::Bytes(as_bytes(&self.ids)),
+                Part::Bytes(dl.bytes()),
+                Part::Bytes(ids.bytes()),
                 Part::Bytes(&blen),
                 part(&pos),
             ];

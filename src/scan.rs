@@ -371,7 +371,7 @@ impl<'a, 's> Scan<'a, 's> {
     #[cfg_attr(not(feature = "prof"), inline)]
     fn score(&self, b: u32, r: u32) -> f32 {
         let (st, row) = (self.seg.st, (b << SHIFT | r) as usize);
-        let norm = st.c0 + st.c1 * self.seg.idx.dl[row] as f32;
+        let norm = st.c0 + st.c1 * self.seg.idx.dl(row) as f32;
         let mut score = 0f64;
         for (j, t) in self.scoring() {
             if let Some((m, first)) = self.cur[j] {
@@ -392,7 +392,7 @@ impl<'a, 's> Scan<'a, 's> {
         while rows != 0 {
             let r = rows.trailing_zeros();
             rows &= rows - 1;
-            top.push(self.seg.idx.ids[(b << SHIFT | r) as usize], self.score(b, r));
+            top.push(self.seg.idx.id((b << SHIFT | r) as usize), self.score(b, r));
         }
     }
 
@@ -494,7 +494,7 @@ impl<'a, 's> Scan<'a, 's> {
             lap(2);
             #[cfg(feature = "prof")]
             if std::env::var("TRACE").is_ok() {
-                eprintln!("  window {:>3}: lengths {:>5}..  live-eligible {:>4}  threshold {:.3}  scored so far {} blocks {} rows", b0 / WINDOW, self.seg.idx.dl[(b0 << SHIFT) as usize],
+                eprintln!("  window {:>3}: lengths {:>5}..  live-eligible {:>4}  threshold {:.3}  scored so far {} blocks {} rows", b0 / WINDOW, self.seg.idx.dl((b0 << SHIFT) as usize),
                     acc.iter().filter(|&&a| a >= need(top)).count(), top.threshold(), WORK[3].load(std::sync::atomic::Ordering::Relaxed), WORK[4].load(std::sync::atomic::Ordering::Relaxed));
             }
         }
@@ -766,7 +766,7 @@ impl<'a, 's> Scan<'a, 's> {
         while rows != 0 {
             let r = rows.trailing_zeros();
             rows &= rows - 1;
-            let (id, score) = (idx.ids[(b << SHIFT | r) as usize], self.score(b, r));
+            let (id, score) = (idx.id((b << SHIFT | r) as usize), self.score(b, r));
             if top.takes(id, score) && phrases.iter().all(|p| self.adjacent(b, 1 << r, p) != 0) {
                 top.push(id, score);
             }
@@ -791,7 +791,7 @@ fn emit(idx: &Index, b: u32, mut rows: u64, sink: &mut Sink) {
         Sink::Count(n) => **n += rows.count_ones() as u64,
         Sink::Each(f) => {
             while rows != 0 {
-                f(idx.ids[(b << SHIFT | rows.trailing_zeros()) as usize]);
+                f(idx.id((b << SHIFT | rows.trailing_zeros()) as usize));
                 rows &= rows - 1;
             }
         }

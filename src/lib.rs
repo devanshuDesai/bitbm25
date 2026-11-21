@@ -97,6 +97,7 @@ impl Stats {
 /// Implement only for such types.
 unsafe trait Plain: Copy {}
 unsafe impl Plain for u8 {}
+unsafe impl Plain for u16 {}
 unsafe impl Plain for u32 {}
 unsafe impl Plain for u64 {}
 
@@ -427,7 +428,7 @@ fn merged(segs: &[SegView], spill: Option<&Path>) -> io::Result<seg::Assembler> 
     let live = |del: &[u64], row: usize| del.get(row >> SHIFT).is_none_or(|w| w >> (row & 63) & 1 == 0);
     let mut rows: Vec<(u32, u32, u32)> = Vec::new();
     for (s, &(idx, del)) in segs.iter().enumerate() {
-        rows.extend((0..idx.rows()).filter(|&r| live(del, r)).map(|r| (idx.dl[r], s as u32, r as u32)));
+        rows.extend((0..idx.rows()).filter(|&r| live(del, r)).map(|r| (idx.dl(r), s as u32, r as u32)));
     }
     if rows.len() >= u32::MAX as usize {
         return Err(bad_input("a segment holds at most 2^32 - 1 rows"));
@@ -438,7 +439,7 @@ fn merged(segs: &[SegView], spill: Option<&Path>) -> io::Result<seg::Assembler> 
     const GONE: u32 = u32::MAX;
     let mut new_of: Vec<Vec<u32>> = segs.iter().map(|s| vec![GONE; s.0.rows()]).collect();
     rows.iter().enumerate().for_each(|(new, &(_, s, r))| new_of[s as usize][r as usize] = new as u32);
-    let ids = rows.iter().map(|&(_, s, r)| segs[s as usize].0.ids[r as usize]).collect();
+    let ids = rows.iter().map(|&(_, s, r)| segs[s as usize].0.id(r as usize)).collect();
     let positions = segs.iter().any(|s| s.0.has_positions());
     if segs.iter().any(|s| s.0.has_positions() != positions) {
         return Err(bad_input("segments with and without positions can't be merged: phrases would stop working"));
@@ -1353,7 +1354,7 @@ mod tests {
                         tighter += (p.bound_over(b..b + 1) < p.top) as usize;
                         while rows != 0 {
                             let (row, tf) = ((b << SHIFT | rows.trailing_zeros()) as usize, p.tf(i) as f32);
-                            let score = idf * tf * st.k1p1 / (tf + st.c0 + st.c1 * idx.dl[row] as f32);
+                            let score = idf * tf * st.k1p1 / (tf + st.c0 + st.c1 * idx.dl(row) as f32);
                             assert!(score > 0.0 && score <= bound * (1.0 + 1e-6), "block {b} row {row}: {score} above {bound}");
                             assert!(score <= stretch * (1.0 + 1e-6), "block {b} row {row}: {score} above its stretch's {stretch}");
                             i += 1;
