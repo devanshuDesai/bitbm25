@@ -851,6 +851,19 @@ mod tests {
         }
     }
 
+    /// Fullwidth `？` and `～` (as Japanese and Chinese text is typed) and other compatibility forms
+    /// of `?`, `*` and `~` are punctuation, not pattern syntax: such a word is its terms ANDed, as
+    /// before patterns existed. Accent folding must not turn them into wildcards or fuzzy edits.
+    #[test]
+    fn compatibility_forms_are_not_pattern_syntax() {
+        // a question, a price range, an interrobang
+        for text in ["東京タワーはどこ？", "価格１～３", "価格１～２", "really⁉"] {
+            let terms: Vec<Query> = Analyzer::default().terms(text).into_iter().map(Term).collect();
+            let want = if terms.len() == 1 { terms[0].clone() } else { And(terms) };
+            assert_eq!(Query::parse(&Analyzer::default(), text).ok(), Some(want), "{text}");
+        }
+    }
+
     #[test]
     fn patterns_match_rows_and_nest_one_deeper() {
         let row = |s: &str| Analyzer::whitespace().terms(s);
