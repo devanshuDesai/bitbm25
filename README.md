@@ -49,6 +49,9 @@ bitbm25::count(&segs, &q)?;
 bitbm25::for_each_match(&segs, &q, |id| ...)?;   // every match, unscored
 for (id, score) in Cursor::new(&segs, &q)? { ... } // best first, until you stop
 let merged = bitbm25::merge(&segs)?;        // live rows only, ids kept
+
+bitbm25::highlight(&analyzer, &q, text);    // byte ranges of the words that make a row's text match
+bitbm25::snippet(&analyzer, &q, text, 150, "<b>", "</b>"); // its best 150 bytes, those words marked
 ```
 
 ## Text and queries
@@ -87,6 +90,33 @@ terms without an index, for hosts that re-check rows.
 k1 (0 to 1000) and b (0 to 1) are chosen per index at build time. They are written in each segment and baked into its
 bounds, so segments with different values can't be searched or merged together.
 
+## Highlights and snippets
+
+Both are worked out from a row's text alone, with the analyzer its index was built with. No index
+is read, so a host can call them on whatever rows it ends up showing. Each call goes through the
+whole text, holding about 100 bytes of memory per word while it runs.
+
+`highlight(&analyzer, &q, text)` returns the byte ranges of the words that make the text match, in
+order, one per word. It returns nothing if the text doesn't match. In a text that does:
+- A term highlights every word that analyzes to it: `run` highlights `Running` when the analyzer
+  lowercases and stems.
+- A phrase highlights the words of each place it occurs, and its words nowhere else.
+- An AND or an OR highlights what its parts do, also a part that doesn't match by itself: for
+  `fox OR (quick AND slow)`, `quick` is highlighted in a row that has `fox` and no `slow`.
+- Nothing under a NOT is highlighted.
+
+`snippet(&analyzer, &q, text, max_bytes, before, after)` returns the stretch of the text, at most
+`max_bytes` bytes long, that holds the most highlighted words, with `before` and `after` around
+each of them. The markers don't count toward `max_bytes`.
+- Text that fits in `max_bytes` comes back whole. Otherwise the stretch runs from the start of a
+  word to the end of one, so no word or character is cut. Words the analyzer drops (stopwords) don't
+  count as words here: a stretch cut out of a longer text never starts or ends with one.
+- Of equally good stretches it is the earliest, made as long as fits. So a lone match deep in the
+  text comes last, after the words that lead up to it.
+- It is empty when nothing is highlighted, or when no highlighted word fits in `max_bytes`.
+- Nothing is escaped. A host that shows a snippet as HTML escapes the text itself, or builds its
+  own markup from `highlight`'s ranges.
+
 ## Python
 
 ```python
@@ -99,6 +129,10 @@ idx.save("wiki.idx")                      # atomic: temp file, fsync, rename
 idx = bitbm25.Index.open("wiki.idx", analyzer="standard stem=english")  # maps the file; instant
 idx.verify()                              # reads every byte and checks the checksums
 idx.top_k(terms, exhaustive=True)         # no early stopping: same answer, slowly, for checking
+
+bitbm25.highlight(text, "new AND york")   # [(start, end), ...]: byte offsets into text.encode()
+bitbm25.snippet(text, "new AND york", max_bytes=150, before="<b>", after="</b>")
+bitbm25.snippet(text, "running", analyzer="standard stem=english")  # both take the index's analyzer
 
 col = bitbm25.Collection("wiki/")         # a directory; created if missing, one writer at a time
 ids = col.add_many(docs)                  # or col.add(doc); returns stable row ids
