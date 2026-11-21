@@ -118,35 +118,63 @@ fn load(queries: &str) -> std::io::Result<Vec<(String, Vec<Query>)>> {
     Ok(sets)
 }
 
+/// (instructions retired, cycles, peak memory in bytes) of this process so far. Instruction counts
+/// repeat to a few parts in 100,000 on a busy machine, where wall time moves by a factor of two.
+#[cfg(target_os = "macos")]
+fn usage() -> (u64, u64, u64) {
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
+        fn getpid() -> i32;
+    }
+    // struct rusage_info_v4: a 16-byte uuid, then u64 fields; flavor 4. Indices from <sys/resource.h>.
+    let mut info = [0u64; 64];
+    // SAFETY: the buffer is larger than the struct the call fills.
+    if unsafe { proc_pid_rusage(getpid(), 4, info.as_mut_ptr()) } != 0 {
+        return (0, 0, 0);
+    }
+    (info[31], info[32], info[30]) // ri_instructions, ri_cycles, ri_lifetime_max_phys_footprint
+}
+
+#[cfg(not(target_os = "macos"))]
+fn usage() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
 fn bench(index: &str, queries: &str, reps: usize) -> std::io::Result<()> {
     let idx = Index::open(index)?;
     let segs = [(&idx, &[][..])];
     let sets = load(queries)?;
-    println!("{} rows, {} reps; ms per query, best of reps", idx.rows(), reps);
-    println!("{:<10} {:<6} {:>5} {:>9} {:>8} {:>8} {:>8} {:>8}  exact", "kind", "mode", "n", "qps", "mean", "p50", "p95", "p99");
+    let k = std::env::var("K").ok().and_then(|k| k.parse().ok()).unwrap_or(10);
+    println!("{} rows, top {k}, {} reps; ms per query, best of reps; instructions and cycles per query (thousands), one pass", idx.rows(), reps);
+    println!("{:<10} {:<6} {:>5} {:>9} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9}  exact", "kind", "mode", "n", "qps", "mean", "p50", "p95", "p99", "k-instr", "k-cycles");
     for (name, qs) in &sets {
-        for mode in ["top10", "count"] {
+        for mode in ["top", "count"] {
             let mut best = vec![f64::INFINITY; qs.len()];
+            let (mut instr, mut cycles) = (u64::MAX, u64::MAX);
             for _ in 0..reps {
+                let before = usage();
                 for (q, b) in qs.iter().zip(&mut best) {
                     let t0 = Instant::now();
-                    if mode == "top10" {
-                        std::hint::black_box(bitbm25::top_k(&segs, q, 10)?);
+                    if mode == "top" {
+                        std::hint::black_box(bitbm25::top_k(&segs, q, k)?);
                     } else {
                         std::hint::black_box(bitbm25::count(&segs, q)?);
                     }
                     *b = b.min(t0.elapsed().as_secs_f64() * 1e3);
                 }
+                let after = usage();
+                (instr, cycles) = (instr.min(after.0 - before.0), cycles.min(after.1 - before.1));
             }
-            // Exactness: pruned top-10 equals the exhaustive one (first 50 queries; it is slow).
+            // Exactness: pruned top-k equals the exhaustive one (first 50 queries; it is slow).
             let exact = mode == "count"
-                || qs.iter().take(50).all(|q| bitbm25::top_k(&segs, q, 10).unwrap() == bitbm25::top_k_exhaustive(&segs, q, 10).unwrap());
-            let total: f64 = best.iter().sum();
+                || qs.iter().take(50).all(|q| bitbm25::top_k(&segs, q, k).unwrap() == bitbm25::top_k_exhaustive(&segs, q, k).unwrap());
+            let (total, n) = (best.iter().sum::<f64>(), qs.len() as f64);
             best.sort_by(f64::total_cmp);
             let pct = |p: f64| best[((best.len() - 1) as f64 * p) as usize];
-            println!("{:<10} {:<6} {:>5} {:>9.1} {:>8.3} {:>8.3} {:>8.3} {:>8.3}  {}", name, mode, qs.len(),
-                qs.len() as f64 / total * 1e3, total / qs.len() as f64, pct(0.5), pct(0.95), pct(0.99), exact);
+            println!("{:<10} {:<6} {:>5} {:>9.1} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>9.0} {:>9.0}  {}", name, mode, qs.len(),
+                n / total * 1e3, total / n, pct(0.5), pct(0.95), pct(0.99), instr as f64 / n / 1e3, cycles as f64 / n / 1e3, exact);
         }
     }
+    println!("peak memory {:.0} MB", usage().2 as f64 / 1e6);
     Ok(())
 }

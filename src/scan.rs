@@ -555,10 +555,45 @@ impl<'a, 's> Scan<'a, 's> {
                 return;
             }
         }
-        let rows = lanes.reaching(200) & !self.excluded(b);
+        let mut rows = lanes.reaching(200) & !self.excluded(b);
+        if rows.count_ones() > 4 {
+            rows = self.enough_tf(b, rows, top.threshold());
+        }
         #[cfg(feature = "prof")]
         work(4, rows.count_ones() as u64);
         self.push_rows(b, rows, top);
+    }
+
+    /// Narrows `rows` of block `b` (whose terms are in `later` and `cur`) by term frequency, for
+    /// blocks where frequent terms leave the row filter many rows. If the other terms' bounds here
+    /// fall short of `theta` by x, a row needs this term to score x, so it needs a tf of at least
+    /// some value (found from the block's shortest row, with no division per row): rows with less
+    /// are dropped with a compare.
+    fn enough_tf(&self, b: u32, mut rows: u64, theta: f32) -> u64 {
+        let (st, norm) = (self.seg.st, self.norm[self.seg.idx.blen[b as usize] as usize]);
+        let term = |j: usize| self.seg.terms[j].as_ref().expect("a scoring term of this segment");
+        let total: f32 = self.later.iter().map(|&(j, _)| self.bound(j, term(j), b)).sum();
+        for &(j, _) in &self.later {
+            let t = term(j);
+            // what the term must score, as a share of the most any tf could: tf / (tf + norm) >= share
+            let share = (theta / (1.0 + 1e-5) - (total - self.bound(j, t, b)) * (1.0 + 1e-5)) / (t.idf * st.k1p1);
+            let least = (share * norm / (1.0 - share) * (1.0 - 1e-4)).ceil();
+            if share <= 0.0 || share >= 1.0 || least < 2.0 {
+                continue; // no row is ruled out (a share of 1 or more is left to exact scoring)
+            }
+            let (m, first) = self.cur[j].expect("a term of this block");
+            let first = if first == UNKNOWN { t.p.first(b) } else { first };
+            let mut left = rows & m;
+            rows &= m; // a row without the term can't make up for it
+            while left != 0 {
+                let r = left.trailing_zeros();
+                left &= left - 1;
+                if (t.p.tf(first + (m & ((1u64 << r) - 1)).count_ones() as usize) as f32) < least {
+                    rows &= !(1 << r);
+                }
+            }
+        }
+        rows
     }
 
     /// Count or visit every match of an OR or tree.
