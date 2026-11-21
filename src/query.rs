@@ -99,7 +99,7 @@ impl Query {
     fn eval(&self, set: &HashSet<&str>, row: &[String]) -> bool {
         match self {
             Query::Term(t) => set.contains(t.as_str()),
-            Query::Phrase(ts) => !ts.is_empty() && row.windows(ts.len()).any(|w| w == &ts[..]),
+            Query::Phrase(ts) => places(row, ts).next().is_some(),
             Query::And(qs) => !qs.is_empty() && qs.iter().all(|q| q.eval(set, row)),
             Query::Or(qs) => qs.iter().any(|q| q.eval(set, row)),
             Query::Not(q) => !q.eval(set, row),
@@ -142,6 +142,31 @@ impl Query {
         walk(self, &mut out, &mut HashSet::new());
         out
     }
+}
+
+/// Where `phrase` starts in `row`, in order, overlapping places too; nowhere if it is empty.
+/// This is Knuth-Morris-Pratt: it costs the row's length plus the phrase's, even when both repeat
+/// one word, where comparing the phrase at every place would cost their product.
+pub(crate) fn places<'a>(row: &'a [String], phrase: &'a [String]) -> impl Iterator<Item = usize> + 'a {
+    // border[i]: the length of the longest proper prefix of phrase[..=i] that also ends it
+    let mut border = vec![0; phrase.len()];
+    let mut k = 0;
+    for i in 1..phrase.len() {
+        while k > 0 && phrase[i] != phrase[k] {
+            k = border[k - 1];
+        }
+        k += (phrase[i] == phrase[k]) as usize;
+        border[i] = k;
+    }
+    // k: the longest start of the phrase that the words read so far end with
+    let mut k = 0;
+    row.iter().enumerate().filter_map(move |(i, word)| {
+        while k > 0 && (k == phrase.len() || phrase[k] != *word) {
+            k = border[k - 1];
+        }
+        k += (phrase.get(k) == Some(word)) as usize;
+        (k > 0 && k == phrase.len()).then(|| i + 1 - k)
+    })
 }
 
 /// Recursive descent; each rule returns None for a part that analyzed to nothing.
@@ -292,6 +317,27 @@ mod tests {
             assert_eq!(Query::parse(&Analyzer::whitespace(), q).unwrap().matches(&row), want, "{q}");
         }
         assert!(!Phrase(vec![]).matches(&row));
+    }
+
+    #[test]
+    fn places_are_where_a_phrase_starts() {
+        // three words only, so that places overlap and near misses abound
+        let mut s = 7u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut words = |most: u64| {
+            let n = next() % most;
+            (0..n).map(|_| ["a", "b", "c"][(next() % 3) as usize].to_string()).collect::<Vec<_>>()
+        };
+        for _ in 0..5_000 {
+            let (row, phrase) = (words(40), words(7));
+            let want: Vec<usize> = (0..row.len()).filter(|&i| !phrase.is_empty() && row[i..].starts_with(&phrase)).collect();
+            assert_eq!(places(&row, &phrase).collect::<Vec<_>>(), want, "{phrase:?} in {row:?}");
+        }
     }
 
     #[test]

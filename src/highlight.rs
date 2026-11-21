@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
+use crate::query::places;
 use crate::{Analyzer, Query};
 
 /// The byte ranges in `text`, ascending, of the words that make it match `q`: one range per word,
@@ -57,8 +58,8 @@ pub fn snippet(analyzer: &Analyzer, q: &Query, text: &str, max_bytes: usize, bef
 
 /// The words of `text` the analyzer keeps, as byte ranges, and whether `q` highlights each.
 fn words(analyzer: &Analyzer, q: &Query, text: &str) -> (Vec<Range<usize>>, Vec<bool>) {
-    // ponytail: a String per word and a pass over the words per phrase, as `Query::matches` does; a
-    // map from term to places would serve both if long texts or many phrases ever cost too much.
+    // ponytail: a String per word, so a call holds about 100 bytes per word of the text; ids for the
+    // row's distinct terms would hold less, if hosts pass texts of many megabytes.
     let (mut terms, mut spans) = (Vec::new(), Vec::new());
     analyzer.for_each_term_at(text, |term, span| {
         terms.push(term.to_string());
@@ -69,11 +70,12 @@ fn words(analyzer: &Analyzer, q: &Query, text: &str) -> (Vec<Range<usize>>, Vec<
         leaves(q, &mut single, &mut phrases); // `matches` has checked the nesting, so this can't run deep
     }
     let mut lit: Vec<bool> = terms.iter().map(|term| single.contains(term.as_str())).collect();
-    for phrase in phrases.into_iter().filter(|phrase| !phrase.is_empty()) {
-        for (i, run) in terms.windows(phrase.len()).enumerate() {
-            if run == phrase {
-                lit[i..i + phrase.len()].fill(true);
-            }
+    for phrase in phrases {
+        // places can overlap: each word is lit once, from where the last place's words end
+        let mut from = 0;
+        for at in places(&terms, phrase) {
+            lit[from.max(at)..at + phrase.len()].fill(true);
+            from = at + phrase.len();
         }
     }
     (spans, lit)
