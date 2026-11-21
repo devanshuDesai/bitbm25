@@ -259,12 +259,14 @@ mod tests {
 
     #[test]
     fn repetitive_rows_take_linear_time() {
-        // A row of one word repeated: every place in it starts a near miss of the first phrase (which
-        // a search never checks, as the row has no `b`) and an occurrence of the second. Finding a
-        // phrase's places must not cost the row's length times the phrase's.
+        // A row of one word repeated: every place in it starts a near miss of `near`, which a search
+        // never checks as the row has no `b`, and an occurrence of the last phrase. Finding a phrase's
+        // places, to light them or to see that a NOT holds, must not cost the row's length times the
+        // phrase's.
         let ws = Analyzer::whitespace();
         let row = "a ".repeat(40_000);
-        for q in [format!("a OR \"{}b\"", "a ".repeat(19_999)), format!("\"{}\"", "a ".repeat(20_000))] {
+        let near = format!("\"{}b\"", "a ".repeat(19_999));
+        for q in [format!("a OR {near}"), format!("a AND -{near}"), format!("\"{}\"", "a ".repeat(20_000))] {
             let q = Query::parse(&ws, &q).unwrap();
             let start = std::time::Instant::now();
             assert_eq!(highlight(&ws, &q, &row).len(), 40_000);
