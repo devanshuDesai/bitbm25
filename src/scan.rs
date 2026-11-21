@@ -150,12 +150,12 @@ impl Lanes {
     }
 }
 
-/// Adds `ceil(byte * mul / 256)` to `acc[b - from]` for blocks `from..to`, whose bound bytes are in
-/// `bounds`; `mul` is at most 256.
+/// Adds `ceil(min(byte, cap) * mul / 256)` to `acc[b - from]` for blocks `from..to`, whose bound
+/// bytes are in `bounds`; `mul` is at most 256.
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline)]
-fn add_bounds(acc: &mut [u16], bounds: &[u64], from: u32, to: u32, mul: u16) {
-    let byte = |b: u32| (bounds[b as usize >> 3] >> (8 * (b & 7))) as u8 as u32;
+fn add_bounds(acc: &mut [u16], bounds: &[u64], from: u32, to: u32, mul: u16, cap: u8) {
+    let byte = |b: u32| ((bounds[b as usize >> 3] >> (8 * (b & 7))) as u8).min(cap) as u32;
     let scalar = |acc: &mut [u16], lo: u32, hi: u32| {
         for b in lo..hi {
             let a = &mut acc[(b - from) as usize];
@@ -173,9 +173,9 @@ fn add_bounds(acc: &mut [u16], bounds: &[u64], from: u32, to: u32, mul: u16) {
         // SAFETY: NEON is baseline on aarch64. Each step reads one whole word of `bounds` (bounds
         // checked) and 8 accumulators, whose range the slice below checks.
         unsafe {
-            let round = vdupq_n_u16(255);
+            let (round, cap) = (vdupq_n_u16(255), vdup_n_u8(cap));
             for b in (first..last).step_by(8) {
-                let w = vmulq_n_u16(vmovl_u8(vcreate_u8(bounds[(b / 8) as usize])), mul); // at most 255 * 256
+                let w = vmulq_n_u16(vmovl_u8(vmin_u8(vcreate_u8(bounds[(b / 8) as usize]), cap)), mul); // at most 255 * 256
                 let a = acc[(b - from) as usize..(b - from) as usize + 8].as_mut_ptr();
                 vst1q_u16(a, vqaddq_u16(vld1q_u16(a), vshrq_n_u16(vaddq_u16(w, round), 8)));
             }
@@ -245,7 +245,8 @@ struct Scan<'a, 's> {
     seg: &'a Seg<'a>,
     shape: &'s Shape,
     norm: [f32; 256],                 // by length class: k1 (1 - b + b len / avgdl) at the class's lower edge
-    unit: f32,                        // score per bound-byte unit (before idf), nudged up; grows if the average length has
+    unit: f32,                        // score per bound-byte unit (before idf), nudged up, scaled by how much the average length grew
+    cap: u8,                          // bytes above this bound more than k1 + 1, the most any tf scores
     cur: Vec<Option<(u64, usize)>>,   // each plan term's rows in the block at hand, and its first posting there
     masks: Vec<u64>,                  // the same rows, for evaluating a tree
     later: Vec<(usize, u8)>,          // scratch: the terms of the block at hand and their weights
@@ -265,9 +266,17 @@ impl<'a, 's> Scan<'a, 's> {
         // Bound bytes were computed under the segment's own average length. A larger one now raises
         // every tf_part by at most the ratio, so the bytes are scaled by it.
         let unit = (st.params.k1 + 1.0) / 255.0 * (st.avgdl / seg.idx.stats.avgdl).max(1.0) * (1.0 + 1e-6);
+        // No term scores more than k1 + 1 times its idf, however far the scaling took its bytes.
+        let cap = ((st.params.k1 + 1.0) * (1.0 + 1e-6) / unit).ceil().min(255.0) as u8;
         let n = seg.terms.len();
         let lists = (0..n).map(|_| None).collect();
-        Scan { seg, shape, norm, unit: unit as f32, cur: vec![None; n], masks: vec![0; n], later: Vec::with_capacity(n), lists, read: vec![0; n], tf: vec![0; n], positions: Adjacency { pos: vec![Default::default(); n], ..Default::default() }.into() }
+        Scan { seg, shape, norm, unit: unit as f32, cap, cur: vec![None; n], masks: vec![0; n], later: Vec::with_capacity(n), lists, read: vec![0; n], tf: vec![0; n], positions: Adjacency { pos: vec![Default::default(); n], ..Default::default() }.into() }
+    }
+
+    /// What term `t` can score where its bound byte (or stretch byte) is `byte`.
+    #[inline]
+    fn byte_bound(&self, t: &QTerm, byte: u8) -> f32 {
+        t.idf * byte.min(self.cap) as f32 * self.unit
     }
 
     /// The scoring terms this segment has, with their place in the plan.
@@ -401,7 +410,7 @@ impl<'a, 's> Scan<'a, 's> {
     #[inline]
     fn bound(&self, j: usize, t: &QTerm, b: u32) -> f32 {
         if let Some(byte) = t.p.bound(b) {
-            return t.idf * byte as f32 * self.unit;
+            return self.byte_bound(t, byte);
         }
         let (m, first) = self.cur[j].expect("only asked for terms in the block");
         let tf = if self.lists[j].is_some() { self.tf[j] } else { t.p.block_tf(b, m, first) } as f32;
@@ -440,7 +449,7 @@ impl<'a, 's> Scan<'a, 's> {
             acc.fill(0);
             for ((j, t), &mul) in ts.iter().zip(&muls) {
                 match t.p.bounds {
-                    Some(bounds) => add_bounds(acc, bounds, b0, b1, mul),
+                    Some(bounds) => add_bounds(acc, bounds, b0, b1, mul, self.cap),
                     None => {
                         let list = self.lists[*j].get_or_insert_default();
                         list.clear();
@@ -554,7 +563,7 @@ impl<'a, 's> Scan<'a, 's> {
                 units(self.bound(j, t, b))
             } else {
                 match t.p.bound(b) {
-                    Some(byte) if byte != 0 => units(t.idf * byte as f32 * self.unit),
+                    Some(byte) if byte != 0 => units(self.byte_bound(t, byte)),
                     _ => continue,
                 }
             };
@@ -674,7 +683,7 @@ impl<'a, 's> Scan<'a, 's> {
             let lead = term(driver).p;
             for stretch in lead.stretches(blocks) {
                 // Ranked: can a row of the stretch qualify, every term scoring its most there?
-                let most = |theta: f32| need.iter().map(|&j| (term(j).idf * term(j).p.bound_over(stretch.clone()) as f32 * self.unit) as f64).sum::<f64>() * (1.0 + 1e-5) < theta as f64;
+                let most = |theta: f32| need.iter().map(|&j| self.byte_bound(term(j), term(j).p.bound_over(stretch.clone())) as f64).sum::<f64>() * (1.0 + 1e-5) < theta as f64;
                 if theta(sink).is_some_and(most) {
                     continue;
                 }
@@ -728,7 +737,7 @@ impl<'a, 's> Scan<'a, 's> {
                 Some(byte) => byte,
                 None => t.p.bound_over(b..b + 1),
             };
-            others += (t.idf * byte as f32 * self.unit) as f64;
+            others += self.byte_bound(t, byte) as f64;
         }
         if theta(sink).is_some_and(|theta| (self.bound(driver, term(driver), b) as f64 + others) * (1.0 + 1e-5) < theta as f64) {
             return;

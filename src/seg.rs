@@ -1013,7 +1013,11 @@ struct LexWriter {
 }
 
 impl LexWriter {
-    fn push(&mut self, term: &[u8], meta: &Meta, positions: Option<&[u32]>) {
+    fn push(&mut self, term: &[u8], meta: &Meta, positions: Option<&[u32]>) -> io::Result<()> {
+        // Groups and inline terms' positions are found by u32 offsets into the lexicon.
+        if self.bytes.len() + term.len() + 64 > u32::MAX as usize {
+            return Err(bad_input("a segment's lexicon is limited to 4 GiB: split its rows over more segments"));
+        }
         let shared = if self.n.is_multiple_of(LEX_GROUP) {
             self.heads.push(self.bytes.len() as u32);
             0
@@ -1027,6 +1031,7 @@ impl LexWriter {
         self.prev.clear();
         self.prev.extend_from_slice(term);
         self.n += 1;
+        Ok(())
     }
 }
 
@@ -1063,13 +1068,25 @@ impl Column {
         }
     }
 
-    fn mapped(map: &Buf, (off, bytes): (u64, u64), rows: u64) -> io::Result<Column> {
-        Ok(match bytes.checked_div(rows) {
-            Some(2) => Column::U16(Arr::mapped(map, off, bytes)?),
-            Some(4) | None => Column::U32(Arr::mapped(map, off, bytes)?),
-            Some(8) => Column::U64(Arr::mapped(map, off, bytes)?),
-            _ => return Err(invalid("a per-row section is not 2, 4 or 8 bytes a row")),
+    /// The section at `off`, of `rows` values `2 << code` bytes wide each (the header says).
+    fn mapped(map: &Buf, (off, bytes): (u64, u64), rows: u64, code: u32) -> io::Result<Column> {
+        if code == 0 || bytes != rows * (1 << code) {
+            return Err(invalid("a per-row section's size doesn't fit its rows and width"));
+        }
+        Ok(match code {
+            1 => Column::U16(Arr::mapped(map, off, bytes)?),
+            2 => Column::U32(Arr::mapped(map, off, bytes)?),
+            _ => Column::U64(Arr::mapped(map, off, bytes)?),
         })
+    }
+
+    /// Its width as the header records it: bytes per value are 2 << code.
+    fn code(&self) -> u32 {
+        match self {
+            Column::U16(_) => 1,
+            Column::U32(_) => 2,
+            Column::U64(_) => 3,
+        }
     }
 
     #[inline]
@@ -1098,14 +1115,19 @@ impl Column {
     }
 }
 
+/// Header flag bits 2..6: the widths of the lengths and ids columns.
+fn widths(dl: &Column, ids: &Column) -> u32 {
+    dl.code() << 2 | ids.code() << 4
+}
+
 const MAGIC: &[u8; 8] = b"BITBM25\0";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 const SECTIONS: usize = 7;
 // Header: magic, version u32, section count u32, k1 f64, b f64, block shift u32, flags u32 (bit 0:
 // rows as added; bit 1: positions), rows u64, total length u64, terms u64, then per section (offset u64, bytes u64, crc32 u32,
 // zero u32), then a crc32 of all of that. Sections follow, each 8-byte aligned.
 pub(crate) const TABLE_AT: usize = 64;
-const HEADER_CRC_AT: usize = TABLE_AT + 24 * SECTIONS;
+pub(crate) const HEADER_CRC_AT: usize = TABLE_AT + 24 * SECTIONS;
 const DATA_AT: usize = (HEADER_CRC_AT + 4).next_multiple_of(8);
 
 impl Index {
@@ -1314,7 +1336,7 @@ impl Index {
 
     /// Writes the index in its file format: what `save` puts in a file and `from_bytes` reads.
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
-        let flags = self.order as u32 | (self.pos.is_some() as u32) << 1;
+        let flags = self.order as u32 | (self.pos.is_some() as u32) << 1 | widths(&self.dl, &self.ids);
         let parts = self.sections().map(Part::Bytes);
         write_segment(w, self.stats.params, flags, self.dl.len() as u64, self.stats.total_len, self.n_terms as u64, parts)
     }
@@ -1354,7 +1376,7 @@ impl Index {
         }
         let params = Params { k1: f64::from_bits(u64_at(16)), b: f64::from_bits(u64_at(24)) };
         let (shift, flags) = (u32_at(32), u32_at(36));
-        if u32_at(12) as usize != SECTIONS || shift != SHIFT || flags > 3 || !params.valid() {
+        if u32_at(12) as usize != SECTIONS || shift != SHIFT || flags >> 6 != 0 || !params.valid() {
             return Err(invalid(format!("index built with {params:?}, block shift {shift}, flags {flags}")));
         }
         let (rows, total_len, n_terms) = (u64_at(40), u64_at(48), u64_at(56) as usize);
@@ -1370,8 +1392,8 @@ impl Index {
             lex_heads: arr!(0),
             lex: arr!(1),
             post: arr!(2),
-            dl: Column::mapped(&map, sec(3), rows)?,
-            ids: Column::mapped(&map, sec(4), rows)?,
+            dl: Column::mapped(&map, sec(3), rows, flags >> 2 & 3)?,
+            ids: Column::mapped(&map, sec(4), rows, flags >> 4 & 3)?,
             blen: arr!(5),
             pos: (flags & 2 != 0).then_some(arr!(6)),
             n_terms,
@@ -1540,20 +1562,46 @@ pub(crate) struct Assembler {
     pos: Option<Words>,           // positions, if the segment stores them
     term: (Vec<u64>, Vec<u64>), // the term being added: its postings and positions, before they are appended
     lex: LexWriter,
+    spill: Option<TempDir>, // where postings and positions go while the segment is assembled
+}
+
+/// A directory this process made for its own temporary files, removed with them when dropped.
+pub(crate) struct TempDir(pub(crate) PathBuf);
+
+impl TempDir {
+    /// A new directory in `dir`, named so that no other file, nor another of ours, is touched.
+    pub(crate) fn new_in(dir: &Path, what: &str) -> io::Result<TempDir> {
+        for n in 0.. {
+            let path = dir.join(format!(".bitbm25-{what}-{}-{n}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(TempDir(path)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("some name is free")
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0); // only our files are in it
+    }
 }
 
 impl Assembler {
     pub(crate) fn new(params: Params, order: Order, positions: bool, dl: Vec<u32>, ids: Vec<u64>) -> Self {
         let avgdl = Stats::new(dl.len(), dl.iter().map(|&d| d as u64).sum(), params).avgdl;
         let (post, pos) = (Words::Mem(Vec::new()), positions.then(|| Words::Mem(Vec::new())));
-        Assembler { params, order, avgdl, dl, ids, post, pos, term: Default::default(), lex: LexWriter::default() }
+        Assembler { params, order, avgdl, dl, ids, post, pos, term: Default::default(), lex: LexWriter::default(), spill: None }
     }
 
     /// Sends postings and positions to files in `dir` instead of memory; `finish_file` then copies
     /// them into the segment file. Call before adding terms.
     pub(crate) fn spill(mut self, dir: &Path) -> io::Result<Self> {
+        let own = TempDir::new_in(dir, "merge")?;
         let file = |name: &str| {
-            let path = dir.join(name);
+            let path = own.0.join(name);
             let w = BufWriter::with_capacity(1 << 20, File::create(&path)?);
             Ok::<_, io::Error>(Words::File { w, path, words: 0, crc: crc32fast::Hasher::new() })
         };
@@ -1561,6 +1609,7 @@ impl Assembler {
         if self.pos.is_some() {
             self.pos = Some(file("pos")?);
         }
+        self.spill = Some(own);
         Ok(self)
     }
 
@@ -1578,7 +1627,7 @@ impl Assembler {
             meta.pos = out.len();
             out.put(pos)?;
         }
-        self.lex.push(name, &meta, self.pos.as_ref().map(|_| positions));
+        self.lex.push(name, &meta, self.pos.as_ref().map(|_| positions))?;
         Ok(())
     }
 
@@ -1614,8 +1663,9 @@ impl Assembler {
     /// postings or positions in memory, if the assembler was spilled.
     pub(crate) fn finish_file(self, path: &Path) -> io::Result<()> {
         let blen = self.block_lengths();
-        let flags = self.order as u32 | (self.pos.is_some() as u32) << 1;
         let total_len = self.dl.iter().map(|&d| d as u64).sum();
+        let (dl, ids) = (Column::new(self.dl.iter().map(|&d| d as u64), 2), Column::new(self.ids.iter().copied(), 4));
+        let flags = self.order as u32 | (self.pos.is_some() as u32) << 1 | widths(&dl, &ids);
         // close the spill files; what is left of each is its path, length and checksum
         let close = |w: Words| match w {
             Words::Mem(v) => Ok((None, v)),
@@ -1631,7 +1681,6 @@ impl Assembler {
                 (None, mem) => Part::Bytes(as_bytes(mem)),
             }
         }
-        let (dl, ids) = (Column::new(self.dl.iter().map(|&d| d as u64), 2), Column::new(self.ids.iter().copied(), 4));
         replace_file(path, |w| {
             let parts = [
                 Part::Bytes(as_bytes(&self.lex.heads)),
@@ -1644,12 +1693,7 @@ impl Assembler {
             ];
             write_segment(w, self.params, flags, self.dl.len() as u64, total_len, self.lex.n as u64, parts)
         })?;
-        for (file, _) in [post, pos] {
-            if let Some((path, ..)) = file {
-                std::fs::remove_file(path)?;
-            }
-        }
-        Ok(())
+        Ok(()) // the spill files go with their directory
     }
 }
 

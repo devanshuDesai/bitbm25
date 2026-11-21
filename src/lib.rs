@@ -508,6 +508,9 @@ fn merged(segs: &[SegView], spill: Option<&Path>) -> io::Result<seg::Assembler> 
     if segs.iter().any(|s| s.0.params() != params) {
         return Err(bad_input("segments built with different k1/b can't be merged"));
     }
+    if segs.iter().any(|(s, del)| !del.is_empty() && del.len() != s.rows().div_ceil(64)) {
+        return Err(bad_input("an excluded-rows bitset needs one bit per row: rows.div_ceil(64) words, or none"));
+    }
     let order = segs.first().map_or_else(Order::default, |s| s.0.order());
     // Every live row as (length, segment, row), in its new order.
     let live = |del: &[u64], row: usize| del.get(row >> SHIFT).is_none_or(|w| w >> (row & 63) & 1 == 0);
@@ -602,13 +605,9 @@ fn build_batched(
     threads: usize,
     batch_bytes: usize,
 ) -> io::Result<()> {
-    let mut parts = path.as_os_str().to_owned();
-    parts.push(".parts");
-    let parts = Path::new(&parts);
-    std::fs::create_dir_all(parts)?;
-    let built = build_in(parts, path, docs, builder, threads, batch_bytes);
-    std::fs::remove_dir_all(parts)?;
-    built
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parts = seg::TempDir::new_in(dir, "build")?; // removed when dropped, whatever happens
+    build_in(&parts.0, path, docs, builder, threads, batch_bytes)
 }
 
 /// `build_batched` with its temporary files in the directory `parts`.
@@ -630,6 +629,7 @@ fn build_in(
         }
         b.finish().save(parts.join(format!("{i}.seg")))
     };
+    let panicked = std::sync::Mutex::new(None); // the first worker panic, raised again at the end
     let work = || -> io::Result<()> {
         let mut result = Ok(());
         loop {
@@ -638,7 +638,10 @@ fn build_in(
             // After a failure, keep taking batches (and dropping them): the feeder must never wait
             // on a queue nobody empties. It stops at its next row.
             if result.is_ok() {
-                result = index(i, batch);
+                result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| index(i, batch))).unwrap_or_else(|p| {
+                    panicked.lock().expect("held only to store it").get_or_insert(p);
+                    Err(io::Error::other("a builder panicked"))
+                });
                 failed.fetch_or(result.is_err(), std::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -672,9 +675,13 @@ fn build_in(
             n += 1;
         }
         drop(send);
-        let done: io::Result<()> = workers.into_iter().try_for_each(|w| w.join().expect("workers don't panic"));
+        let done: io::Result<()> = workers.into_iter().try_for_each(|w| w.join().expect("workers catch their panics"));
         fed.and(done).map(|()| n)
-    })?;
+    });
+    if let Some(p) = panicked.into_inner().expect("no one panics holding it") {
+        std::panic::resume_unwind(p);
+    }
+    let n = n?;
     let segs = (0..n).map(|i| Index::open(parts.join(format!("{i}.seg")))).collect::<io::Result<Vec<Index>>>()?;
     match segs.len() {
         0 => builder()?.finish().save(path),
@@ -878,14 +885,23 @@ mod py {
         let analyzer = super::Analyzer::parse(analyzer)?;
         let threads = if threads == 0 { std::thread::available_parallelism().map_or(1, |n| n.get()) } else { threads };
         // Rows are pulled from Python on this thread (which holds the GIL); the workers never touch Python.
+        // A Python error while iterating ends the build as a failed source does, so no file is
+        // written; it is then raised as it was.
         let mut failed = None;
-        let rows = docs.try_iter()?.enumerate().map_while(|(id, d)| {
+        let rows = docs.try_iter()?.enumerate().map(|(id, d)| {
             let text = d.and_then(|d| Ok(d.cast::<pyo3::types::PyString>()?.to_str()?.to_owned()));
-            text.map_err(|e| failed = Some(e)).ok().map(|text| Ok((id as u64, text)))
+            text.map(|text| (id as u64, text)).map_err(|e| {
+                let msg = e.to_string();
+                failed = Some(e);
+                std::io::Error::other(msg)
+            })
         });
         let builder = || Ok(super::Builder::new(super::Params { k1, b }, analyzer.clone())?.positions(positions));
-        super::build_file(path, rows, builder, threads)?;
-        failed.map_or(Ok(()), Err)
+        let built = super::build_file(path, rows, builder, threads);
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(built?),
+        }
     }
 
     /// The (start, end) byte offsets, in `text` as UTF-8, of the words that make it match `query`
@@ -1696,6 +1712,15 @@ mod tests {
         assert!(err(with(&|b| b[8] = 9)).contains("version 9"));
         assert!(err(with(&|b| b[seg::TABLE_AT + 3] ^= 1)).contains("header is corrupt"));
         assert!(err(with(&|b| b.truncate(b.len() - 100))).contains("out of bounds"));
+        // A header that says half the rows (its checksum made to match): the lengths and ids no
+        // longer fit their recorded widths, so they aren't read as twice as wide.
+        let half_rows = |b: &mut Vec<u8>| {
+            let rows = u64::from_le_bytes(b[40..48].try_into().unwrap());
+            b[40..48].copy_from_slice(&(rows / 2).to_le_bytes());
+            let crc = crc32fast::hash(&b[..seg::HEADER_CRC_AT]);
+            b[seg::HEADER_CRC_AT..seg::HEADER_CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
+        };
+        assert!(err(with(&half_rows)).contains("size doesn't fit"));
         // A flipped bit in the postings opens (opening reads only the header) but fails verify.
         let idx = with(&|b| *b.last_mut().unwrap() ^= 1).unwrap();
         assert!(idx.verify().unwrap_err().to_string().contains("section 6 is corrupt"));
@@ -1724,11 +1749,46 @@ mod tests {
         assert_eq!(Index::open(&file.0).unwrap().rows(), 0);
         let bad = [Ok((0, "a".to_string())), Err(bad_input("no more"))].into_iter();
         assert!(build_batched(&file.0, bad, || Builder::new(Params::default(), Analyzer::whitespace()), 2, 100).is_err());
-        assert!(!file.0.with_extension("parts").exists(), "temporary segments are removed after a failure too");
+        let temp = || std::fs::read_dir(std::env::temp_dir()).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with(&format!(".bitbm25-build-{}-", std::process::id()))).count();
+        assert_eq!(temp(), 0, "temporary segments are removed after a failure too");
         // Workers that all fail end the build with their error; the feeder used to wait forever on
         // the full queue they no longer emptied.
         let rows = docs.iter().enumerate().map(|(i, d)| Ok((i as u64, d.clone())));
         assert!(build_batched(&file.0, rows, || Err(bad_input("no builder")), 2, 100).is_err());
+        // ... and a builder that panics: the panic comes back, in place of a hang
+        let rows = docs.iter().enumerate().map(|(i, d)| Ok((i as u64, d.clone())));
+        let panics = || -> io::Result<Builder> { panic!("a host's builder bug") };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_batched(&file.0, rows, panics, 2, 100)));
+        assert!(caught.is_err());
+        assert_eq!(temp(), 0, "and after a panic");
+    }
+
+    #[test]
+    fn merges_leave_the_scratch_directory_as_they_found_it() {
+        let dir = TempPath::new("scratch");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        // a host's files named as a merge's spill files once were
+        ["post", "pos"].iter().for_each(|f| std::fs::write(dir.0.join(f), b"the host's").unwrap());
+        let (a, b) = (Index::build(&corpus(500, 1, 30)), Index::build(&corpus(400, 2, 30)));
+        let views = [(&a, &[][..]), (&b, &[][..])];
+        let mut want = Vec::new();
+        merge(&views).unwrap().write_to(&mut want).unwrap();
+        // two merges at once, spilling into the same directory
+        std::thread::scope(|s| {
+            for i in 0..2 {
+                let (views, dir) = (&views, &dir.0);
+                s.spawn(move || merge_to(views, dir, &dir.join(format!("{i}.out"))).unwrap());
+            }
+        });
+        for i in 0..2 {
+            assert!(std::fs::read(dir.0.join(format!("{i}.out"))).unwrap() == want, "merge {i}");
+        }
+        let mut left: Vec<String> = std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, ["0.out", "1.out", "pos", "post"]);
+        assert!(["post", "pos"].iter().all(|f| std::fs::read(dir.0.join(f)).unwrap() == b"the host's"));
+        // and a bitset of the wrong length is refused, as queries refuse it
+        assert_eq!(merge(&[(&a, &[0u64; 1][..])]).err().map(|e| e.kind()), Some(io::ErrorKind::InvalidInput));
     }
 
     #[test]
@@ -1812,6 +1872,47 @@ mod tests {
             }
         }
         assert!(checked > 1_500, "{checked} queries filled the heap");
+    }
+
+    #[test]
+    fn ands_over_segments_of_very_different_lengths() {
+        // A segment of short rows next to one of long rows: the short one's bound bytes were made
+        // under an average length a fortieth of the collection's, so every use of them must scale
+        // them (a slip in one of the four places that did it once passed every other test). ANDs
+        // whose rarest term keeps no bound bytes there, the other term bound bytes.
+        let words = |n: usize, seed: u64, lo: usize, hi: usize| {
+            let mut s = seed;
+            let mut next = move || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 11) as f64 / (1u64 << 53) as f64
+            };
+            let row = |next: &mut dyn FnMut() -> f64| {
+                let len = lo + (next() * (hi - lo) as f64) as usize;
+                (0..len).map(|_| format!("t{}", (next().powi(4) * 50_000.0) as u32)).collect::<Vec<_>>().join(" ")
+            };
+            (0..n).map(|_| row(&mut next)).collect::<Vec<_>>()
+        };
+        let (short, long) = (Index::build(&words(20_000, 0x5EED, 2, 12)), Index::build(&words(4_000, 0xFEED, 200, 600)));
+        let views = [(&short, &[][..]), (&long, &[][..])];
+        let (mut drivers, mut partners, mut terms) = (Vec::new(), Vec::new(), short.terms());
+        while let Some(meta) = terms.next() {
+            let (p, name) = (short.postings(&meta), String::from_utf8(terms.term().to_vec()).unwrap());
+            if long.lookup(name.as_bytes()).is_some() && p.df >= 8 {
+                if p.bounds.is_none() { &mut drivers } else { &mut partners }.push(name);
+            }
+        }
+        let mut full = 0;
+        for (i, d) in drivers.iter().enumerate().take(400) {
+            let q = Query::words(&[d.as_str(), partners[i % partners.len()].as_str()], true);
+            for k in [1, 3, 10] {
+                let want = top_k_exhaustive(&views, &q, k).unwrap();
+                assert_eq!(top_k(&views, &q, k).unwrap(), want, "{q:?} top {k}");
+                full += (want.len() == k) as usize;
+            }
+        }
+        assert!(full > 100, "{full} queries filled the heap");
     }
 
     /// Rows of 1 to about 600 words (log-uniform, as real text varies), words drawn with a heavy
