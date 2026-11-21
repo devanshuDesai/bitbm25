@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
+use std::ops::Range;
 use std::sync::Arc;
 
 use rust_stemmers::{Algorithm, Stemmer};
@@ -94,12 +95,21 @@ impl Analyzer {
     }
 
     pub(crate) fn for_each_term(&self, text: &str, mut f: impl FnMut(&str)) {
+        self.for_each_term_at(text, |term, _| f(term))
+    }
+
+    /// Calls `f` with each term of `text`, in order, and the bytes of `text` its word takes up. A
+    /// word that yields no term (a stopword) is skipped. A word yields one term at most, so the
+    /// ranges ascend without overlapping; `snippet` counts on that.
+    pub(crate) fn for_each_term_at(&self, text: &str, mut f: impl FnMut(&str, Range<usize>)) {
         if !self.standard {
-            return text.split_ascii_whitespace().for_each(f);
+            // each word is a slice of `text`, so its address tells where it starts
+            let at = |word: &str| word.as_ptr() as usize - text.as_ptr() as usize;
+            return text.split_ascii_whitespace().for_each(|word| f(word, at(word)..at(word) + word.len()));
         }
         let stemmer = self.stem.map(|i| Stemmer::create(LANGUAGES[i].1));
         let mut folded = String::new();
-        for word in text.unicode_words() {
+        for (at, word) in text.unicode_word_indices() {
             let lower = word.to_lowercase();
             if self.stops.contains(lower.as_str()) {
                 continue;
@@ -111,7 +121,7 @@ impl Analyzer {
             folded.clear();
             folded.extend(stemmed.nfkd().filter(|c| !is_combining_mark(*c)));
             if !folded.is_empty() {
-                f(&folded);
+                f(&folded, at..at + word.len());
             }
         }
     }
@@ -171,6 +181,49 @@ mod tests {
         assert_eq!(en.terms("The running dogs"), ["run", "dog"]);
         let fr = Analyzer::parse("standard stem=french").unwrap();
         assert_eq!(fr.terms("été"), fr.terms("Été"));
+    }
+
+    #[test]
+    fn terms_come_with_the_bytes_of_their_words() {
+        let at = |config: &str, text: &str| {
+            let mut out = Vec::new();
+            Analyzer::parse(config).unwrap().for_each_term_at(text, |term, span| out.push((term.to_string(), span)));
+            out
+        };
+        let w = |term: &str, span: Range<usize>| (term.to_string(), span);
+        assert_eq!(at("whitespace", "  Foo-bar  ( -x\tY "), [w("Foo-bar", 2..9), w("(", 11..12), w("-x", 13..15), w("Y", 16..17)]);
+        assert_eq!(at("whitespace", "né\u{a0}e  東京"), [w("né\u{a0}e", 0..6), w("東京", 8..14)]);
+        assert_eq!(at("standard", "Café, naïve RÉSUMÉ!"), [w("cafe", 0..5), w("naive", 7..13), w("resume", 14..22)]);
+        assert_eq!(at("standard", "東京 タワー 🚀 e\u{301}te\u{301}"), [w("東", 0..3), w("京", 3..6), w("タワー", 7..16), w("ete", 22..29)]);
+        assert_eq!(at("standard stem=english stop=english", "The running dogs"), [w("run", 4..11), w("dog", 12..16)]);
+        // lowercasing and folding change how many bytes a word takes; the range is of the word as written
+        assert_eq!(at("standard", "İstanbul ﬁn Straße"), [w("istanbul", 0..9), w("fin", 10..14), w("straße", 15..22)]);
+        // Whatever the text: ranges ascend without overlapping, and each cuts out one whole word
+        // and nothing else, which analyzes to the same term alone.
+        let texts = [
+            "",
+            " \t\n",
+            "!!! ... ---",
+            "  Foo-bar  ( -x\tY ",
+            "wi-fi l'amour can't 3.14 1,000 a.b x:y foo_bar U.S.A.",
+            "Café: wi-fi l'amour can't 3.14 1,000 a.b x:y foo_bar U.S.A.",
+            "東京 タワー 🚀 e\u{301}te\u{301} ｆｕｌｌ ＷＩＤＴＨ ﬁn İstanbul Straße",
+            "The running dogs aren't here; they were RUNNING.",
+            "Les étés français étaient là, où ça ?",
+        ];
+        for config in ["whitespace", "standard", "standard stem=english stop=english", "standard stem=french stop=french"] {
+            let a = Analyzer::parse(config).unwrap();
+            for text in texts {
+                let mut end = 0;
+                a.for_each_term_at(text, |term, span| {
+                    let word = &text[span.clone()];
+                    let whole = if a.standard { word.unicode_words().eq([word]) } else { word == term };
+                    assert!(end <= span.start && whole, "{config}: {span:?} in {text:?}");
+                    assert_eq!(a.terms(word), [term], "{config}: {span:?} in {text:?}");
+                    end = span.end;
+                });
+            }
+        }
     }
 
     #[test]
