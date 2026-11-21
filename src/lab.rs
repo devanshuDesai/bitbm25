@@ -11,7 +11,7 @@ pub fn composition(idx: &Index) -> String {
     let (rows, total) = (idx.rows(), idx.size_bytes());
     // (terms, postings, words) by row form, by tf form, and for summaries
     let (mut by_rows, mut by_tfs) = (BTreeMap::<&str, [u64; 3]>::new(), BTreeMap::<&str, [u64; 3]>::new());
-    let (mut summary, mut postings, mut n_terms) = ([0u64; 3], 0u64, 0u64);
+    let (mut summary, mut stretched, mut postings, mut n_terms) = ([0u64; 3], [0u64; 3], 0u64, 0u64);
     let mut terms = idx.terms();
     while let Some(meta) = terms.next() {
         let (p, words) = idx.postings_sized(&meta);
@@ -19,8 +19,10 @@ pub fn composition(idx: &Index) -> String {
         let add = |e: &mut [u64; 3], w: usize| *e = [e[0] + 1, e[1] + p.df as u64, e[2] + w as u64];
         add(by_rows.entry(rf).or_default(), words[0]);
         add(by_tfs.entry(tf).or_default(), words[1]);
-        if p.bounds.is_some() {
-            add(&mut summary, words[2]);
+        match (p.bounds.is_some(), words[2] > 0) {
+            (true, _) => add(&mut summary, words[2]),
+            (false, true) => add(&mut stretched, words[2]),
+            _ => {}
         }
         postings += p.df as u64;
         n_terms += 1;
@@ -41,25 +43,7 @@ pub fn composition(idx: &Index) -> String {
     by_rows.iter().for_each(|(name, e)| line(&mut o, "rows", name, e));
     by_tfs.iter().for_each(|(name, e)| line(&mut o, "tf", name, e));
     line(&mut o, "", "bounds", &summary);
-    // What bound bytes would cost for the terms that keep none, by the share of blocks they are in.
-    let mut by_share = [(0u64, 0u64); 4]; // at least 1/4, 1/8, 1/16, 1/32 of the blocks
-    let mut terms = idx.terms();
-    while let Some(meta) = terms.next() {
-        let p = idx.postings(&meta);
-        if p.bounds.is_some() || (p.df as u64) * 32 < idx.blocks() as u64 {
-            continue;
-        }
-        let mut blocks = 0u64;
-        p.for_each_block(0..idx.blocks(), |_, _, _| blocks += 1);
-        for (k, e) in by_share.iter_mut().enumerate() {
-            if blocks << (k + 2) >= idx.blocks() as u64 {
-                *e = (e.0 + 1, e.1 + idx.blocks() as u64);
-            }
-        }
-    }
-    for (k, (n, bytes)) in by_share.iter().enumerate() {
-        writeln!(o, "  without bounds, in >= 1/{} of the blocks: {n} terms, {:.1} MB of bound bytes", 4 << k, *bytes as f64 / 1e6).unwrap();
-    }
+    line(&mut o, "", "stretches", &stretched);
     o
 }
 
@@ -97,15 +81,4 @@ pub fn work() -> [u64; 5] {
     return std::array::from_fn(|i| crate::scan::WORK[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     #[cfg(not(feature = "prof"))]
     [0; 5]
-}
-
-/// Sets the ranked scan's experiment knobs (`prof` builds): seed blocks per window (0: default),
-/// and a mode (1: every window seeds).
-pub fn knobs(seed: u64, mode: u64) {
-    #[cfg(feature = "prof")]
-    {
-        crate::scan::KNOBS[0].store(seed, std::sync::atomic::Ordering::Relaxed);
-        crate::scan::KNOBS[1].store(mode, std::sync::atomic::Ordering::Relaxed);
-    }
-    let _ = (seed, mode);
 }

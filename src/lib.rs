@@ -1,21 +1,23 @@
 //! bitbm25: exact BM25 top-k, match counts and unscored match sets over immutable segments.
 //!
-//! A segment (`seg`) groups its rows into 64-row blocks and stores each term's rows compactly: a
-//! row bitmap for frequent terms, Elias-Fano for the rest, one or two rows inline in the lexicon.
-//! Term frequencies and row lengths are exact. Scores are computed at query time from them and the
-//! current collection statistics (row count, document frequency, average length), so nothing stored
-//! goes stale when those change.
+//! A segment (`seg`) groups its rows into 64-row blocks and stores each term's rows in one of four
+//! forms: one or two rows inline in the lexicon, Elias-Fano, a bitmap word per block, or two levels
+//! of bytes. Term frequencies and row lengths are exact. Scores are computed at query time from them
+//! and the current collection statistics (row count, document frequency, average length), so
+//! nothing stored goes stale when those change.
 //!
-//! No score bounds are stored. The most a term can score in a block follows from the largest tf it
-//! has there and the length of the block's shortest row, both known exactly, under whatever the
-//! statistics are now. Segments order their rows by length by default, which makes that bound tight.
+//! Segments order their rows by length by default, so the most a term can score in a block follows
+//! from the largest tf it has there and the length of the block's shortest row. Terms in a quarter
+//! of the blocks or more also store that bound, a byte per block; other Elias-Fano terms a byte per
+//! stretch of their rows (see `seg`).
 //!
 //! Queries (`scan`) sum those bounds per block, skip blocks that can't reach the current k-th score,
 //! and inside the others score only the rows whose own bound can. AND is `&` on row masks, OR is `|`,
 //! a count is a popcount. Results are exact: equal to scoring every match.
 //!
-//! On disk a segment is its arrays as they are in memory, so opening one maps the file (or takes any
-//! byte buffer the host holds) and reads nothing else; see `Index::write_to` for the layout.
+//! On disk a segment is its arrays as they are in memory, after a header (see the comment above
+//! `seg::TABLE_AT`), so opening one maps the file (or takes any byte buffer the host holds) and reads
+//! nothing else.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -59,7 +61,7 @@ impl Default for Params {
 }
 
 impl Params {
-    /// k1 in [0, 1000] (larger would overflow f32 scores), b in [0, 1].
+    /// k1 in [0, 1000], b in [0, 1]: the range BM25 is used in, with room to spare.
     fn valid(self) -> bool {
         (0.0..=1000.0).contains(&self.k1) && (0.0..=1.0).contains(&self.b)
     }
@@ -1622,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn k1_too_large_for_f32_scores_is_refused() {
+    fn k1_and_b_out_of_range_are_refused() {
         let bad = |k1| Builder::new(Params { k1, b: 0.75 }, Analyzer::whitespace()).err().map(|e| e.kind());
         assert_eq!(bad(1e37), Some(io::ErrorKind::InvalidInput));
         assert_eq!(bad(1e4), Some(io::ErrorKind::InvalidInput));

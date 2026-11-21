@@ -7,7 +7,7 @@
 //!
 //! Terms present in at least a quarter of the blocks do keep a bound, one byte per block: the
 //! largest length-dependent score part there, rounded up to a 255th of its ceiling (k1 + 1). Queries
-//! sum those bytes sixteen blocks at a time, and they are tight in either row order. Below that, an
+//! sum those bytes eight blocks at a time, and they are tight in either row order. Below that, an
 //! Elias-Fano term keeps one such byte per stretch of 64 of its buckets (one per Elias-Fano sample):
 //! about a byte per 64 to 128 postings, which bounds it in the blocks it was not decoded for.
 //!
@@ -1124,8 +1124,10 @@ const MAGIC: &[u8; 8] = b"BITBM25\0";
 const VERSION: u32 = 6;
 const SECTIONS: usize = 7;
 // Header: magic, version u32, section count u32, k1 f64, b f64, block shift u32, flags u32 (bit 0:
-// rows as added; bit 1: positions), rows u64, total length u64, terms u64, then per section (offset u64, bytes u64, crc32 u32,
-// zero u32), then a crc32 of all of that. Sections follow, each 8-byte aligned.
+// rows as added; bit 1: positions; bits 2-3 and 4-5: the lengths' and ids' widths, 2 << code bytes),
+// rows u64, total length u64, terms u64, then per section (offset u64, bytes u64, crc32 u32,
+// zero u32), then a crc32 of all of that. Sections follow, each 8-byte aligned: lexicon group heads,
+// lexicon, postings, lengths, ids, block length classes, positions.
 pub(crate) const TABLE_AT: usize = 64;
 pub(crate) const HEADER_CRC_AT: usize = TABLE_AT + 24 * SECTIONS;
 const DATA_AT: usize = (HEADER_CRC_AT + 4).next_multiple_of(8);

@@ -89,8 +89,6 @@ fn main() -> std::io::Result<()> {
             // lab phases <index> <queries.tsv>: where ranked scans spend their time (build with --features prof)
             let idx = Index::open(&args[2])?;
             let segs = [(&idx, &[][..])];
-            let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            bitbm25::lab::knobs(env("SEED"), env("MODE"));
             println!("{:<10} {:>8} {:>8} {:>8} {:>8} | {:>8} {:>8}   (ms and counts per query)", "kind", "total", "setup", "bounds", "blocks", "blocks", "rows");
             for (name, qs) in load(&args[3])? {
                 let mut best = [f64::INFINITY; 4];
@@ -112,12 +110,14 @@ fn main() -> std::io::Result<()> {
             }
         }
         Some("trace") => {
-            // lab trace <index> <words...>: one OR (AND with AND=1) query, traced (build with --features prof, run with TRACE=1)
+            // lab trace <index> <words...>: one OR (AND with AND=1) query's hits and, with --features
+            // prof, the blocks and rows it scored
             let idx = Index::open(&args[2])?;
             let words: Vec<&str> = args[3..].iter().map(String::as_str).collect();
             bitbm25::lab::work();
             let hits = bitbm25::top_k(&[(&idx, &[][..])], &Query::words(&words, std::env::var("AND").is_ok()), 10)?;
-            println!("{hits:?}");
+            let w = bitbm25::lab::work();
+            println!("{hits:?}\nblocks scored {}, rows scored {}", w[3], w[4]);
         }
         Some("bench") => bench(&args[2], &args[3], args.get(4).map_or(5, |r| r.parse().unwrap()))?,
         _ => eprintln!("usage: lab build|stats|bench ... (see the file header)"),
@@ -184,7 +184,7 @@ fn bench(index: &str, queries: &str, reps: usize) -> std::io::Result<()> {
     let sets = load(queries)?;
     let k = std::env::var("K").ok().and_then(|k| k.parse().ok()).unwrap_or(10);
     println!("{} rows, top {k}, {} reps; ms per query, best of reps; instructions and cycles per query (thousands), one pass", idx.rows(), reps);
-    println!("{:<10} {:<6} {:>5} {:>9} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9}  exact", "kind", "mode", "n", "qps", "mean", "p50", "p95", "p99", "k-instr", "k-cycles");
+    println!("{:<10} {:<6} {:>5} {:>9} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9}  pruned=exhaustive", "kind", "mode", "n", "qps", "mean", "p50", "p95", "p99", "k-instr", "k-cycles");
     for (name, qs) in &sets {
         for mode in ["top", "count"] {
             let mut best = vec![f64::INFINITY; qs.len()];
@@ -203,9 +203,13 @@ fn bench(index: &str, queries: &str, reps: usize) -> std::io::Result<()> {
                 let after = usage();
                 (instr, cycles) = (instr.min(after.0 - before.0), cycles.min(after.1 - before.1));
             }
-            // Exactness: pruned top-k equals the exhaustive one (first 50 queries; it is slow).
-            let exact = mode == "count"
-                || qs.iter().take(50).all(|q| bitbm25::top_k(&segs, q, k).unwrap() == bitbm25::top_k_exhaustive(&segs, q, k).unwrap());
+            // Pruned top-k against the crate's own exhaustive path on the first 50 queries (it is slow);
+            // counts aren't checked here. `examples/verify.rs` checks both against the corpus itself.
+            let exact = match mode {
+                "count" => "-",
+                _ if qs.iter().take(50).all(|q| bitbm25::top_k(&segs, q, k).unwrap() == bitbm25::top_k_exhaustive(&segs, q, k).unwrap()) => "same",
+                _ => "DIFFERS",
+            };
             if let Ok(path) = std::env::var("DUMP") {
                 // per-query best times, to compare engines query by query
                 let lines: String = best.iter().enumerate().map(|(i, ms)| format!("{name}\t{mode}\t{i}\t{ms:.4}\n")).collect();

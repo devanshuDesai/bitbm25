@@ -24,7 +24,7 @@ unicode-segmentation = "1.13"
 
 [features]
 python = ["dep:pyo3"]
-prof = [] # keeps hot functions out of line so a sampling profiler can tell them apart
+prof = [] # keeps hot functions out of line so a sampling profiler can tell them apart, and times ranked scans (lab phases)
 
 [profile.release]
 lto = true

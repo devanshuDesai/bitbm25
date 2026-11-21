@@ -3,7 +3,8 @@
 //! Blocks are handled a window at a time (`WINDOW` blocks), so per-query state stays in L1 however
 //! large the segment is. For ranked ORs and trees:
 //!   1. every scoring term adds its bound for each block of the window into a `u16` accumulator.
-//!      Terms in most blocks keep a bound byte per block and add sixteen blocks per step; for the
+//!      Terms in a quarter of the blocks or more keep a bound byte per block and add eight blocks
+//!      per step; for the
 //!      others the bound comes from the largest tf the term has in the block and the block's
 //!      shortest row, found while its postings for the window are decoded (once: step 3 reuses them);
 //!   2. blocks whose summed bound can't reach the current k-th score are skipped;
@@ -30,11 +31,6 @@ const SEED: usize = 32; // blocks scored first, best bound first, while the heap
 /// setting up, summing bounds, and scoring blocks; then blocks scored and rows scored.
 #[cfg(feature = "prof")]
 pub static WORK: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
-
-/// Experiment knobs (`prof` builds): blocks seeded per window, and whether windows after the heap
-/// is full seed too.
-#[cfg(feature = "prof")]
-pub static KNOBS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 #[cfg(feature = "prof")]
 fn work(i: usize, n: u64) {
@@ -471,18 +467,12 @@ impl<'a, 's> Scan<'a, 's> {
             lap(1);
             // While the heap is filling, score the window's best blocks first: the threshold they set
             // spares most of the rest.
-            #[cfg(feature = "prof")]
-            let (seed, always) = (KNOBS[0].load(std::sync::atomic::Ordering::Relaxed) as usize, KNOBS[1].load(std::sync::atomic::Ordering::Relaxed) == 1);
-            #[cfg(feature = "prof")]
-            let seed = if seed == 0 { SEED } else { seed };
-            #[cfg(not(feature = "prof"))]
-            let (seed, always) = (SEED, false);
-            if prune && (always || top.heap.len() < top.k) {
+            if prune && top.heap.len() < top.k {
                 let min = need(top);
                 let mut best: Vec<u32> = (b0..b1).filter(|&b| acc[(b - b0) as usize] >= min).collect();
-                if best.len() > seed {
-                    best.select_nth_unstable_by_key(seed, |&b| std::cmp::Reverse(acc[(b - b0) as usize]));
-                    best.truncate(seed);
+                if best.len() > SEED {
+                    best.select_nth_unstable_by_key(SEED, |&b| std::cmp::Reverse(acc[(b - b0) as usize]));
+                    best.truncate(SEED);
                 }
                 best.sort_unstable();
                 for b in best {
@@ -501,11 +491,6 @@ impl<'a, 's> Scan<'a, 's> {
             }
             #[cfg(feature = "prof")]
             lap(2);
-            #[cfg(feature = "prof")]
-            if std::env::var("TRACE").is_ok() {
-                eprintln!("  window {:>3}: lengths {:>5}..  live-eligible {:>4}  threshold {:.3}  scored so far {} blocks {} rows", b0 / WINDOW, self.seg.idx.dl((b0 << SHIFT) as usize),
-                    acc.iter().filter(|&&a| a >= need(top)).count(), top.threshold(), WORK[3].load(std::sync::atomic::Ordering::Relaxed), WORK[4].load(std::sync::atomic::Ordering::Relaxed));
-            }
         }
     }
 

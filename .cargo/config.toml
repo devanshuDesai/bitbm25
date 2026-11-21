@@ -1,0 +1,5 @@
+# x86-64 builds assume POPCNT and SSE4.2 (x86-64-v2: every x86 server CPU since 2009). Counts and
+# row filters take a popcount per block; on the bare x86-64 baseline each one is a dozen or more
+# instructions. aarch64 needs nothing: NEON is part of its baseline.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v2"]
