@@ -5,9 +5,11 @@
 //! best possible score in a block follows from the largest tf it has there and the block's shortest
 //! row: nothing about bounds is stored per posting. `ids` maps a row back to the host's id.
 //!
-//! Terms present in at least half the blocks do keep a bound, one byte per block: the largest
-//! length-dependent score part there, rounded up to a 255th of its ceiling (k1 + 1). Queries sum
-//! those bytes sixteen blocks at a time, and they are tight in either row order.
+//! Terms present in at least a quarter of the blocks do keep a bound, one byte per block: the
+//! largest length-dependent score part there, rounded up to a 255th of its ceiling (k1 + 1). Queries
+//! sum those bytes sixteen blocks at a time, and they are tight in either row order. Below that, an
+//! Elias-Fano term keeps one such byte per stretch of 64 of its buckets (one per Elias-Fano sample):
+//! about a byte per 64 to 128 postings, which bounds it in the blocks it was not decoded for.
 //!
 //! A term's rows are stored in one of four forms, by how many it has:
 //!   - one or two rows: inline in the lexicon;
@@ -90,6 +92,7 @@ const TF_SMALL: u8 = 1 << 2; // two bits, a nibble for 4..18, a table beyond
 const TF_BYTES: u8 = 2 << 2; // a byte, a table for 255 and more
 const TF_MASK: u8 = 3 << 2; // neither: every tf is 1
 const BOUNDS: u8 = 1 << 4; // a bound byte per block follows
+const DENSE: u8 = 1 << 5; // in at least half the blocks: Elias-Fano samples every 8th bucket
 
 /// Where a term's postings are, as the lexicon records it.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -346,12 +349,15 @@ pub(crate) struct Postings<'a> {
     pub(crate) df: usize,
     rows: Rows<'a>,
     tfs: Tfs<'a>,
-    /// A byte per block, for terms in at least half of them: the largest tf_part any of its rows
+    /// A byte per block, for terms in at least a quarter of them: the largest tf_part any of its rows
     /// there has (under the segment's own average length), in 255ths of k1 + 1, rounded up; 0 where
     /// the term is absent.
     pub(crate) bounds: Option<&'a [u64]>,
     /// The largest such byte over all the term's rows: the most it can score anywhere.
     pub(crate) top: u8,
+    /// For an Elias-Fano term without bound bytes that spans several of its sampled stretches (2^s
+    /// buckets each), the largest byte in each stretch, and log2 of the blocks a stretch covers.
+    segs: Option<(&'a [u8], u32)>,
     positions: Positions<'a>,
 }
 
@@ -669,6 +675,26 @@ impl<'a> Postings<'a> {
         self.bounds.map(|s| (s[b as usize >> 3] >> (8 * (b & 7))) as u8)
     }
 
+    /// The largest bound byte of the term's rows in the blocks `blocks`: from its stretches' bytes
+    /// where it keeps them, else `top` (rows may be absent: this only bounds).
+    #[inline]
+    pub(crate) fn bound_over(&self, blocks: std::ops::Range<u32>) -> u8 {
+        match self.segs {
+            Some((segs, shift)) if !blocks.is_empty() => {
+                segs[(blocks.start >> shift) as usize..=((blocks.end - 1) >> shift) as usize].iter().copied().max().unwrap_or(0)
+            }
+            _ => self.top,
+        }
+    }
+
+    /// The blocks of each stretch the term keeps a byte for, in order (all of `blocks` as one when
+    /// it keeps none).
+    pub(crate) fn stretches(&self, blocks: u32) -> impl Iterator<Item = std::ops::Range<u32>> {
+        let shift = self.segs.map_or(32, |(_, shift)| shift);
+        (0..blocks.div_ceil(1u32.checked_shl(shift).unwrap_or(u32::MAX).max(1)))
+            .map(move |g| g.checked_shl(shift).unwrap_or(0)..(g + 1).checked_shl(shift).unwrap_or(blocks).min(blocks))
+    }
+
     /// The largest tf in block `b`, given what `block` returned for it.
     #[inline]
     pub(crate) fn block_tf(&self, b: u32, mask: u64, first: usize) -> u32 {
@@ -776,12 +802,16 @@ fn write_term(rows: &[u32], tfs: &[u32], dl: &[u32], avgdl: f64, params: Params,
     m.off = post.len() as u64;
     let blocks = n_rows.div_ceil(64);
 
-    // A term in at least half the blocks keeps bounds (below), and its Elias-Fano samples every 8th
-    // block instead of every 64th bucket, since queries will look it up in most blocks they score.
+    // A term in at least a quarter of the blocks keeps bounds (below). In at least half, its
+    // Elias-Fano samples every 8th block instead of every 64th bucket, since queries will look it up
+    // in most blocks they score.
     let entries = 1 + rows.windows(2).filter(|w| w[0] >> SHIFT != w[1] >> SHIFT).count();
-    let summary = 2 * entries >= blocks;
+    let summary = 4 * entries >= blocks;
+    if 2 * entries >= blocks {
+        m.kind |= DENSE;
+    }
     let l = (n_rows / df).max(1).ilog2().max(SHIFT);
-    let s = ef_samples(summary, l);
+    let s = ef_samples(m.kind & DENSE != 0, l);
     let rank_words = blocks.div_ceil(8).div_ceil(2);
     let n_groups = 1 + rows.windows(2).filter(|w| w[0] >> 3 != w[1] >> 3).count(); // 8-row groups with a row
     let at_words = blocks.div_ceil(8) + 1; // two u32s for every 8th block, and for the end
@@ -863,22 +893,47 @@ fn write_term(rows: &[u32], tfs: &[u32], dl: &[u32], avgdl: f64, params: Params,
         post.extend(tfs.iter().enumerate().filter(|(_, &tf)| tf >= cap).map(|(i, &tf)| (i as u64) << 32 | tf as u64));
     }
 
-    // Bounds: the largest tf_part of the term's rows, over all of them and, for terms in at least
-    // half the blocks, per block.
+    // Bounds: the largest tf_part of the term's rows, over all of them and, for terms in at least a
+    // quarter of the blocks, per block; for other Elias-Fano terms, per sampled stretch.
     let at = post.len();
     if summary {
         m.kind |= BOUNDS;
         post.resize(at + blocks.div_ceil(8), 0);
     }
+    let stretches = stretches(m.kind, n_rows, m.l as u32);
+    let segs = post.len();
+    if let Some((n, _)) = stretches {
+        post.resize(segs + n.div_ceil(8), 0);
+    }
+    let put = |post: &mut Vec<u64>, at: usize, i: usize, byte: u8| {
+        let (w, o) = (at + i / 8, 8 * (i % 8));
+        post[w] = post[w] & !(255 << o) | (post[w] >> o & 255).max(byte as u64) << o;
+    };
     for (&r, &tf) in rows.iter().zip(tfs) {
         let byte = bound_byte(tf, dl[r as usize], avgdl, params);
         m.top = m.top.max(byte);
         if summary {
-            let (w, o) = (at + (r >> SHIFT) as usize / 8, 8 * ((r >> SHIFT) % 8));
-            post[w] = post[w] & !(255 << o) | (post[w] >> o & 255).max(byte as u64) << o;
+            put(post, at, (r >> SHIFT) as usize, byte);
+        }
+        if let Some((_, shift)) = stretches {
+            put(post, segs, (r >> SHIFT >> shift) as usize, byte);
         }
     }
     m
+}
+
+/// For an Elias-Fano term without bound bytes: how many stretches of 2^s buckets (one Elias-Fano
+/// sample each) its rows span, and log2 of the blocks one covers, if more than one. Each gets the
+/// largest bound byte of its rows, a block bound for terms too sparse to keep one per block: about
+/// one byte per 64 to 128 postings.
+fn stretches(kind: u8, n_rows: usize, l: u32) -> Option<(usize, u32)> {
+    if kind & (FORM_MASK | BOUNDS) != 0 {
+        return None; // a mask form, or bound bytes
+    }
+    let s = ef_samples(false, l);
+    let buckets = ((n_rows.max(1) - 1) >> l) + 1;
+    let n = buckets.div_ceil(1 << s);
+    (n > 1).then_some((n, s + l - SHIFT))
 }
 
 /// Appends a term's positions (each posting's, back to back, in posting order) to `out`.
@@ -905,8 +960,8 @@ fn write_positions(rows: &[u32], tfs: &[u32], positions: &[u32], dl: &[u32], out
 
 /// Elias-Fano's sample interval (as a shift): every 8th bucket when buckets are blocks and the term
 /// is in most of them, else every 64th.
-fn ef_samples(summary: bool, l: u32) -> u32 {
-    if summary && l == SHIFT {
+fn ef_samples(dense: bool, l: u32) -> u32 {
+    if dense && l == SHIFT {
         3
     } else {
         6
@@ -956,7 +1011,7 @@ pub struct Index {
 }
 
 const MAGIC: &[u8; 8] = b"BITBM25\0";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const SECTIONS: usize = 7;
 // Header: magic, version u32, section count u32, k1 f64, b f64, block shift u32, flags u32 (bit 0:
 // rows as added; bit 1: positions), rows u64, total length u64, terms u64, then per section (offset u64, bytes u64, crc32 u32,
@@ -1078,7 +1133,7 @@ impl Index {
             };
             let byte = |&(row, tf): &(u32, u32)| bound_byte(tf, self.dl[row as usize], self.stats.avgdl, self.stats.params);
             let top = m.inline[..df].iter().map(byte).max().unwrap_or(0);
-            return (Postings { df, rows: Rows::Inline(rows), tfs: Tfs::Inline(tfs), bounds: None, top, positions }, [0; 3]);
+            return (Postings { df, rows: Rows::Inline(rows), tfs: Tfs::Inline(tfs), bounds: None, top, segs: None, positions }, [0; 3]);
         }
         let (n_rows, blocks) = (self.rows(), self.rows().div_ceil(64));
         let w = &mut &self.post[m.off as usize..];
@@ -1092,10 +1147,11 @@ impl Index {
             let n_groups = at[2 * blocks.div_ceil(8)] as usize;
             Rows::Bytes { present, at, groups: bits::as_u8(take(w, n_groups.div_ceil(8) + 1)) }
         } else {
-            let (ef, used) = Ef::read(w, df, n_rows, m.l as u32, ef_samples(m.kind & BOUNDS != 0, m.l as u32));
+            let (ef, used) = Ef::read(w, df, n_rows, m.l as u32, ef_samples(m.kind & DENSE != 0, m.l as u32));
             take(w, used);
             Rows::Ef(ef)
         };
+        let stretches = stretches(m.kind, n_rows, m.l as u32);
         let (big, after_rows) = (m.n_big as usize, w.len());
         let tfs = match m.kind & TF_MASK {
             TF_SMALL => {
@@ -1109,6 +1165,7 @@ impl Index {
         };
         let after_tfs = w.len();
         let bounds = (m.kind & BOUNDS != 0).then(|| take(w, blocks.div_ceil(8)));
+        let segs = stretches.map(|(n, shift)| (bits::as_u8(take(w, n.div_ceil(8))), shift));
         let positions = match &self.pos {
             Some(pos) => {
                 let (chunks, data) = pos[m.pos as usize..].split_at(df.div_ceil(64));
@@ -1116,7 +1173,7 @@ impl Index {
             }
             None => Positions::None,
         };
-        (Postings { df, rows, tfs, bounds, top: m.top, positions }, [start - after_rows, after_rows - after_tfs, after_tfs - w.len()])
+        (Postings { df, rows, tfs, bounds, top: m.top, segs, positions }, [start - after_rows, after_rows - after_tfs, after_tfs - w.len()])
     }
 
     /// Size of the index's arrays, which is also its file size less a few hundred bytes of header.

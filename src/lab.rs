@@ -41,7 +41,7 @@ pub fn composition(idx: &Index) -> String {
     by_rows.iter().for_each(|(name, e)| line(&mut o, "rows", name, e));
     by_tfs.iter().for_each(|(name, e)| line(&mut o, "tf", name, e));
     line(&mut o, "", "bounds", &summary);
-    // What bound bytes would cost for terms in fewer than half the blocks, by the share they are in.
+    // What bound bytes would cost for the terms that keep none, by the share of blocks they are in.
     let mut by_share = [(0u64, 0u64); 4]; // at least 1/4, 1/8, 1/16, 1/32 of the blocks
     let mut terms = idx.terms();
     while let Some(meta) = terms.next() {

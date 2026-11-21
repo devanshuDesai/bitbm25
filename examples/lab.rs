@@ -81,11 +81,11 @@ fn main() -> std::io::Result<()> {
             }
         }
         Some("trace") => {
-            // lab trace <index> <words...>: one OR query, window by window (build with --features prof, run with TRACE=1)
+            // lab trace <index> <words...>: one OR (AND with AND=1) query, traced (build with --features prof, run with TRACE=1)
             let idx = Index::open(&args[2])?;
             let words: Vec<&str> = args[3..].iter().map(String::as_str).collect();
             bitbm25::lab::work();
-            let hits = bitbm25::top_k(&[(&idx, &[][..])], &Query::words(&words, false), 10)?;
+            let hits = bitbm25::top_k(&[(&idx, &[][..])], &Query::words(&words, std::env::var("AND").is_ok()), 10)?;
             println!("{hits:?}");
         }
         Some("bench") => bench(&args[2], &args[3], args.get(4).map_or(5, |r| r.parse().unwrap()))?,

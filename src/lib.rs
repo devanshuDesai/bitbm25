@@ -1326,9 +1326,11 @@ mod tests {
     #[test]
     fn block_bounds_never_underestimate() {
         // A term's bound in a block is its stored byte, or comes from its largest tf there and the
-        // block's shortest row: no row of the block may score more, in either row order.
-        let (mut stored, mut derived) = (0, 0);
-        for docs in corpora() {
+        // block's shortest row; and the byte of the stretch the block is in: no row of the block may
+        // score more, in either row order.
+        let (mut stored, mut derived, mut tighter) = (0, 0, 0);
+        // the large sparse corpus has terms in a few of its 625 blocks that span several stretches
+        for docs in corpora().into_iter().chain([sparse_corpus(40_000, 23)]) {
             for order in [Order::Length, Order::Added] {
                 let mut b = Builder::new(Params::default(), Analyzer::whitespace()).unwrap().order(order);
                 docs.iter().enumerate().for_each(|(i, d)| b.add(i as u64, d).unwrap());
@@ -1347,10 +1349,13 @@ mod tests {
                             }
                         };
                         *if p.bounds.is_some() { &mut stored } else { &mut derived } += 1;
+                        let stretch = idf * p.bound_over(b..b + 1) as f32 * (st.k1p1 / 255.0);
+                        tighter += (p.bound_over(b..b + 1) < p.top) as usize;
                         while rows != 0 {
                             let (row, tf) = ((b << SHIFT | rows.trailing_zeros()) as usize, p.tf(i) as f32);
                             let score = idf * tf * st.k1p1 / (tf + st.c0 + st.c1 * idx.dl[row] as f32);
                             assert!(score > 0.0 && score <= bound * (1.0 + 1e-6), "block {b} row {row}: {score} above {bound}");
+                            assert!(score <= stretch * (1.0 + 1e-6), "block {b} row {row}: {score} above its stretch's {stretch}");
                             i += 1;
                             rows &= rows - 1;
                         }
@@ -1358,7 +1363,73 @@ mod tests {
                 }
             }
         }
-        assert!(stored > 5_000 && derived > 5_000, "{stored} {derived}");
+        assert!(stored > 5_000 && derived > 5_000 && tighter > 1_000, "{stored} {derived} {tighter}");
+    }
+
+    #[test]
+    fn stretch_skips_keep_exact_results() {
+        // Terms in a few of 625 blocks keep a bound byte per stretch of their rows, and ranked ANDs
+        // skip stretches and look-ups by them: pruned results must equal exhaustive ones.
+        let docs = zipf_corpus(20_000, 29);
+        let idx = Index::build(&docs);
+        let segs = [(&idx, &[][..])];
+        let mut terms = idx.terms();
+        let mut mid = Vec::new(); // terms in 1/32..1/4 of the blocks
+        while let Some(meta) = terms.next() {
+            let p = idx.postings(&meta);
+            if p.bounds.is_none() && p.df * 32 >= idx.blocks() as usize && p.df * 4 < idx.blocks() as usize {
+                mid.push(String::from_utf8(terms.term().to_vec()).unwrap());
+            }
+        }
+        assert!(mid.len() > 100, "{} terms in the band", mid.len());
+        let mid: HashSet<&str> = mid.iter().map(String::as_str).collect();
+        // words of one row, so the AND matches it at least (and its first two words as a phrase)
+        let (mut checked, mut s) = (0, 0x9E37u64);
+        for i in 0..3000 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let row: Vec<&str> = docs[(s >> 33) as usize % docs.len()].split(' ').collect();
+            let mut words: Vec<&str> = row.iter().copied().filter(|w| mid.contains(w)).collect();
+            words.dedup();
+            words.truncate(2 + i % 2);
+            let q = match (i % 5, words.len()) {
+                (0, _) if row.len() > 1 => Query::Phrase(row[..2].iter().map(|w| w.to_string()).collect()),
+                (_, n) if n > 1 => Query::words(&words, true),
+                _ => continue,
+            };
+            for k in [1, 3, 10] {
+                // small k fills the heap, so the threshold prunes, however few rows match
+                let (got, want) = (top_k(&segs, &q, k).unwrap(), top_k_exhaustive(&segs, &q, k).unwrap());
+                assert_eq!(got, want, "{q:?} top {k}");
+                checked += (want.len() == k) as usize;
+            }
+        }
+        assert!(checked > 1_500, "{checked} queries filled the heap");
+    }
+
+    /// Rows of 1 to about 600 words (log-uniform, as real text varies), words drawn with a heavy
+    /// skew from 50,000, a fifth of them repeated: scores spread as in real corpora, so bounds that
+    /// are too low show.
+    fn zipf_corpus(n: usize, seed: u64) -> Vec<String> {
+        let mut s = seed;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / (1u64 << 53) as f64
+        };
+        (0..n)
+            .map(|_| {
+                let len = (next() * 600f64.ln()).exp() as usize;
+                let mut words: Vec<String> = Vec::with_capacity(len);
+                while words.len() < len {
+                    match words.last() {
+                        Some(w) if next() < 0.2 => words.push(w.clone()),
+                        _ => words.push(format!("t{}", (next().powi(4) * 50_000.0) as u32)),
+                    }
+                }
+                words.join(" ")
+            })
+            .collect()
     }
 
     /// Like `corpus`, with a vocabulary of thousands of words so that most are in few blocks.

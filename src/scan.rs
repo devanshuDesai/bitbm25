@@ -635,11 +635,6 @@ impl<'a, 's> Scan<'a, 's> {
         }
     }
 
-    /// The most term `t` can score in any row of this segment.
-    fn top_bound(&self, t: &QTerm) -> f32 {
-        t.idf * t.p.top as f32 * self.unit
-    }
-
     /// Rows holding every term of `need` (the plan's scoring terms), those of each of `phrases`
     /// adjacent.
     ///
@@ -660,34 +655,15 @@ impl<'a, 's> Scan<'a, 's> {
         // blocks are cheaper to AND a window at a time.
         if matches!(sink, Sink::Top { prune: true, .. }) || (term(driver).p.df as u64) * 8 < blocks as u64 {
             let lead = term(driver).p;
-            return lead.for_each_block(0..blocks, |b, m, first| {
-                let mut rows = m & !self.excluded(b);
-                self.cur[driver] = Some((m, first));
-                // Before any lookup: is every term with bound bytes here, and can a row qualify if
-                // each other term scored its most (in this block, where its bytes say)?
-                let mut others = 0f64;
-                for &j in &need[1..] {
-                    let t = term(j);
-                    others += match t.p.bound(b) {
-                        Some(0) => return,
-                        Some(byte) => (t.idf * byte as f32 * self.unit) as f64,
-                        None => self.top_bound(t) as f64,
-                    };
+            for stretch in lead.stretches(blocks) {
+                // Ranked: can a row of the stretch qualify, every term scoring its most there?
+                let most = |theta: f32| need.iter().map(|&j| (term(j).idf * term(j).p.bound_over(stretch.clone()) as f32 * self.unit) as f64).sum::<f64>() * (1.0 + 1e-5) < theta as f64;
+                if theta(sink).is_some_and(most) {
+                    continue;
                 }
-                if theta(sink).is_some_and(|theta| (self.bound(driver, term(driver), b) as f64 + others) * (1.0 + 1e-5) < theta as f64) {
-                    return;
-                }
-                for &j in &need[1..] {
-                    if rows == 0 {
-                        return;
-                    }
-                    self.cur[j] = term(j).p.block(b);
-                    rows &= self.cur[j].map_or(0, |c| c.0);
-                }
-                if rows != 0 {
-                    self.all_block(b, rows, &need, phrases, sink);
-                }
-            });
+                lead.for_each_block(stretch, |b, m, first| self.lead_block(b, m, first, &need, phrases, sink));
+            }
+            return;
         }
 
         let (mut rows, mut other) = ([0u64; WINDOW as usize], [0u64; WINDOW as usize]);
@@ -715,6 +691,40 @@ impl<'a, 's> Scan<'a, 's> {
                 need.iter().for_each(|&j| self.cur[j] = term(j).p.block(b));
                 self.all_block(b, rows, &need, phrases, sink);
             }
+        }
+    }
+
+    /// `all` for block `b` of the driver (`need[0]`), which has rows `m` there from posting `first`.
+    /// Before any lookup: is every term with bound bytes here, and can a row qualify if each other
+    /// term scored its most (in this block where its bytes say, else in its stretch)?
+    #[inline]
+    fn lead_block(&mut self, b: u32, m: u64, first: usize, need: &[usize], phrases: &[Vec<usize>], sink: &mut Sink) {
+        let seg = self.seg;
+        let term = |j: usize| seg.terms[j].as_ref().expect("a term of this segment");
+        let (driver, mut rows) = (need[0], m & !self.excluded(b));
+        self.cur[driver] = Some((m, first));
+        let mut others = 0f64;
+        for &j in &need[1..] {
+            let t = term(j);
+            let byte = match t.p.bound(b) {
+                Some(0) => return,
+                Some(byte) => byte,
+                None => t.p.bound_over(b..b + 1),
+            };
+            others += (t.idf * byte as f32 * self.unit) as f64;
+        }
+        if theta(sink).is_some_and(|theta| (self.bound(driver, term(driver), b) as f64 + others) * (1.0 + 1e-5) < theta as f64) {
+            return;
+        }
+        for &j in &need[1..] {
+            if rows == 0 {
+                return;
+            }
+            self.cur[j] = term(j).p.block(b);
+            rows &= self.cur[j].map_or(0, |c| c.0);
+        }
+        if rows != 0 {
+            self.all_block(b, rows, need, phrases, sink);
         }
     }
 
