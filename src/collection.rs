@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::seg::SHIFT;
-use crate::{invalid, merge, replace_file, Analyzer, Builder, Index, Params, Query, SegView};
+use crate::{invalid, merge_to, replace_file, Analyzer, Builder, Index, Params, Query, SegView};
 
 const MANIFEST_HEADER: &str = "bitbm25-collection 1";
 
@@ -64,7 +64,13 @@ impl Collection {
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
-        let ours = dir.join("LOCK").exists(); // opened as a collection before: its leftovers are ours to remove
+        // A directory never opened as a collection may hold a host's own files: refuse it if any of
+        // them has a name a collection writes, so that nothing of theirs is overwritten or removed.
+        if !dir.join("LOCK").exists() && !dir.join("MANIFEST").exists() {
+            if let Some(name) = names(&dir)?.into_iter().find(|n| ours(n)) {
+                return Err(invalid(format!("{} holds {name}, a name a collection writes, but is not one", dir.display())));
+            }
+        }
         let lock = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("LOCK"))?;
         lock.try_lock().map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "collection is open elsewhere"))?;
         let (mut next_id, mut next_file, mut segs) = (0, 0, Vec::new());
@@ -93,9 +99,7 @@ impl Collection {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        if ours {
-            remove_unreferenced(&dir, &segs)?;
-        }
+        remove_unreferenced(&dir, &segs);
         Ok(Collection {
             dir,
             _lock: lock,
@@ -188,7 +192,8 @@ impl Collection {
         (w.staged, w.pending) = (Vec::new(), Vec::new()); // committed
         *self.snap.write().unwrap() = Arc::new(segs.clone());
         // Open snapshots keep their files mapped. Files left here are removed by the next commit or open.
-        remove_unreferenced(&self.dir, &segs)
+        remove_unreferenced(&self.dir, &segs);
+        Ok(())
     }
 
     /// Saves `idx` as the next segment file and maps it.
@@ -200,8 +205,13 @@ impl Collection {
         Ok(Seg { file, idx, del: Vec::new(), deleted: 0, del_file: None })
     }
 
+    /// Merges `segs` into the next segment file, a term at a time (`merge_to`), and maps it.
     fn merged(&self, next_file: &mut u64, segs: &[Seg]) -> io::Result<Seg> {
-        self.write_segment(next_file, &merge(&views(segs))?)
+        let file = format!("{next_file}.seg");
+        *next_file += 1;
+        merge_to(&views(segs), &self.dir, &self.dir.join(&file))?;
+        let idx = Arc::new(Index::open(self.dir.join(&file))?);
+        Ok(Seg { file, idx, del: Vec::new(), deleted: 0, del_file: None })
     }
 
     fn snapshot(&self) -> Arc<Vec<Seg>> {
@@ -234,7 +244,10 @@ impl Collection {
 
     /// Checks every segment file and deleted-rows file against its checksums.
     pub fn verify(&self) -> io::Result<()> {
-        self.snapshot().iter().try_for_each(|s| s.idx.verify())
+        self.snapshot().iter().try_for_each(|s| {
+            s.idx.verify()?;
+            s.del_file.as_ref().map_or(Ok(()), |f| read_del(&self.dir.join(f), s.idx.rows()).map(drop))
+        })
     }
 }
 
@@ -262,24 +275,36 @@ fn read_del(path: &Path, rows: usize) -> io::Result<Vec<u64>> {
     Ok(bytes[..words * 8].as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect())
 }
 
-/// Removes segment, deleted-rows and temporary files that `segs` doesn't use: left by merges, or by
-/// a commit that failed or crashed before writing its MANIFEST. Only names a collection gives its
-/// files are touched: `<n>.seg`, `<n>.del`, those with `.tmp` added, and `MANIFEST.tmp`.
-fn remove_unreferenced(dir: &Path, segs: &[Seg]) -> io::Result<()> {
-    let keep: HashSet<&str> = segs.iter().flat_map(|s| [Some(s.file.as_str()), s.del_file.as_deref()]).flatten().collect();
-    let named = |name: &str| {
-        let name = name.strip_suffix(".tmp").unwrap_or(name);
-        let num = name.strip_suffix(".seg").or_else(|| name.strip_suffix(".del"));
-        name == "MANIFEST" || num.is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
-    };
+/// Whether a collection gives files this name: `<n>.seg`, `<n>.del`, `MANIFEST`, and those with
+/// `.tmp` added.
+fn ours(name: &str) -> bool {
+    let name = name.strip_suffix(".tmp").unwrap_or(name);
+    let num = name.strip_suffix(".seg").or_else(|| name.strip_suffix(".del"));
+    name == "MANIFEST" || num.is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// The names of the regular files in `dir`.
+fn names(dir: &Path) -> io::Result<Vec<String>> {
+    let mut out = Vec::new();
     for entry in fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if named(name) && name != "MANIFEST" && !keep.contains(name) {
-            fs::remove_file(dir.join(name))?;
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            out.extend(entry.file_name().into_string().ok());
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+/// Removes segment, deleted-rows and temporary files that `segs` doesn't use: left by merges, or by
+/// a commit that failed or crashed before writing its MANIFEST. Best effort: a file it can't
+/// remove is harmless, so it is left for the next commit or open rather than failing this one.
+fn remove_unreferenced(dir: &Path, segs: &[Seg]) {
+    let keep: HashSet<&str> = segs.iter().flat_map(|s| [Some(s.file.as_str()), s.del_file.as_deref()]).flatten().collect();
+    for name in names(dir).unwrap_or_default() {
+        if ours(&name) && name != "MANIFEST" && !keep.contains(name.as_str()) {
+            let _ = fs::remove_file(dir.join(&name));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -400,7 +425,7 @@ mod tests {
     fn deletes_touch_only_assigned_ids_and_open_only_its_own_files() {
         let dir = TempPath::new("foreign");
         fs::create_dir_all(&dir.0).unwrap();
-        let theirs = ["wiki.seg", "download.tmp", "rows.del", "7.seg"];
+        let theirs = ["wiki.seg", "download.tmp", "rows.del"];
         theirs.iter().for_each(|f| fs::write(dir.0.join(f), b"someone else's file").unwrap());
         let c = Collection::open(&dir.0).unwrap();
         c.delete(0); // nothing has id 0 yet: ignored, not left to delete the row that gets it
@@ -409,8 +434,32 @@ mod tests {
         assert_eq!(c.count(&Query::words(&["alpha"], false)).unwrap(), 1);
         drop(c);
         drop(Collection::open(&dir.0).unwrap());
-        assert!(theirs[..3].iter().all(|f| dir.0.join(f).exists()), "files a collection never names are left alone");
-        assert!(!dir.0.join("7.seg").exists(), "a segment name in a directory opened as a collection is the collection's");
+        assert!(theirs.iter().all(|f| dir.0.join(f).exists()), "files a collection never names are left alone");
+        // A directory that holds a file named as a collection's, and never was one, is refused,
+        // and its files are left as they were.
+        let host = TempPath::new("host-segments");
+        fs::create_dir_all(&host.0).unwrap();
+        crate::Index::build(&["a b"]).save(host.0.join("0.seg")).unwrap();
+        let before = fs::read(host.0.join("0.seg")).unwrap();
+        assert!(Collection::open(&host.0).is_err());
+        assert!(fs::read(host.0.join("0.seg")).unwrap() == before && !host.0.join("LOCK").exists());
+    }
+
+    #[test]
+    fn an_error_after_the_commit_point_is_not_the_commit_s() {
+        // A leftover the collection can't remove (here a directory where one of its files would be)
+        // fails neither the commit that made it unreferenced nor later opens.
+        let dir = TempPath::new("after-commit");
+        let c = Collection::open(&dir.0).unwrap();
+        c.add("alpha").unwrap();
+        c.commit().unwrap();
+        fs::create_dir(dir.0.join("77.seg")).unwrap();
+        c.add("beta").unwrap();
+        c.commit().unwrap();
+        drop(c);
+        let c = Collection::open(&dir.0).unwrap();
+        assert_eq!(c.len(), 2);
+        c.verify().unwrap();
     }
 
     #[test]
