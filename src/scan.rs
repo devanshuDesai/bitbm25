@@ -218,6 +218,15 @@ pub(crate) fn run(seg: &Seg, shape: &Shape, sink: &mut Sink) {
     }
 }
 
+/// Scratch for checking a phrase in a row.
+#[derive(Default)]
+struct Adjacency {
+    /// Per plan term: its positions in the row last read, where they were read from, and that row.
+    pos: Vec<(Vec<u32>, PosCursor, u64)>,
+    order: Vec<(u32, usize, usize)>, // the phrase's words as (tf in the row, place in the phrase, posting)
+    starts: Vec<u32>,                // positions where the phrase can still start
+}
+
 /// A term's (block, rows there, first posting there, largest tf there).
 type Listed = (u32, u64, usize, u32);
 
@@ -234,8 +243,7 @@ struct Scan<'a, 's> {
     lists: Vec<Option<Vec<Listed>>>,
     read: Vec<usize>, // how far into each list
     tf: Vec<u32>,     // each term's largest tf in the block at hand, when its list gave it
-    // scratch: each plan term's positions in the row being checked, and where its last ones were read
-    positions: std::cell::RefCell<Vec<(Vec<u32>, PosCursor)>>,
+    positions: std::cell::RefCell<Adjacency>, // scratch for `adjacent`
 }
 
 impl<'a, 's> Scan<'a, 's> {
@@ -248,7 +256,7 @@ impl<'a, 's> Scan<'a, 's> {
         let unit = (st.params.k1 + 1.0) / 255.0 * (st.avgdl / seg.idx.stats.avgdl).max(1.0) * (1.0 + 1e-6);
         let n = seg.terms.len();
         let lists = (0..n).map(|_| None).collect();
-        Scan { seg, shape, norm, unit: unit as f32, cur: vec![None; n], masks: vec![0; n], later: Vec::with_capacity(n), lists, read: vec![0; n], tf: vec![0; n], positions: vec![Default::default(); n].into() }
+        Scan { seg, shape, norm, unit: unit as f32, cur: vec![None; n], masks: vec![0; n], later: Vec::with_capacity(n), lists, read: vec![0; n], tf: vec![0; n], positions: Adjacency { pos: vec![Default::default(); n], ..Default::default() }.into() }
     }
 
     /// The scoring terms this segment has, with their place in the plan.
@@ -294,24 +302,45 @@ impl<'a, 's> Scan<'a, 's> {
     }
 
     /// The rows among `rows` of block `b` (whose terms `cur` holds) where the terms of `phrase`
-    /// follow one another.
+    /// follow one another. In each row the words are taken rarest first: the first gives the places
+    /// the phrase could start, each further one strikes out those where it is missing, and a row is
+    /// dropped as soon as none is left, usually before its frequent words' positions are read.
     fn adjacent(&self, b: u32, mut rows: u64, phrase: &[usize]) -> u64 {
-        let (mut out, mut pos) = (0, self.positions.borrow_mut());
+        let (mut out, mut scratch) = (0, self.positions.borrow_mut());
+        let Adjacency { pos, order, starts } = &mut *scratch;
         while rows != 0 {
             let r = rows.trailing_zeros();
             rows &= rows - 1;
-            for (k, &j) in phrase.iter().enumerate().filter(|&(k, j)| !phrase[..k].contains(j)) {
-                let _ = k;
+            // each word's place in the phrase, with its posting and tf in this row
+            order.clear();
+            for (k, &j) in phrase.iter().enumerate() {
                 let t = self.seg.terms[j].as_ref().expect("a phrase's terms are all in a matching row");
                 let (m, first) = self.cur[j].expect("and in its block");
                 let first = if first == UNKNOWN { t.p.first(b) } else { first };
-                let (out, cursor) = &mut pos[j];
-                t.p.positions(first + (m & ((1u64 << r) - 1)).count_ones() as usize, cursor, out);
+                let i = first + (m & ((1u64 << r) - 1)).count_ones() as usize;
+                order.push((t.p.tf(i), k, i));
             }
-            // Some start p has phrase[k] at p + k for every k: try the starts the rarest word allows.
-            let lead = (0..phrase.len()).min_by_key(|&k| pos[phrase[k]].0.len()).expect("a phrase has words");
-            let follows = |p: u32| phrase.iter().enumerate().all(|(k, &j)| pos[j].0.binary_search(&(p + k as u32)).is_ok());
-            if pos[phrase[lead]].0.iter().any(|&p| p >= lead as u32 && follows(p - lead as u32)) {
+            order.sort_unstable();
+            let stamp = (b << SHIFT | r) as u64 + 1; // marks positions read for this row
+            for (n, &(_, k, i)) in order.iter().enumerate() {
+                let (list, cursor, read) = &mut pos[phrase[k]];
+                if *read != stamp {
+                    let t = self.seg.terms[phrase[k]].as_ref().expect("checked above");
+                    t.p.positions(i, cursor, list);
+                    *read = stamp;
+                }
+                match n {
+                    0 => {
+                        starts.clear();
+                        starts.extend(list.iter().filter(|&&p| p >= k as u32).map(|&p| p - k as u32));
+                    }
+                    _ => starts.retain(|&s| list.binary_search(&(s + k as u32)).is_ok()),
+                }
+                if starts.is_empty() {
+                    break;
+                }
+            }
+            if !starts.is_empty() {
                 out |= 1 << r;
             }
         }
