@@ -138,9 +138,9 @@ mod tests {
     }
 
     /// A row's terms (t0..t299, as `corpus` makes them) written so that the standard analyzer reads
-    /// the same terms back: in capitals, with accents, in fullwidth forms, with punctuation between
-    /// them. Also where each word went.
-    fn dress(terms: &[String], seed: u64) -> (String, Vec<Range<usize>>) {
+    /// the same terms back: in capitals, with accents, in fullwidth forms, each followed by one of
+    /// `between`. Also where each word went.
+    fn dress(terms: &[String], seed: u64, between: &[&str]) -> (String, Vec<Range<usize>>) {
         let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
         let mut next = move || {
             s ^= s << 13;
@@ -148,7 +148,6 @@ mod tests {
             s ^= s << 17;
             s
         };
-        let between = [" ", ", ", " — ", "\n", "。", " (", ") ", " 🚀 ", "\u{3000}", "-", "/", "!? "];
         let (mut text, mut spans) = (String::from("¡"), Vec::new());
         for term in terms {
             let start = text.len();
@@ -168,6 +167,10 @@ mod tests {
     #[test]
     fn highlights_and_snippets_match_brute_force() {
         let (ws, std) = (Analyzer::whitespace(), Analyzer::default());
+        let en = Analyzer::parse("standard stem=english stop=english").unwrap();
+        let punct = [" ", ", ", " — ", "\n", "。", " (", ") ", " 🚀 ", "\u{3000}", "-", "/", "!? "];
+        // and stopwords, which `en` drops: phrases run across them, and snippets are cut around them
+        let stops: Vec<&str> = punct.iter().copied().chain([" the ", " of THE ", ", and "]).collect();
         let maxes = [0, 1, 2, 3, 4, 6, 9, 13, 20, 31, 50, 80, 130, 210, 500];
         // rows that match, rows that don't though they hold a term of the query, rows with a
         // phrase's word outside the phrase; snippets shorter than their text, and with no room
@@ -182,16 +185,21 @@ mod tests {
                 let at = spaced.last().map_or(0, |last| last.end + 1);
                 spaced.push(at..at + t.len());
             }
-            let (dressed, dressed_at) = dress(&terms, d as u64);
+            let (dressed, dressed_at) = dress(&terms, d as u64, &punct);
+            let (stopped, stopped_at) = dress(&terms, d as u64, &stops);
             assert_eq!(std.terms(&dressed), terms, "{dressed:?}");
-            // a run of the row's own words, so that phrases occur
-            let own = Query::Phrase(terms[d % (terms.len() - 1)..].iter().take(2 + d % 3).cloned().collect());
+            assert_eq!(en.terms(&stopped), terms, "{stopped:?}");
+            let texts = [(&ws, &doc[..], &spaced), (&std, &dressed[..], &dressed_at), (&en, &stopped[..], &stopped_at)];
+            // a run of the row's own words, so that phrases occur; now and then of one word
+            let own = Query::Phrase(terms[d % (terms.len() - 1)..].iter().take(1 + d % 4).cloned().collect());
             let queries = (0..40).flat_map(|seed| {
                 let random = random_query(d as u64 * 100 + seed, (seed % 5) as u32);
                 let either = Query::Or(vec![random.clone(), own.clone()]);
                 [random.clone(), either, Query::And(vec![own.clone(), Query::Not(Box::new(random))])]
             });
-            for (n, q) in queries.chain([own.clone()]).enumerate() {
+            // true of every row, but `check` refuses a NOT among ORed parts, so nothing is highlighted
+            let refused = Query::Or(vec![own.clone(), Query::Not(Box::new(own.clone()))]);
+            for (n, q) in queries.chain([own.clone(), refused]).enumerate() {
                 let want = brute(&q, &terms);
                 let positive = q.positive_terms();
                 let present = terms.iter().filter(|t| positive.contains(&t.as_str())).count();
@@ -200,9 +208,9 @@ mod tests {
                 stray += (!want.is_empty() && want.len() < present) as u32;
                 // a search finds the row exactly when there is something to highlight in it
                 let mut found = false;
-                for_each_match(&[(&index, &[])], &q, |id| found |= id == d as u64).unwrap();
-                assert_eq!(found, !want.is_empty(), "{q:?} in {doc:?}");
-                for (analyzer, text, words) in [(&ws, doc.as_str(), &spaced), (&std, dressed.as_str(), &dressed_at)] {
+                let searched = for_each_match(&[(&index, &[])], &q, |id| found |= id == d as u64);
+                assert_eq!((found, searched.is_ok()), (!want.is_empty(), q.check().is_ok()), "{q:?} in {doc:?}");
+                for (analyzer, text, words) in texts {
                     let lit: Vec<Range<usize>> = want.iter().map(|&i| words[i].clone()).collect();
                     assert_eq!(highlight(analyzer, &q, text), lit, "{q:?} in {text:?}");
                     let edge = [text.len(), text.len() - 1]; // the text just fits; it is a byte too long
