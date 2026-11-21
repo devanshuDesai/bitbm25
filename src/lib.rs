@@ -17,6 +17,7 @@
 //! On disk a segment is its arrays as they are in memory, so opening one maps the file (or takes any
 //! byte buffer the host holds) and reads nothing else; see `Index::write_to` for the layout.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
@@ -191,16 +192,17 @@ pub type SegView<'a> = (&'a Index, &'a [u64]);
 /// left-out rows included. Fails on a query that fails `Query::check` (as `parse`'s output never
 /// does) or segments built with different k1/b.
 pub fn top_k(segs: &[SegView], q: &Query, k: usize) -> io::Result<Vec<(u64, f32)>> {
-    search(segs, q, k, true)
+    search(segs, &*expand(segs, q)?, k, true)
 }
 
 /// `top_k` scoring every match instead of stopping early: the same answer, slowly. For checking.
 pub fn top_k_exhaustive(segs: &[SegView], q: &Query, k: usize) -> io::Result<Vec<(u64, f32)>> {
-    search(segs, q, k, false)
+    search(segs, &*expand(segs, q)?, k, false)
 }
 
 /// Exact number of matching rows.
 pub fn count(segs: &[SegView], q: &Query) -> io::Result<u64> {
+    let q = &*expand(segs, q)?;
     let Some((plan, st, sps)) = prepare(segs, q)? else { return Ok(0) };
     let mut n = 0;
     for (&(idx, del), sp) in segs.iter().zip(&sps).filter(|(_, sp)| sp.live) {
@@ -214,11 +216,72 @@ pub fn count(segs: &[SegView], q: &Query) -> io::Result<u64> {
 
 /// Calls `f(id)` for every matching row, unscored: segment by segment, in row order.
 pub fn for_each_match(segs: &[SegView], q: &Query, mut f: impl FnMut(u64)) -> io::Result<()> {
+    let q = &*expand(segs, q)?;
     let Some((plan, st, sps)) = prepare(segs, q)? else { return Ok(()) };
     for (&(idx, del), sp) in segs.iter().zip(&sps).filter(|(_, sp)| sp.live) {
         scan::run(&Seg { idx, del, st: &st, terms: &sp.terms, n_pos: plan.n_pos }, &plan.shape, &mut Sink::Each(&mut f));
     }
     Ok(())
+}
+
+/// `q` with each pattern (prefix, wildcard, fuzzy, regex) replaced by the OR of the terms it
+/// matches among those of `segs`, in order, each once: none, if nothing matches. A pattern right
+/// under an OR joins it, so that `a b*` stays a flat OR. Everything after this sees only terms.
+/// Borrows `q` if it holds no pattern; fails if it fails `Query::check`.
+fn expand<'q>(segs: &[SegView], q: &'q Query) -> io::Result<Cow<'q, Query>> {
+    /// The terms `q` matches if it is a pattern, None if it isn't one.
+    fn matching(segs: &[SegView], q: &Query) -> io::Result<Option<Vec<Query>>> {
+        let Some(mut pattern) = q.matcher()? else { return Ok(None) };
+        let mut found: Vec<String> = Vec::new();
+        for (idx, _) in segs {
+            // the lexicon is sorted, so the terms starting with the pattern's prefix are a run of it
+            let mut terms = idx.terms_from(pattern.prefix());
+            while terms.next().is_some() && terms.term().starts_with(pattern.prefix()) {
+                if pattern.matches(terms.term()) {
+                    // a term is UTF-8 unless the file is corrupt
+                    if let Ok(term) = std::str::from_utf8(terms.term()) {
+                        found.push(term.into());
+                    }
+                } else if let Some(n) = pattern.dead() {
+                    terms.skip_groups(n);
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        Ok(Some(found.into_iter().map(Query::Term).collect()))
+    }
+    fn walk(segs: &[SegView], q: &Query) -> io::Result<Query> {
+        if let Some(terms) = matching(segs, q)? {
+            return Ok(Query::Or(terms));
+        }
+        let all = |qs: &[Query]| qs.iter().map(|q| walk(segs, q)).collect::<io::Result<Vec<Query>>>();
+        Ok(match q {
+            Query::And(qs) => Query::And(all(qs)?),
+            Query::Or(qs) => {
+                let mut kids = Vec::with_capacity(qs.len());
+                for q in qs {
+                    match matching(segs, q)? {
+                        Some(terms) => kids.extend(terms),
+                        None => kids.push(walk(segs, q)?),
+                    }
+                }
+                Query::Or(kids)
+            }
+            Query::Not(q) => Query::Not(Box::new(walk(segs, q)?)),
+            leaf => leaf.clone(),
+        })
+    }
+    fn has_pattern(q: &Query) -> bool {
+        match q {
+            Query::Term(_) | Query::Phrase(_) => false,
+            Query::And(qs) | Query::Or(qs) => qs.iter().any(has_pattern),
+            Query::Not(q) => has_pattern(q),
+            _ => true,
+        }
+    }
+    q.check()?; // the walks below recurse, which is safe once the depth is known to be bounded
+    Ok(if has_pattern(q) { Cow::Owned(walk(segs, q)?) } else { Cow::Borrowed(q) })
 }
 
 fn search(segs: &[SegView], q: &Query, k: usize, prune: bool) -> io::Result<Vec<(u64, f32)>> {
@@ -240,7 +303,7 @@ fn search(segs: &[SegView], q: &Query, k: usize, prune: bool) -> io::Result<Vec<
 /// top-k and the stream never repeats or skips a row. Total work is about twice the final top-k.
 pub struct Cursor<'a> {
     segs: &'a [SegView<'a>],
-    q: &'a Query,
+    q: Cow<'a, Query>, // its patterns expanded, once
     k: usize,
     hits: Vec<(u64, f32)>,
     pos: usize,
@@ -249,8 +312,9 @@ pub struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     /// Fails as `top_k` does.
     pub fn new(segs: &'a [SegView<'a>], q: &'a Query) -> io::Result<Cursor<'a>> {
-        let k = 10;
-        Ok(Cursor { segs, q, k, hits: top_k(segs, q, k)?, pos: 0 })
+        let (q, k) = (expand(segs, q)?, 10);
+        let hits = search(segs, &q, k, true)?;
+        Ok(Cursor { segs, q, k, hits, pos: 0 })
     }
 }
 
@@ -261,7 +325,7 @@ impl Iterator for Cursor<'_> {
         if self.pos == self.hits.len() && self.hits.len() == self.k {
             self.k = self.k.saturating_mul(2);
             let err = "the query and segments already passed in Cursor::new";
-            self.hits = top_k(self.segs, self.q, self.k).expect(err);
+            self.hits = search(self.segs, &self.q, self.k, true).expect(err);
         }
         let hit = self.hits.get(self.pos).copied()?;
         self.pos += 1;
@@ -311,6 +375,7 @@ impl Node {
             Query::And(qs) => Node::And(qs.iter().map(|q| Node::new(q, terms, slot)).collect()),
             Query::Or(qs) => Node::Or(qs.iter().map(|q| Node::new(q, terms, slot)).collect()),
             Query::Not(q) => Node::Not(Box::new(Node::new(q, terms, slot))),
+            _ => unreachable!("`expand` replaced the patterns before planning"),
         }
     }
 }
@@ -994,16 +1059,19 @@ mod tests {
         excl.get(row >> SHIFT).is_some_and(|w| w >> (row & 63) & 1 == 1)
     }
 
-    #[test]
-    fn tree_queries_match_brute_force() {
-        let docs = corpus(4_000, 21, 40);
-        // three segments with scattered ids; the middle one fully excluded, the last partly
-        let ids: Vec<u64> = (0..docs.len() as u64).map(|i| i * 7 % 4_001).collect();
+    /// A row as `brute_rows` takes it: (id, doc, live).
+    type Row<'a> = (u64, &'a str, bool);
+
+    /// `docs` as three segments with scattered ids, the middle one fully excluded and the last
+    /// partly: the segments, their excluded-rows bitsets, and every row.
+    fn three_segments(docs: &[String]) -> (Vec<Index>, Vec<Vec<u64>>, Vec<Row<'_>>) {
+        let ids: Vec<u64> = (0..docs.len() as u64).map(|i| i.wrapping_mul(0x9E3779B97F4A7C15)).collect();
+        let per_seg = docs.len().div_ceil(3);
         let mut segs = Vec::new();
-        for (s, chunk) in docs.chunks(1_400).enumerate() {
+        for (s, chunk) in docs.chunks(per_seg).enumerate() {
             let mut b = Builder::new(Params::default(), Analyzer::whitespace()).unwrap();
             for (j, d) in chunk.iter().enumerate() {
-                b.add(ids[s * 1_400 + j], d).unwrap();
+                b.add(ids[s * per_seg + j], d).unwrap();
             }
             segs.push(b.finish());
         }
@@ -1016,9 +1084,16 @@ mod tests {
                 _ => vec![],
             })
             .collect();
+        let live = |r: usize| !left_out(&segs[r / per_seg], &excl[r / per_seg], ids[r]);
+        let rows = docs.iter().enumerate().map(|(r, d)| (ids[r], d.as_str(), live(r))).collect();
+        (segs, excl, rows)
+    }
+
+    #[test]
+    fn tree_queries_match_brute_force() {
+        let docs = corpus(4_000, 21, 40);
+        let (segs, excl, rows) = three_segments(&docs);
         let views: Vec<SegView> = segs.iter().zip(&excl).map(|(i, e)| (i, &e[..])).collect();
-        let rows: Vec<(u64, &str, bool)> =
-            docs.iter().enumerate().map(|(r, d)| (ids[r], d.as_str(), !left_out(&segs[r / 1_400], &excl[r / 1_400], ids[r]))).collect();
         let (mut trees, mut matched) = (0, 0);
         for seed in 0..300 {
             let q = random_query(seed, 4);
@@ -1028,6 +1103,216 @@ mod tests {
             check_query(&views, &q, &want);
         }
         assert!(trees > 100 && matched > 100, "the generator exercises nested queries that match: {trees} {matched}");
+    }
+
+    /// Edit distance by the textbook table. With `swaps`, exchanging two neighbours that are not
+    /// edited again is one edit.
+    pub(crate) fn edits(a: &[char], b: &[char], swaps: bool) -> usize {
+        let mut d = vec![vec![0; b.len() + 1]; a.len() + 1];
+        for i in 0..=a.len() {
+            for j in 0..=b.len() {
+                d[i][j] = if i == 0 || j == 0 {
+                    i + j
+                } else {
+                    let swapped = swaps && i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1];
+                    let step = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + (a[i - 1] != b[j - 1]) as usize);
+                    if swapped { step.min(d[i - 2][j - 2] + 1) } else { step }
+                };
+            }
+        }
+        d[a.len()][b.len()]
+    }
+
+    /// Whether the wildcard `pattern` matches `text`, by trying every way it could.
+    pub(crate) fn wild(pattern: &[char], text: &[char]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some(('*', rest)) => (0..=text.len()).any(|n| wild(rest, &text[n..])),
+            Some((c, rest)) => text.split_first().is_some_and(|(t, text)| (*c == '?' || c == t) && wild(rest, text)),
+        }
+    }
+
+    /// `q` with each pattern replaced by the OR of the words of `vocab` it matches, every word
+    /// tested the plain way above: the reference for `expand`.
+    fn expanded_by_hand(q: &Query, vocab: &[String]) -> Query {
+        let chars = |s: &str| s.chars().collect::<Vec<char>>();
+        let or = |keep: &dyn Fn(&str) -> bool| Query::Or(vocab.iter().filter(|w| keep(w)).cloned().map(Query::Term).collect());
+        let each = |qs: &[Query]| qs.iter().map(|q| expanded_by_hand(q, vocab)).collect();
+        match q {
+            Query::Term(_) | Query::Phrase(_) => q.clone(),
+            Query::And(qs) => Query::And(each(qs)),
+            Query::Or(qs) => Query::Or(each(qs)),
+            Query::Not(q) => Query::Not(Box::new(expanded_by_hand(q, vocab))),
+            Query::Prefix(start) => or(&|w| w.starts_with(start.as_str())),
+            Query::Wildcard(pattern) => or(&|w| wild(&chars(pattern), &chars(w))),
+            Query::Fuzzy { term, distance, prefix, transpositions } => {
+                let term = chars(term);
+                let locked = &term[..term.len().min(*prefix as usize)];
+                or(&|w| chars(w).starts_with(locked) && edits(&term, &chars(w), *transpositions) <= *distance as usize)
+            }
+            Query::Regex(pattern) => {
+                let whole = regex::Regex::new(&format!("^(?:{pattern})$")).unwrap();
+                or(&|w| whole.is_match(w))
+            }
+        }
+    }
+
+    /// `p` under an AND, an OR and a NOT, next to the terms `a` and `b` and the pattern `other`.
+    fn nestings(p: &Query, other: &Query, a: &str, b: &str) -> [Query; 5] {
+        let (p, t, not) = (|| p.clone(), |t: &str| Query::Term(t.into()), |q| Query::Not(Box::new(q)));
+        let phrase = Query::Phrase(vec![a.into(), b.into()]);
+        [
+            Query::And(vec![t(a), p()]),
+            Query::Or(vec![t(b), p()]),
+            Query::And(vec![t(a), not(p())]),
+            Query::And(vec![p(), other.clone()]),
+            Query::Or(vec![Query::And(vec![p(), not(Query::Or(vec![t(a), other.clone()]))]), phrase]),
+        ]
+    }
+
+    /// The distinct words of `docs`, in order.
+    fn vocabulary(docs: &[String]) -> Vec<String> {
+        let mut words: Vec<String> = docs.iter().flat_map(|d| d.split_ascii_whitespace()).map(String::from).collect();
+        words.sort_unstable();
+        words.dedup();
+        words
+    }
+
+    /// Checks each of `queries`, which hold patterns, against brute force on the same query with
+    /// its patterns expanded by hand, over `docs` as three segments with rows left out. Returns
+    /// how many of them match a row.
+    fn check_patterns(docs: &[String], queries: &[Query]) -> usize {
+        let (analyzer, vocab) = (Analyzer::whitespace(), vocabulary(docs));
+        let (segs, excl, rows) = three_segments(docs);
+        let views: Vec<SegView> = segs.iter().zip(&excl).map(|(i, e)| (i, &e[..])).collect();
+        let mut matched = 0;
+        for q in queries {
+            let by_hand = expanded_by_hand(q, &vocab);
+            let want = brute_rows(&rows, &by_hand, Params::default(), &analyzer);
+            matched += !want.is_empty() as usize;
+            check_query(&views, q, &want);
+            if q.matcher().unwrap().is_some() {
+                // alone, a pattern becomes its terms in order, each once though several segments hold it
+                assert_eq!(*expand(&views, q).unwrap(), by_hand, "{q:?}");
+            }
+            // a host re-checking a row gets the same answer from the row's terms alone
+            for d in docs.iter().step_by(docs.len() / 20 + 1) {
+                let terms = analyzer.terms(d);
+                assert_eq!(q.matches(&terms), by_hand.matches(&terms), "{q:?} on {d:?}");
+            }
+        }
+        matched
+    }
+
+    /// Pattern queries; a fuzzy one is (term, distance, locked prefix, transpositions).
+    fn patterns_of(prefixes: &[&str], wildcards: &[&str], fuzzies: &[(&str, u8, u8, bool)], regexes: &[&str]) -> Vec<Query> {
+        let mut all: Vec<Query> = prefixes.iter().map(|s| Query::Prefix(s.to_string())).collect();
+        all.extend(wildcards.iter().map(|s| Query::Wildcard(s.to_string())));
+        for &(term, distance, prefix, transpositions) in fuzzies {
+            all.push(Query::Fuzzy { term: term.into(), distance, prefix, transpositions });
+        }
+        all.extend(regexes.iter().map(|s| Query::Regex(s.to_string())));
+        all
+    }
+
+    #[test]
+    fn patterns_match_brute_force() {
+        // over the words t0, t1, t2... of `corpora`
+        let patterns = patterns_of(
+            &["t12", "t299", "u"],
+            &["t?5", "t1*9", "*77", "*t4"],
+            &[("t12", 1, 0, true), ("x12", 2, 0, true), ("t21", 1, 0, false), ("t100", 1, 2, true), ("3t", 1, 0, true)],
+            &["t1[0-4]", r"t(2|3)\d", "t1?5", ".*99", r"t5|t6\d|t70", "(?i)T8.?"],
+        );
+        for docs in corpora() {
+            // each pattern alone, and in one of its nestings in turn
+            let other = |i: usize| &patterns[(i + 9) % patterns.len()];
+            let nested = patterns.iter().enumerate().map(|(i, p)| nestings(p, other(i), "t0", "t3")[i % 5].clone());
+            let queries: Vec<Query> = patterns.iter().cloned().chain(nested).collect();
+            let matched = check_patterns(&docs, &queries);
+            assert!(matched >= queries.len() - 4, "nearly all the patterns match rows: {matched} of {}", queries.len());
+        }
+    }
+
+    /// Rows of words that resemble one another, some accented, so that a pattern matches several.
+    fn similar_corpus() -> Vec<String> {
+        let words = "color colour colors colours colored coloured colon colony cooler collar dolor government goverment \
+                     governments govern governor governance international internal interval interim internet intern \
+                     intranet national nation notion motion lotion station form from forum farm firm foam for fro cafe \
+                     café cafes caffè naive naïve cat cut cot coat cast cats act uber über";
+        let words: Vec<&str> = words.split(' ').collect();
+        let mut s = 0x51A1u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // the first words most often
+        let mut word = || words[(((next() % 1_000) as f64 / 1_000.0).powi(2) * words.len() as f64) as usize];
+        let mut docs: Vec<String> = (0..2_000).map(|i| (0..1 + i % 30).map(|_| word()).collect::<Vec<_>>().join(" ")).collect();
+        // a word for each of `three_segments` alone: the first, the excluded one, the last
+        for (doc, only) in [(0, " colorado"), (1_000, " colorless"), (1_999, " colorful")] {
+            docs[doc] += only;
+        }
+        docs
+    }
+
+    #[test]
+    fn patterns_match_among_similar_words() {
+        let docs = similar_corpus();
+        let patterns = patterns_of(
+            &["col", "color", "inter", "gov", "caf", "café", "", "zebra"],
+            &["col*r", "colo?r*", "*tion", "in*al", "?o*", "caf?", "c?t", "*o*o*", "f*r*m", "color", "*", "na?ve", "*ï*"],
+            &[
+                ("color", 1, 0, true),
+                ("colour", 2, 0, true),
+                ("goverment", 1, 0, true),
+                ("goverment", 1, 1, true),
+                ("goverment", 2, 0, false),
+                ("form", 1, 0, true),
+                ("form", 1, 0, false),
+                ("form", 2, 1, true),
+                ("cafe", 1, 0, true),
+                ("naive", 1, 2, true),
+                ("nation", 2, 3, true),
+                ("cta", 1, 0, true),
+                ("uber", 1, 9, true),
+                ("interal", 2, 5, false),
+            ],
+            &[
+                "colou?r",
+                "colou?r(s|ed)?",
+                "gover.*",
+                "(inter|intra)n.*",
+                ".*tion",
+                "caf[eé]s?",
+                "co.*|ca.*",
+                "(?i)COLOR.*",
+                "f.r.?m?",
+                r"[a-c]\w+",
+                "x+",
+                "",
+            ],
+        );
+        let mut queries = patterns.clone();
+        for (i, p) in patterns.iter().enumerate() {
+            queries.extend(nestings(p, &patterns[(i + 11) % patterns.len()], "color", "form"));
+        }
+        let matched = check_patterns(&docs, &queries);
+        assert!(matched > queries.len() * 3 / 4, "most of the patterns match rows: {matched} of {}", queries.len());
+        // and as one segment with nothing left out
+        let (whole, vocab) = (Index::build(&docs), vocabulary(&docs));
+        for q in &patterns {
+            check_query(&[(&whole, &[])], q, &brute(&docs, &expanded_by_hand(q, &vocab)));
+        }
+        // a pattern right under an OR joins it, so the query stays a flat OR
+        let q = Query::Or(vec![Query::Term("form".into()), Query::Prefix("caf".into()), Query::Term("act".into())]);
+        assert_eq!(*expand(&[(&whole, &[])], &q).unwrap(), Query::words(&["form", "cafe", "cafes", "caffè", "café", "act"], false));
+        // the fuzzy and wildcard ones match several words each
+        let several = |q: &&Query| matches!(&*expand(&[(&whole, &[])], q).unwrap(), Query::Or(terms) if terms.len() >= 3);
+        let fuzzy_or_wild = |q: &&Query| matches!(q, Query::Fuzzy { .. } | Query::Wildcard(_));
+        assert!(patterns.iter().filter(fuzzy_or_wild).filter(several).count() >= 15);
     }
 
     #[test]
@@ -1042,6 +1327,20 @@ mod tests {
         assert_eq!(top_k(&[(&a, &[])], &not, 10).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(count(&[(&a, &[])], &not).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(top_k(&[], &q, 10).unwrap().is_empty());
+        // a bad pattern is refused by every way in, wherever it sits in the query
+        let bad = [Query::Regex("t(".into()), Query::Fuzzy { term: "t0".into(), distance: 3, prefix: 0, transpositions: true }];
+        for q in bad.into_iter().flat_map(|p| [Query::Or(vec![q.clone(), p.clone()]), p]) {
+            let views = [(&a, &[][..])];
+            let errors = [
+                top_k(&views, &q, 10).err(),
+                top_k_exhaustive(&views, &q, 10).err(),
+                count(&views, &q).err(),
+                for_each_match(&views, &q, |_| ()).err(),
+                Cursor::new(&views, &q).err(),
+            ];
+            assert!(errors.iter().all(|e| e.as_ref().is_some_and(|e| e.kind() == io::ErrorKind::InvalidInput)), "{q:?}");
+        }
+        assert_eq!(count(&[], &Query::Prefix("t".into())).unwrap(), 0);
     }
 
     #[test]
@@ -1114,7 +1413,9 @@ mod tests {
         let docs = corpus(3_000, 4, 40);
         let a = Index::build(&docs);
         let views = [(&a, &[][..])];
-        let queries = [Query::words(&["t0", "t1"], false), Query::words(&["t2", "t3"], true), random_query(7, 3), Query::Or(vec![])];
+        let pattern = Query::And(vec![Query::Prefix("t1".into()), Query::Not(Box::new(Query::Wildcard("t?".into())))]);
+        let words = [Query::words(&["t0", "t1"], false), Query::words(&["t2", "t3"], true)];
+        let queries = words.into_iter().chain([random_query(7, 3), Query::Or(vec![]), pattern]);
         for q in queries {
             let all = top_k(&views, &q, usize::MAX).unwrap(); // every match, best first
             let streamed: Vec<_> = Cursor::new(&views, &q).unwrap().collect();

@@ -3,9 +3,14 @@
 //! A row matches by ordinary boolean logic. Its score is the sum of the BM25 scores of the query's
 //! positive terms (those not under a NOT, a phrase's words included) that it contains, wherever
 //! they sit in the query. A phrase narrows which rows match; it does not change how they score.
+//!
+//! A pattern (prefix, wildcard, fuzzy or regex) stands for the OR of the terms it matches: a search
+//! replaces it by those of its segments' terms that match, and each then scores with its own idf.
 
 use std::collections::HashSet;
 use std::io;
+
+use regex_syntax::hir::{literal::Extractor, Hir, Look};
 
 use crate::{bad_input, Analyzer};
 
@@ -25,6 +30,18 @@ pub enum Query {
     /// Allowed only as a direct child of an `And` that has a positive child: a bare negation would
     /// mean "every other row".
     Not(Box<Query>),
+    /// Any term that starts with this text.
+    Prefix(String),
+    /// Any term this pattern matches whole: `*` stands for any run of characters (none too) and `?`
+    /// for any one character.
+    Wildcard(String),
+    /// Any term within `distance` edits (1 or 2) of `term` whose first `prefix` characters are the
+    /// same as `term`'s (all of them, if it has fewer). An edit inserts, removes or replaces one
+    /// character or, with `transpositions`, swaps two neighbours that are not edited again: `ca` is
+    /// three edits from `abc`, as in Lucene. Characters are Unicode scalar values, not bytes.
+    Fuzzy { term: String, distance: u8, prefix: u8, transpositions: bool },
+    /// Any term this regular expression (the `regex` crate's syntax) matches whole.
+    Regex(String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -103,17 +120,21 @@ impl Query {
             Query::And(qs) => !qs.is_empty() && qs.iter().all(|q| q.eval(set, row)),
             Query::Or(qs) => qs.iter().any(|q| q.eval(set, row)),
             Query::Not(q) => !q.eval(set, row),
+            pattern => pattern.matcher().ok().flatten().is_some_and(|mut m| set.iter().any(|t| m.matches(t.as_bytes()))),
         }
     }
 
-    /// Refuses nesting deeper than `MAX_DEPTH` and a NOT anywhere but under an AND with a positive
-    /// child. The search functions call it too; hosts that build queries in code can call it first.
+    /// Refuses nesting deeper than `MAX_DEPTH`, a NOT anywhere but under an AND with a positive
+    /// child, a fuzzy distance other than 1 or 2 and a regex that doesn't compile. The search
+    /// functions call it too; hosts that build queries in code can call it first.
     pub fn check(&self) -> io::Result<()> {
         self.check_at(1, false)
     }
 
     fn check_at(&self, depth: usize, not_ok: bool) -> io::Result<()> {
-        if depth > MAX_DEPTH {
+        // a pattern becomes an OR of terms, which are one level deeper
+        let pattern = matches!(self, Query::Prefix(_) | Query::Wildcard(_) | Query::Fuzzy { .. } | Query::Regex(_));
+        if depth + pattern as usize > MAX_DEPTH {
             return Err(bad_input(format!("query nested deeper than {MAX_DEPTH}")));
         }
         match self {
@@ -125,22 +146,221 @@ impl Query {
                 let positive = qs.iter().any(|q| !matches!(q, Query::Not(_)));
                 qs.iter().try_for_each(|q| q.check_at(depth + 1, positive))
             }
+            pattern => pattern.matcher().map(drop),
         }
     }
 
-    /// The distinct terms not under a NOT, in order of first appearance: the terms that score.
+    /// The distinct terms not under a NOT, in order of first appearance: the terms that score. A
+    /// pattern has none of its own: a search replaces it by the terms it matches first.
     pub(crate) fn positive_terms(&self) -> Vec<&str> {
         fn walk<'a>(q: &'a Query, out: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
             match q {
                 Query::Term(t) if seen.insert(t) => out.push(t),
-                Query::Term(_) | Query::Not(_) => {}
                 Query::Phrase(ts) => ts.iter().filter(|t| seen.insert(t)).for_each(|t| out.push(t)),
                 Query::And(qs) | Query::Or(qs) => qs.iter().for_each(|q| walk(q, out, seen)),
+                _ => {} // a term already seen, a NOT, a pattern
             }
         }
         let mut out = Vec::new();
         walk(self, &mut out, &mut HashSet::new());
         out
+    }
+
+    /// For a prefix, wildcard, fuzzy or regex node, what tests a term against it; None for the
+    /// other kinds. Fails on a fuzzy distance other than 1 or 2 and on a regex that doesn't compile.
+    pub(crate) fn matcher(&self) -> io::Result<Option<Matcher>> {
+        let (prefix, kind) = match self {
+            Query::Prefix(start) => (start.as_str(), Kind::Prefix),
+            Query::Wildcard(pattern) => {
+                // the text before the first wildcard, what lies from there to the last one, the text after
+                let (start, rest) = pattern.split_at(pattern.find(['*', '?']).unwrap_or(pattern.len()));
+                let (middle, end) = rest.split_at(rest.rfind(['*', '?']).map_or(0, |last| last + 1));
+                (start, Kind::Wildcard(middle.into(), end.into()))
+            }
+            Query::Fuzzy { term, distance, prefix, transpositions } => {
+                if !(1..=2).contains(distance) {
+                    return Err(bad_input(format!("a fuzzy term allows 1 or 2 edits, not {distance}")));
+                }
+                let locked = term.char_indices().nth(*prefix as usize).map_or(term.len(), |(at, _)| at);
+                (&term[..locked], Kind::Fuzzy(Edits::new(term, *distance as usize, *transpositions)))
+            }
+            Query::Regex(pattern) => {
+                let bad = |e: &dyn std::fmt::Display| bad_input(format!("bad regex /{pattern}/: {e}"));
+                let hir = regex_syntax::parse(pattern).map_err(|e| bad(&e))?;
+                // every match starts with one of the regex's prefix literals, so with what they share
+                let prefix = Extractor::new().extract(&hir).longest_common_prefix().map_or(Vec::new(), <[u8]>::to_vec);
+                // Anchored as parsed, then printed back: text put around the pattern could be escaped
+                // by a pattern like `a)|(b`, or swallowed by a comment in one that sets the `x` flag.
+                let whole = Hir::concat(vec![Hir::look(Look::Start), hir, Hir::look(Look::End)]);
+                let regex = regex::bytes::Regex::new(&whole.to_string()).map_err(|e| bad(&e))?;
+                return Ok(Some(Matcher { prefix, kind: Kind::Regex(regex) }));
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Matcher { prefix: prefix.into(), kind }))
+    }
+}
+
+/// A pattern ready to test terms against.
+pub(crate) struct Matcher {
+    prefix: Vec<u8>,
+    kind: Kind,
+}
+
+enum Kind {
+    Prefix,
+    Wildcard(Vec<u8>, Vec<u8>), // the pattern from its first `*` or `?` to its last, and the text after that
+    Fuzzy(Edits),
+    Regex(regex::bytes::Regex),
+}
+
+impl Matcher {
+    /// What every matching term starts with: where they are in a sorted lexicon.
+    pub(crate) fn prefix(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    pub(crate) fn matches(&mut self, term: &[u8]) -> bool {
+        match &mut self.kind {
+            Kind::Prefix => term.starts_with(&self.prefix),
+            Kind::Wildcard(pattern, end) => {
+                let middle = term.strip_prefix(&self.prefix[..]).and_then(|rest| rest.strip_suffix(&end[..]));
+                middle.is_some_and(|middle| glob(pattern, middle))
+            }
+            // the distance first: it follows the terms as they come, so it must see each of them
+            Kind::Fuzzy(edits) => edits.within(term) && term.starts_with(&self.prefix),
+            Kind::Regex(regex) => regex.is_match(term),
+        }
+    }
+
+    /// After a term that didn't match: how many of its leading bytes rule a term out, if reading
+    /// it has just shown that some do. Every term starting with them can be skipped.
+    pub(crate) fn dead(&self) -> Option<usize> {
+        match &self.kind {
+            Kind::Fuzzy(edits) if edits.died => Some(edits.bytes.len()),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `text` is `pattern`, in which `*` stands for any run of characters and `?` for any one.
+/// Both are UTF-8, compared as bytes: no byte of a longer character is a `*` or a `?`, and a
+/// character that starts with the same byte as another is as long, so the two stay in step.
+fn glob(pattern: &[u8], text: &[u8]) -> bool {
+    // where the character after the one at `at` starts: past the bytes 10xxxxxx that continue it
+    let next = |at: usize| (at + 1..text.len()).find(|&i| text[i] & 0xC0 != 0x80).unwrap_or(text.len());
+    let (mut p, mut t) = (0, 0); // how much of the pattern is matched, by how much of the text
+    let mut star = None; // where the pattern goes on after its last `*` so far, and where that `*` ends in the text
+    loop {
+        match (pattern.get(p), text.get(t)) {
+            (Some(b'*'), _) => {
+                p += 1;
+                star = Some((p, t));
+            }
+            (Some(b'?'), Some(_)) => (p, t) = (p + 1, next(t)),
+            (Some(want), Some(byte)) if want == byte => (p, t) = (p + 1, t + 1),
+            (None, None) => return true,
+            // A dead end: the last `*` takes one more character, and what follows it is tried again.
+            _ => {
+                let Some((after, end)) = star.filter(|&(_, end)| end < text.len()) else { return false };
+                (p, t) = (after, next(end));
+                star = Some((p, t));
+            }
+        }
+    }
+}
+
+/// Tests terms for being within a few edits of one term.
+///
+/// The edit distances between a term's first i characters and the query's first j are kept in a row
+/// per i, each needing only the row before it (two with transpositions). Once a row holds nothing
+/// within `max`, no term starting with those i characters can match. So testing terms in sorted
+/// order costs little: the rows of the characters a term shares with the last one are kept, and a
+/// term that starts with characters already found too far is refused without being read.
+struct Edits {
+    term: Vec<char>,
+    max: usize,
+    transpositions: bool,
+    // The last term tested, as far as it was read: its characters and their bytes.
+    chars: Vec<char>,
+    bytes: Vec<u8>,
+    /// A row after none, one, two... of `chars`. Row i has `2 * max + 1` cells, for the query's first
+    /// `i - max ..= i + max` characters: the others are more than `max` edits away, as is any cell
+    /// whose value is `max + 1`.
+    rows: Vec<u8>,
+    dead: bool, // the last row holds nothing within `max`
+    died: bool, // ...which the term just tested is the one to have shown
+}
+
+impl Edits {
+    fn new(term: &str, max: usize, transpositions: bool) -> Edits {
+        let term: Vec<char> = term.chars().collect();
+        // before any character, the query's first j characters are j insertions away
+        let first = |k: usize| if (max..=max + term.len()).contains(&k) { k - max } else { max + 1 };
+        let rows = (0..2 * max + 1).map(|k| first(k) as u8).collect();
+        Edits { term, max, transpositions, chars: Vec::new(), bytes: Vec::new(), rows, dead: false, died: false }
+    }
+
+    /// Adds the row for one more character of the term being tested; false if it holds nothing
+    /// within `max`.
+    fn push(&mut self, c: char) -> bool {
+        let (max, width, far) = (self.max, 2 * self.max + 1, self.max as u8 + 1);
+        let (i, at) = (self.chars.len() + 1, self.rows.len()); // this row's number, and where it starts
+        let mut alive = false;
+        for k in 0..width {
+            // the cell for the query's first j characters, where j = i + k - max
+            let cell = match (i + k).checked_sub(max) {
+                Some(0) => i as u8,
+                Some(j) if j <= self.term.len() => {
+                    let above = at - width;
+                    let mut edits = self.rows[above + k] + (c != self.term[j - 1]) as u8; // `c` replaces, or is, the query's
+                    if k + 1 < width {
+                        edits = edits.min(self.rows[above + k + 1] + 1); // `c` is one too many
+                    }
+                    if k > 0 {
+                        edits = edits.min(self.rows[at + k - 1] + 1); // the query's character is missing
+                    }
+                    if self.transpositions && i > 1 && j > 1 && c == self.term[j - 2] && self.chars[i - 2] == self.term[j - 1] {
+                        edits = edits.min(self.rows[above - width + k] + 1); // the last two are swapped
+                    }
+                    edits.min(far)
+                }
+                _ => far, // before or past the query
+            };
+            alive |= cell < far;
+            self.rows.push(cell);
+        }
+        self.chars.push(c);
+        self.bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+        alive
+    }
+
+    fn within(&mut self, term: &[u8]) -> bool {
+        self.died = false;
+        let shared = term.iter().zip(&self.bytes).take_while(|(a, b)| a == b).count();
+        if self.dead && shared == self.bytes.len() {
+            return false;
+        }
+        // Keep the rows of the whole characters among the shared bytes; read the rest.
+        let (mut keep, mut at) = (0, 0);
+        while keep < self.chars.len() && at + self.chars[keep].len_utf8() <= shared {
+            at += self.chars[keep].len_utf8();
+            keep += 1;
+        }
+        self.chars.truncate(keep);
+        self.bytes.truncate(at);
+        self.rows.truncate((keep + 1) * (2 * self.max + 1));
+        self.dead = false;
+        let Ok(rest) = std::str::from_utf8(&term[at..]) else { return false };
+        for c in rest.chars() {
+            if !self.push(c) {
+                (self.dead, self.died) = (true, true);
+                return false;
+            }
+        }
+        // The last row's cell for the whole query, if the lengths are close enough for it to have one.
+        let (n, m) = (self.chars.len(), self.term.len());
+        n.abs_diff(m) <= self.max && self.rows[self.rows.len() - 1 - (n + self.max - m)] <= self.max as u8
     }
 }
 
@@ -377,5 +597,185 @@ mod tests {
         assert!(!Or(vec![]).matches(&row("a")));
         assert_eq!(Query::words(&["x", "y", "x"], true), And(vec![t("x"), t("y"), t("x")]));
         assert_eq!(And(vec![t("x"), t("b"), t("x"), Not(Box::new(t("y")))]).positive_terms(), ["x", "b"]);
+    }
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+    fn fuzzy(term: &str, distance: u8, prefix: u8, transpositions: bool) -> Query {
+        Query::Fuzzy { term: term.into(), distance, prefix, transpositions }
+    }
+    /// Whether the pattern `q` matches `term`.
+    fn hits(q: &Query, term: &str) -> bool {
+        q.matcher().unwrap().expect("a pattern").matches(term.as_bytes())
+    }
+    /// Every string of up to `max` characters of `alphabet`.
+    fn strings(alphabet: &[char], max: usize) -> Vec<String> {
+        let (mut all, mut from) = (vec![String::new()], 0);
+        for _ in 0..max {
+            let upto = all.len();
+            for i in from..upto {
+                all.extend(alphabet.iter().map(|&c| format!("{}{c}", all[i])).collect::<Vec<_>>());
+            }
+            from = upto;
+        }
+        all
+    }
+
+    #[test]
+    fn wildcards() {
+        for (pattern, text, want) in [
+            ("", "", true),
+            ("", "a", false),
+            ("*", "", true),
+            ("*", "abc", true),
+            ("?", "", false),
+            ("?", "a", true),
+            ("?", "ab", false),
+            ("abc", "abc", true),
+            ("abc", "abcd", false),
+            ("a*b", "ab", true),
+            ("a*b", "axxb", true),
+            ("a*b", "abx", false),
+            ("a*b", "b", false),
+            ("a**b", "ab", true),
+            ("ab*ab", "ab", false),
+            ("ab*ab", "abab", true),
+            ("*ation", "nation", true),
+            ("*ation", "nations", false),
+            ("*a*a*", "banana", true),
+            ("*a*a*a*a*", "banana", false),
+            ("b?n*a", "banana", true),
+            ("b?n*a", "bnana", false),
+            // a character is one `?` however many bytes it takes
+            ("caf?", "café", true),
+            ("caf??", "café", false),
+            ("*é", "café", true),
+            ("?*?", "é", false),
+            ("?*?", "éé", true),
+        ] {
+            assert_eq!(hits(&Wildcard(pattern.into()), text), want, "{pattern:?} on {text:?}");
+        }
+        // every short pattern on every short text, against trying every way to match
+        let texts = strings(&['a', 'é', 'è'], 4); // the last two start with the same byte
+        for pattern in strings(&['a', 'é', '*', '?'], 4) {
+            for text in &texts {
+                let want = crate::tests::wild(&chars(&pattern), &chars(text));
+                assert_eq!(hits(&Wildcard(pattern.clone()), text), want, "{pattern:?} on {text:?}");
+            }
+        }
+        // terms are looked up by what comes before the first wildcard
+        for (pattern, start) in [("inter*al", "inter"), ("in?er*", "in"), ("*ation", ""), ("abc", "abc")] {
+            assert_eq!(Wildcard(pattern.into()).matcher().unwrap().unwrap().prefix(), start.as_bytes(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn edit_distances() {
+        // a character replaced, inserted, removed; none; two; a term of none
+        let apart = [("color", "colon", 1), ("color", "colour", 1), ("colour", "color", 1), ("color", "color", 0)];
+        for (term, other, distance) in apart.into_iter().chain([("color", "colours", 2), ("", "ab", 2), ("ab", "", 2)]) {
+            for (max, swaps) in [(1, false), (1, true), (2, false), (2, true)] {
+                assert_eq!(hits(&fuzzy(term, max, 0, swaps), other), distance <= max, "{term} {other} {max}");
+            }
+        }
+        // two neighbours swapped are one edit with transpositions, two without
+        assert!(hits(&fuzzy("form", 1, 0, true), "from") && !hits(&fuzzy("form", 1, 0, false), "from"));
+        assert!(hits(&fuzzy("form", 2, 0, false), "from"));
+        assert!(hits(&fuzzy("abcd", 2, 0, true), "badc") && !hits(&fuzzy("abcd", 2, 0, false), "badc"));
+        // ...unless one of them is edited again: three edits, where Damerau's distance says two
+        assert!(!hits(&fuzzy("ca", 2, 0, true), "abc"));
+        // a locked prefix must be the same; one longer than the term locks all of it
+        assert!(hits(&fuzzy("color", 1, 0, true), "dolor") && !hits(&fuzzy("color", 1, 1, true), "dolor"));
+        for locked in [1, 4, 5, 9] {
+            let q = fuzzy("color", 1, locked, true);
+            assert!(hits(&q, "colors") && hits(&q, "color") && hits(&q, "colon") == (locked < 5), "{locked}");
+        }
+        // characters, not bytes: an accent is one edit, and a locked prefix counts characters
+        assert!(hits(&fuzzy("café", 1, 0, true), "cafe") && hits(&fuzzy("naive", 1, 0, true), "naïve"));
+        assert!(hits(&fuzzy("日本語", 1, 0, true), "日本") && !hits(&fuzzy("日本語", 1, 0, true), "日"));
+        assert!(hits(&fuzzy("éa", 1, 0, true), "aé") && hits(&fuzzy("éab", 1, 1, true), "éb"));
+        assert!(!hits(&fuzzy("éab", 1, 1, true), "eab") && hits(&fuzzy("éab", 1, 0, true), "eab"));
+        for bad in [0, 3, 255] {
+            assert_eq!(fuzzy("color", bad, 0, true).check().unwrap_err().kind(), io::ErrorKind::InvalidInput, "{bad}");
+        }
+    }
+
+    /// One matcher given many terms, in order or not, agrees with the textbook distance on each;
+    /// and no term matches that starts with what it says rules a term out.
+    #[test]
+    fn a_fuzzy_matcher_follows_its_terms() {
+        let letters = ['a', 'é', 'è']; // the last two start with the same byte, which terms may share
+        let mut sorted = strings(&letters, 5);
+        sorted.sort_unstable();
+        let mut shuffled = sorted.clone();
+        shuffled.sort_by_key(|s| s.bytes().fold(7u64, |h, b| (h ^ b as u64).wrapping_mul(0x9E3779B97F4A7C15)));
+        let (mut tested, mut ruled_out) = (0, 0);
+        for term in strings(&letters, 4).iter().step_by(5) {
+            // (edits allowed, swaps count as one, characters locked)
+            let cases = [(1, false, 0), (1, true, 0), (2, false, 0), (2, true, 0), (1, true, 1), (2, true, 2), (2, false, 9)];
+            for (max, swaps, locked) in cases {
+                let q = fuzzy(term, max as u8, locked as u8, swaps);
+                let term = chars(term);
+                let near = |other: &str| {
+                    let other = chars(other);
+                    other.starts_with(&term[..term.len().min(locked)]) && crate::tests::edits(&term, &other, swaps) <= max
+                };
+                let want: Vec<bool> = sorted.iter().map(|other| near(other)).collect();
+                for order in [&sorted, &shuffled] {
+                    let mut m = q.matcher().unwrap().unwrap();
+                    for other in order {
+                        assert_eq!(m.matches(other.as_bytes()), near(other), "{q:?} on {other:?}");
+                        tested += 1;
+                        let Some(n) = m.dead() else { continue };
+                        // the terms that start with those bytes are a run of the sorted ones
+                        let out = &other.as_bytes()[..n];
+                        let from = sorted.partition_point(|s| s.as_bytes() < out);
+                        let run = sorted[from..].iter().take_while(|s| s.as_bytes().starts_with(out)).count();
+                        assert!(run > 0 && want[from..from + run].iter().all(|w| !w), "{q:?} rules out {out:?}");
+                        ruled_out += 1;
+                    }
+                }
+            }
+        }
+        assert!(tested > 100_000 && ruled_out > 10_000, "{tested} {ruled_out}");
+    }
+
+    #[test]
+    fn regexes_match_whole_terms() {
+        let re = |pattern: &str| Regex(pattern.into());
+        // the whole term, by whichever alternative does it
+        assert!(hits(&re("a|ab"), "ab") && !hits(&re("a|ab"), "abc") && !hits(&re("b"), "ab"));
+        assert!(hits(&re(""), "") && !hits(&re(""), "a"));
+        assert!(hits(&re("colou?r"), "color") && hits(&re("colou?r"), "colour") && !hits(&re("colou?r"), "colours"));
+        // the anchors hold though the pattern ends in a comment, and can't be broken out of
+        let commented = re("(?x) colo u? r  # either spelling");
+        assert!(hits(&commented, "colour") && !hits(&commented, "colours"));
+        for bad in ["(", "a)|(b", "a{2,1}", r"\p{Nope}", r"(?-u:\xFF)"] {
+            assert_eq!(re(bad).check().unwrap_err().kind(), io::ErrorKind::InvalidInput, "{bad}");
+        }
+        // terms are looked up by what every match starts with: nothing, if matches start differently
+        let prefix = |pattern: &str| re(pattern).matcher().unwrap().unwrap().prefix().to_vec();
+        assert_eq!((prefix("colou?r.*"), prefix("abc|abd")), (b"colo".to_vec(), b"ab".to_vec()));
+        for none in ["ab.*|cd.*", "a?bc", ".*abc", "(?i)abc", "[a-c]x", ""] {
+            assert_eq!(prefix(none), b"", "{none}");
+        }
+    }
+
+    #[test]
+    fn patterns_match_rows_and_nest_one_deeper() {
+        let row = |s: &str| Analyzer::whitespace().terms(s);
+        let q = And(vec![Prefix("col".into()), Not(Box::new(Wildcard("*s".into())))]);
+        assert!(q.matches(&row("red colour")) && !q.matches(&row("red colours")) && !q.matches(&row("red")));
+        assert!(Regex("colou?r".into()).matches(&row("a color")) && !Regex("colo".into()).matches(&row("a color")));
+        assert!(fuzzy("colour", 1, 0, true).matches(&row("a color")) && !fuzzy("colour", 1, 0, true).matches(&row("a colon")));
+        // a query that fails `check` matches nothing, wherever the bad pattern sits
+        assert!(!Or(vec![t("a"), Regex("(".into())]).matches(&row("a")));
+        assert!(!Or(vec![t("a"), fuzzy("a", 3, 0, true)]).matches(&row("a")));
+        // a pattern scores through the terms it becomes, and is as deep as they will be
+        assert_eq!(Or(vec![Prefix("a".into()), t("b")]).positive_terms(), ["b"]);
+        let nested = |leaf: Query, levels: usize| (0..levels).fold(leaf, |q, _| And(vec![q, t("b")]));
+        assert!(nested(t("a"), 63).check().is_ok() && nested(t("a"), 64).check().is_err());
+        assert!(nested(Prefix("a".into()), 62).check().is_ok() && nested(Prefix("a".into()), 63).check().is_err());
     }
 }

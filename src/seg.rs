@@ -984,25 +984,32 @@ impl Index {
         self.pos.is_some()
     }
 
-    /// Where `term`'s postings are, if the segment has it.
-    pub(crate) fn lookup(&self, term: &[u8]) -> Option<Meta> {
-        // The last group whose first term is <= `term`, then its entries in order. `matched` is how
-        // many leading bytes of `term` the previous (smaller) entry shares with it.
-        let first = |g: usize| {
-            let mut pos = self.lex_heads[g] as usize + 1; // a group's first entry shares nothing
-            let len = get_varint(&self.lex, &mut pos) as usize;
-            &self.lex[pos..pos + len]
-        };
+    /// The first term of group `g`.
+    fn head(&self, g: usize) -> &[u8] {
+        let mut pos = self.lex_heads[g] as usize + 1; // a group's first entry shares nothing
+        let len = get_varint(&self.lex, &mut pos) as usize;
+        &self.lex[pos..pos + len]
+    }
+
+    /// How many groups start with a term <= `term`: if it is here, it is in the last of them.
+    fn groups_upto(&self, term: &[u8]) -> usize {
         let (mut lo, mut hi) = (0, self.lex_heads.len());
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if first(mid) <= term {
+            if self.head(mid) <= term {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        let g = lo.checked_sub(1)?;
+        lo
+    }
+
+    /// Where `term`'s postings are, if the segment has it.
+    pub(crate) fn lookup(&self, term: &[u8]) -> Option<Meta> {
+        // The last group whose first term is <= `term`, then its entries in order. `matched` is how
+        // many leading bytes of `term` the previous (smaller) entry shares with it.
+        let g = self.groups_upto(term).checked_sub(1)?;
         let (mut pos, mut matched) = (self.lex_heads[g] as usize, 0);
         for _ in 0..LEX_GROUP.min(self.n_terms - g * LEX_GROUP) {
             let shared = get_varint(&self.lex, &mut pos) as usize;
@@ -1031,6 +1038,23 @@ impl Index {
     /// The terms in ascending order, one `next` at a time.
     pub(crate) fn terms(&self) -> TermIter<'_> {
         TermIter { idx: self, pos: 0, left: self.n_terms, term: Vec::new() }
+    }
+
+    /// The terms from the first one >= `from`, in ascending order.
+    pub(crate) fn terms_from(&self, from: &[u8]) -> TermIter<'_> {
+        // That term is in the last group starting at or before `from`, or it starts the group after.
+        let g = self.groups_upto(from).saturating_sub(1);
+        let pos = self.lex_heads.get(g).map_or(0, |&at| at as usize);
+        let mut terms = TermIter { idx: self, pos, left: self.n_terms - g * LEX_GROUP, term: Vec::new() };
+        loop {
+            let before = (terms.pos, terms.left);
+            if terms.next().is_none() || terms.term() >= from {
+                // Step back, so that `next` gives this term. Reading it again is sound: an entry
+                // holds what follows the bytes shared with the term before, and this term has them.
+                (terms.pos, terms.left) = before;
+                return terms;
+            }
+        }
     }
 
     pub(crate) fn postings(&self, m: &Meta) -> Postings<'_> {
@@ -1253,6 +1277,19 @@ impl TermIter<'_> {
 
     pub(crate) fn term(&self) -> &[u8] {
         &self.term
+    }
+
+    /// For a caller with no use for terms that start with the current term's first `n` bytes: skips
+    /// the groups that hold nothing else. Such terms in the group this stops in are still read.
+    pub(crate) fn skip_groups(&mut self, n: usize) {
+        let idx = self.idx;
+        // Terms are sorted: if a later group's first term starts with those bytes, so does every term up to it.
+        let next = (idx.n_terms - self.left).div_ceil(LEX_GROUP); // the group after the current term's
+        let run = (next..idx.lex_heads.len()).take_while(|&g| idx.head(g).starts_with(&self.term[..n])).count();
+        if run > 0 {
+            let last = next + run - 1;
+            (self.pos, self.left) = (idx.lex_heads[last] as usize, idx.n_terms - last * LEX_GROUP);
+        }
     }
 }
 
@@ -1489,6 +1526,78 @@ mod tests {
             let c = len_class(dl) as usize;
             assert!(EDGES[c] <= dl && (c == 255 || dl < EDGES[c + 1]), "dl {dl} class {c}");
         }
+    }
+
+    /// An index of hundreds of terms (dozens of lexicon groups) that share prefixes, one of them two
+    /// bytes long, and its terms in order, each with where its postings are. Some terms are in one
+    /// row (stored inline, positions in the lexicon), the others in several.
+    fn lexicon() -> (Index, Vec<(Vec<u8>, Meta)>) {
+        let stems = ["a", "ab", "abc", "b", "ba", "é", "éa", "z"];
+        let words: Vec<String> = (0..700).map(|i| format!("{}{}", stems[i % 8], i * 37 % 450)).collect();
+        let some: Vec<&str> = words.iter().step_by(3).map(String::as_str).collect();
+        let idx = Index::build(&[words.join(" "), some.join(" "), some.join(" "), some.join(" ")]);
+        let (mut all, mut terms) = (Vec::new(), idx.terms());
+        while let Some(meta) = terms.next() {
+            all.push((terms.term().to_vec(), meta));
+        }
+        let mut sorted: Vec<&[u8]> = words.iter().map(|w| w.as_bytes()).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(all.iter().map(|t| &t.0[..]).collect::<Vec<_>>(), sorted);
+        assert!(all.len() > 20 * LEX_GROUP);
+        (idx, all)
+    }
+
+    /// `terms_from` gives the terms from the first one >= its key, whatever the key.
+    #[test]
+    fn terms_start_at_any_key() {
+        let (idx, all) = lexicon();
+        // Keys before the first term and after the last; then every term, and for each the keys just
+        // before it, just after it and past all it starts. Since the first and last term of every
+        // group get them too, some keys fall between groups.
+        let mut keys: Vec<Vec<u8>> = vec![vec![], vec![0], b"a".to_vec(), b"zzz".to_vec(), vec![0xff]];
+        for (term, _) in &all {
+            let (before, mut past) = (&term[..term.len() - 1], term.clone());
+            *past.last_mut().unwrap() += 1;
+            keys.extend([term.clone(), before.to_vec(), [&term[..], &[0]].concat(), past]);
+        }
+        for key in keys {
+            let want = &all[all.partition_point(|t| t.0 < key)..];
+            let mut terms = idx.terms_from(&key);
+            for (term, meta) in want {
+                assert_eq!(terms.next(), Some(*meta), "from {key:?}");
+                assert_eq!(terms.term(), term, "from {key:?}");
+            }
+            assert_eq!(terms.next(), None, "from {key:?}");
+        }
+        assert_eq!(Index::build::<&str>(&[]).terms_from(b"a").next(), None);
+    }
+
+    /// `skip_groups` goes on from the last group that starts with the bytes given, passing over
+    /// nothing but terms that start with them.
+    #[test]
+    fn groups_of_one_prefix_are_skipped() {
+        let (idx, all) = lexicon();
+        let mut skipped = 0;
+        for (at, (term, _)) in all.iter().enumerate() {
+            for prefix in (0..=term.len().min(3)).map(|n| &term[..n]) {
+                let mut terms = idx.terms_from(term);
+                terms.next();
+                terms.skip_groups(prefix.len());
+                // where it goes on: the first term of the last such group, or the next term
+                let later = at / LEX_GROUP + 1..all.len().div_ceil(LEX_GROUP);
+                let last = later.take_while(|g| all[g * LEX_GROUP].0.starts_with(prefix)).last();
+                let resumed = last.map_or(at + 1, |g| g * LEX_GROUP);
+                assert!(all[at + 1..resumed].iter().all(|t| t.0.starts_with(prefix)), "{term:?} {prefix:?}");
+                skipped += resumed - at - 1;
+                for (term, meta) in all[resumed..].iter().take(2 * LEX_GROUP) {
+                    assert_eq!(terms.next(), Some(*meta), "after {prefix:?} from {at}");
+                    assert_eq!(terms.term(), term, "after {prefix:?} from {at}");
+                }
+                assert_eq!(terms.next().is_none(), resumed + 2 * LEX_GROUP >= all.len());
+            }
+        }
+        assert!(skipped > 10 * all.len(), "{skipped}");
     }
 
     /// Every posting shape reads back: densities from two rows to all rows, tfs across every code.
