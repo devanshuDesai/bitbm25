@@ -222,10 +222,20 @@ pub(crate) fn run(seg: &Seg, shape: &Shape, sink: &mut Sink) {
 /// Scratch for checking a phrase in a row.
 #[derive(Default)]
 struct Adjacency {
-    /// Per plan term: its positions in the row last read, where they were read from, and that row.
-    pos: Vec<(Vec<u32>, PosCursor, u64)>,
+    pos: Vec<TermPos>, // per plan term
     order: Vec<(u32, usize, usize)>, // the phrase's words as (tf in the row, place in the phrase, posting)
+    firsts: Vec<usize>,              // the index of each phrase word's first posting in the block
     starts: Vec<u32>,                // positions where the phrase can still start
+}
+
+/// A term's positions in the row last read, where they were read from, that row, and where its
+/// tfs were last read (see `Postings::tf_near`).
+#[derive(Clone, Default)]
+struct TermPos {
+    list: Vec<u32>,
+    cursor: PosCursor,
+    read: u64,
+    near: (usize, usize),
 }
 
 /// A term's (block, rows there, first posting there, largest tf there).
@@ -308,23 +318,30 @@ impl<'a, 's> Scan<'a, 's> {
     /// dropped as soon as none is left, usually before its frequent words' positions are read.
     fn adjacent(&self, b: u32, mut rows: u64, phrase: &[usize]) -> u64 {
         let (mut out, mut scratch) = (0, self.positions.borrow_mut());
-        let Adjacency { pos, order, starts } = &mut *scratch;
+        let Adjacency { pos, order, firsts, starts } = &mut *scratch;
+        let term = |j: usize| self.seg.terms[j].as_ref().expect("a phrase's terms are all in a matching row");
+        firsts.clear();
+        firsts.extend(phrase.iter().map(|&j| match self.cur[j].expect("and in its block") {
+            (_, UNKNOWN) => term(j).p.first(b),
+            (_, first) => first,
+        }));
         while rows != 0 {
             let r = rows.trailing_zeros();
             rows &= rows - 1;
             // each word's place in the phrase, with its posting and tf in this row
             order.clear();
             for (k, &j) in phrase.iter().enumerate() {
-                let t = self.seg.terms[j].as_ref().expect("a phrase's terms are all in a matching row");
-                let (m, first) = self.cur[j].expect("and in its block");
-                let first = if first == UNKNOWN { t.p.first(b) } else { first };
-                let i = first + (m & ((1u64 << r) - 1)).count_ones() as usize;
-                order.push((t.p.tf(i), k, i));
+                let i = firsts[k] + (self.cur[j].expect("checked above").0 & ((1u64 << r) - 1)).count_ones() as usize;
+                order.push((term(j).p.tf_near(i, &mut pos[j].near), k, i));
             }
-            order.sort_unstable();
+            match order.len() {
+                2 if order[0] > order[1] => order.swap(0, 1),
+                2 => {}
+                _ => order.sort_unstable(),
+            }
             let stamp = (b << SHIFT | r) as u64 + 1; // marks positions read for this row
             for (n, &(tf, k, i)) in order.iter().enumerate() {
-                let (list, cursor, read) = &mut pos[phrase[k]];
+                let TermPos { list, cursor, read, .. } = &mut pos[phrase[k]];
                 if *read != stamp {
                     let t = self.seg.terms[phrase[k]].as_ref().expect("checked above");
                     t.p.positions(i, tf, cursor, list);

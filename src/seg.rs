@@ -634,6 +634,28 @@ impl<'a> Postings<'a> {
         }
     }
 
+    /// `tf(i)` for postings read in mostly ascending order: an escape's count of escapes before it
+    /// is carried on from `near` (a posting and the escapes before it, moved to `i`) when that is a
+    /// little behind, which costs a word or two instead of a walk from the last sample.
+    #[cfg_attr(feature = "prof", inline(never))]
+    #[cfg_attr(not(feature = "prof"), inline)]
+    pub(crate) fn tf_near(&self, i: usize, near: &mut (usize, usize)) -> u32 {
+        let Tfs::Small { codes, nibs, .. } = &self.tfs else { return self.tf(i) };
+        let code = bits::get(codes, 2 * i, 2);
+        if code < 3 {
+            return code + 1;
+        }
+        let n = match near.0 <= i && i - near.0 < 256 {
+            true => near.1 + escapes_in(codes, near.0, i),
+            false => self.escapes_before(i),
+        };
+        *near = (i, n);
+        match bits::get(nibs, 4 * n, 4) {
+            15 => self.tf(i),
+            nib => 4 + nib,
+        }
+    }
+
     /// Postings before `i` whose two-bit code is an escape.
     fn escapes_before(&self, i: usize) -> usize {
         let Tfs::Small { codes, rank, .. } = &self.tfs else { return 0 };
@@ -771,6 +793,19 @@ impl<'a> Postings<'a> {
         }
         bits
     }
+}
+
+/// Two-bit codes of postings `from..to` that are escapes (3).
+#[inline]
+fn escapes_in(codes: &[u64], mut from: usize, to: usize) -> usize {
+    let mut n = 0;
+    while from < to {
+        let k = (to - from).min(32);
+        let w = bits::window(codes, 2 * from) & (!0u64 >> (64 - 2 * k));
+        n += (w & w >> 1 & ESCAPES).count_ones() as usize;
+        from += k;
+    }
+    n
 }
 
 /// The row mask of one block from the `n` six-bit low parts starting at value `first`.
