@@ -11,10 +11,10 @@
 //!      for all 64 rows at once, and only rows that can still qualify are scored exactly.
 //!
 //! ANDs walk the rarest term's blocks and look the others up there, skipping a block before any
-//! lookup when its bound plus the most the others could add can't reach the threshold. Counts and unscored visits
-//! combine row masks and never look at frequencies. Phrases are ANDs whose rows are then checked
-//! against positions; ranked, a row is scored first and its positions read only if it would enter
-//! the top k.
+//! lookup when a term with bound bytes is missing from it or the bounds can't reach the threshold.
+//! Unranked, they AND whole windows of row masks instead when the rarest term is common. Counts and
+//! unscored visits never look at frequencies. Phrases are ANDs whose rows are then checked against
+//! positions; ranked, a row is scored first and its positions read only if it would enter the top k.
 //!
 //! Bounds are rounded up and thresholds down wherever they are quantized, and ties on the k-th
 //! score are kept, so results equal exhaustive scoring exactly. Scores and sums of bounds are added
@@ -323,11 +323,11 @@ impl<'a, 's> Scan<'a, 's> {
             }
             order.sort_unstable();
             let stamp = (b << SHIFT | r) as u64 + 1; // marks positions read for this row
-            for (n, &(_, k, i)) in order.iter().enumerate() {
+            for (n, &(tf, k, i)) in order.iter().enumerate() {
                 let (list, cursor, read) = &mut pos[phrase[k]];
                 if *read != stamp {
                     let t = self.seg.terms[phrase[k]].as_ref().expect("checked above");
-                    t.p.positions(i, cursor, list);
+                    t.p.positions(i, tf, cursor, list);
                     *read = stamp;
                 }
                 match n {
@@ -643,9 +643,10 @@ impl<'a, 's> Scan<'a, 's> {
     /// Rows holding every term of `need` (the plan's scoring terms), those of each of `phrases`
     /// adjacent.
     ///
-    /// If the rarest term is in few blocks, its blocks are walked and the others looked up
-    /// there. Otherwise each window's row masks are ANDed whole, which costs about a nanosecond a
-    /// block per term where a lookup costs ten.
+    /// The rarest term's blocks are walked and the others looked up there, after their bound bytes
+    /// (where they keep them) say they are present and, ranked, that the block can reach the
+    /// threshold. Unranked, if the rarest term is in many blocks, each window's row masks are ANDed
+    /// whole instead, which costs about a nanosecond a block per term where a lookup costs ten.
     fn all(&mut self, need: &[usize], phrases: &[Vec<usize>], sink: &mut Sink) {
         let (idx, seg) = (self.seg.idx, self.seg);
         let term = |j: usize| seg.terms[j].as_ref().expect("a term of this segment");
@@ -653,17 +654,27 @@ impl<'a, 's> Scan<'a, 's> {
         let mut need = need.to_vec();
         need.sort_by_key(|&j| term(j).p.df); // rarest first
         let driver = need[0];
-        // the most the other terms can add to the driver's own bound, in any block
-        let rest: f64 = need[1..].iter().map(|&j| self.top_bound(term(j)) as f64).sum();
         let blocks = idx.blocks();
 
-        if (term(driver).p.df as u64) * 8 < blocks as u64 {
+        // Ranked, the bounds spare most lookups whatever the driver; unranked, a common driver's
+        // blocks are cheaper to AND a window at a time.
+        if matches!(sink, Sink::Top { prune: true, .. }) || (term(driver).p.df as u64) * 8 < blocks as u64 {
             let lead = term(driver).p;
             return lead.for_each_block(0..blocks, |b, m, first| {
                 let mut rows = m & !self.excluded(b);
                 self.cur[driver] = Some((m, first));
-                // Before any lookup: can a row here qualify even if every other term scored its most?
-                if theta(sink).is_some_and(|theta| (self.bound(driver, term(driver), b) as f64 + rest) * (1.0 + 1e-5) < theta as f64) {
+                // Before any lookup: is every term with bound bytes here, and can a row qualify if
+                // each other term scored its most (in this block, where its bytes say)?
+                let mut others = 0f64;
+                for &j in &need[1..] {
+                    let t = term(j);
+                    others += match t.p.bound(b) {
+                        Some(0) => return,
+                        Some(byte) => (t.idf * byte as f32 * self.unit) as f64,
+                        None => self.top_bound(t) as f64,
+                    };
+                }
+                if theta(sink).is_some_and(|theta| (self.bound(driver, term(driver), b) as f64 + others) * (1.0 + 1e-5) < theta as f64) {
                     return;
                 }
                 for &j in &need[1..] {

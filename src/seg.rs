@@ -686,34 +686,64 @@ impl<'a> Postings<'a> {
         });
     }
 
-    /// Replaces `out` with posting `i`'s positions, ascending. Empty if none are stored. `at`
-    /// remembers where the last posting read was, so reading postings in ascending order doesn't
-    /// walk a chunk again for each.
-    pub(crate) fn positions(&self, i: usize, at: &mut PosCursor, out: &mut Vec<u32>) {
+    /// Replaces `out` with posting `i`'s positions, ascending; `tf` is its tf. Empty if none are
+    /// stored. `at` remembers where the last posting read was, so reading postings in ascending
+    /// order doesn't walk a chunk again for each.
+    pub(crate) fn positions(&self, i: usize, tf: u32, at: &mut PosCursor, out: &mut Vec<u32>) {
         out.clear();
         match self.positions {
             Positions::None => {}
             Positions::Inline { lex, at } => {
                 let (mut pos, mut last) = (at[i], 0);
-                for _ in 0..self.tf(i) {
+                for _ in 0..tf {
                     last += get_varint(lex, &mut pos) as u32;
                     out.push(last);
                 }
             }
             Positions::Packed { chunks, data } => {
                 let width = (chunks[i >> 6] >> 56) as u32;
-                // A posting's bits start where the previous one's end: walk from the chunk's start,
+                // A posting's bits start where the previous one's end: count from the chunk's start,
                 // or from the last posting read if that is in this chunk and not past this one.
                 if at.posting >> 6 != i >> 6 || at.posting > i {
                     *at = PosCursor { posting: i & !63, bit: (chunks[i >> 6] & (!0 >> 8)) as usize };
                 }
-                for j in at.posting..i {
-                    at.bit += pos_bits(self.tf(j), width);
-                }
+                at.bit += self.pos_bits_between(at.posting, i, width);
                 at.posting = i;
-                read_pos(data, at.bit, self.tf(i), width, out);
+                read_pos(data, at.bit, tf, width, out);
             }
         }
+    }
+
+    /// Bits the positions of postings `from..to` take, `width` wide: by their tfs, which for two-bit
+    /// codes are counted a word (32 postings) at a time, the rare escapes read one by one.
+    #[cfg_attr(feature = "prof", inline(never))]
+    #[cfg_attr(not(feature = "prof"), inline)]
+    fn pos_bits_between(&self, from: usize, to: usize, width: u32) -> usize {
+        let Tfs::Small { codes, nibs, .. } = &self.tfs else {
+            return match self.tfs {
+                Tfs::Ones => (to - from) * width as usize,
+                _ => (from..to).map(|j| pos_bits(self.tf(j), width)).sum(),
+            };
+        };
+        let (b1, b2, b3) = (pos_bits(1, width), pos_bits(2, width), pos_bits(3, width));
+        let (mut bits, mut i, mut nib) = (0, from, None);
+        while i < to {
+            let k = (to - i).min(32);
+            let w = bits::window(codes, 2 * i) & (!0u64 >> (64 - 2 * k));
+            let (lo, hi) = (w & ESCAPES, w >> 1 & ESCAPES);
+            let (twos, threes, mut escapes) = ((lo & !hi).count_ones() as usize, (hi & !lo).count_ones() as usize, lo & hi);
+            bits += (k - twos - threes - escapes.count_ones() as usize) * b1 + twos * b2 + threes * b3;
+            while escapes != 0 {
+                // an escape's tf is 4 plus the next nibble, or in the table when that is 15
+                let j = i + escapes.trailing_zeros() as usize / 2;
+                let n = nib.get_or_insert_with(|| self.escapes_before(j));
+                bits += pos_bits(match bits::get(nibs, 4 * *n, 4) { 15 => self.tf(j), v => 4 + v }, width);
+                *n += 1;
+                escapes &= escapes - 1;
+            }
+            i += k;
+        }
+        bits
     }
 }
 
@@ -1673,14 +1703,14 @@ mod tests {
                 let (mut got, mut got_pos, mut buf, mut cursor) = (Vec::new(), Vec::new(), Vec::new(), PosCursor::default());
                 p.for_each(blocks, |row, tf, at| {
                     got.push((row, tf));
-                    p.positions(at, &mut cursor, &mut buf);
+                    p.positions(at, tf, &mut cursor, &mut buf);
                     got_pos.extend_from_slice(&buf);
                 });
                 // in any order too: every 7th posting, backwards
                 let mut start = 0;
                 let starts: Vec<usize> = tfs.iter().map(|&tf| (start, start += tf as usize).0).collect();
                 for at in (0..rows.len()).rev().step_by(7) {
-                    p.positions(at, &mut cursor, &mut buf);
+                    p.positions(at, tfs[at], &mut cursor, &mut buf);
                     assert_eq!(buf, positions[i][starts[at]..starts[at] + tfs[at] as usize], "posting {at} of term {i}");
                 }
                 let want: Vec<(u32, u32)> = rows.iter().copied().zip(tfs.iter().copied()).collect();

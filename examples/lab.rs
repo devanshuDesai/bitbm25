@@ -4,6 +4,7 @@
 //!                                                     analyzer) on $THREADS threads (4); `added` keeps
 //!                                                     rows in the order added, `nopos` stores no positions
 //!   lab stats <index>                                 what the index is made of
+//!   lab terms <index> <words...>                      how each term is stored
 //!   lab bench <index> <queries.tsv> [reps]            time top-10 and count per query kind, check exactness
 //!   lab hot <index> <queries.tsv> <kind> <top10|count> <seconds>   one workload in a loop, to profile
 //!
@@ -31,6 +32,10 @@ fn main() -> std::io::Result<()> {
             println!("{} docs  {threads} threads  {:.1}s  {:.1} MB", idx.rows(), t0.elapsed().as_secs_f64(), idx.size_bytes() as f64 / 1e6);
         }
         Some("stats") => print!("{}", bitbm25::lab::composition(&Index::open(&args[2])?)),
+        Some("terms") => {
+            let words: Vec<&str> = args[3..].iter().map(String::as_str).collect();
+            print!("{}", bitbm25::lab::describe(&Index::open(&args[2])?, &words));
+        }
         Some("hot") => {
             // lab hot <index> <queries.tsv> <kind> <top10|count> <seconds>: one workload in a loop, to profile
             let idx = Index::open(&args[2])?;

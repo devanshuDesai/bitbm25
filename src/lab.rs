@@ -41,6 +41,44 @@ pub fn composition(idx: &Index) -> String {
     by_rows.iter().for_each(|(name, e)| line(&mut o, "rows", name, e));
     by_tfs.iter().for_each(|(name, e)| line(&mut o, "tf", name, e));
     line(&mut o, "", "bounds", &summary);
+    // What bound bytes would cost for terms in fewer than half the blocks, by the share they are in.
+    let mut by_share = [(0u64, 0u64); 4]; // at least 1/4, 1/8, 1/16, 1/32 of the blocks
+    let mut terms = idx.terms();
+    while let Some(meta) = terms.next() {
+        let p = idx.postings(&meta);
+        if p.bounds.is_some() || (p.df as u64) * 32 < idx.blocks() as u64 {
+            continue;
+        }
+        let mut blocks = 0u64;
+        p.for_each_block(0..idx.blocks(), |_, _, _| blocks += 1);
+        for (k, e) in by_share.iter_mut().enumerate() {
+            if blocks << (k + 2) >= idx.blocks() as u64 {
+                *e = (e.0 + 1, e.1 + idx.blocks() as u64);
+            }
+        }
+    }
+    for (k, (n, bytes)) in by_share.iter().enumerate() {
+        writeln!(o, "  without bounds, in >= 1/{} of the blocks: {n} terms, {:.1} MB of bound bytes", 4 << k, *bytes as f64 / 1e6).unwrap();
+    }
+    o
+}
+
+/// One line per term: document frequency, blocks it is in, how its rows and tfs are stored, and
+/// whether it keeps a bound byte per block.
+pub fn describe(idx: &Index, terms: &[&str]) -> String {
+    let mut o = String::new();
+    for t in terms {
+        match idx.lookup(t.as_bytes()) {
+            None => writeln!(o, "{t:<20} absent").unwrap(),
+            Some(meta) => {
+                let p = idx.postings(&meta);
+                let mut blocks = 0;
+                p.for_each_block(0..idx.blocks(), |_, _, _| blocks += 1);
+                let (rf, tf) = p.forms();
+                writeln!(o, "{t:<20} df {:>8}  blocks {:>6} of {}  rows {rf:<10} tfs {tf:<6} bounds {}", p.df, blocks, idx.blocks(), p.bounds.is_some()).unwrap();
+            }
+        }
+    }
     o
 }
 

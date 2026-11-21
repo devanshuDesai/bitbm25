@@ -468,7 +468,7 @@ fn merged(segs: &[SegView], spill: Option<&Path>) -> io::Result<seg::Assembler> 
                 if new_of[s][row as usize] != GONE {
                     pairs.push((new_of[s][row as usize], tf, at.len()));
                     if positions {
-                        p.positions(i, &mut cursor, &mut buf);
+                        p.positions(i, tf, &mut cursor, &mut buf);
                         at.extend_from_slice(&buf);
                     }
                 }
